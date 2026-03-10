@@ -29,7 +29,7 @@ Ubuntu 22.04 LTS is a reliable choice for both options.
 Once you are in a Linux environment (native, WSL2, or dual-boot), clone the repository and install:
 
 ```bash
-git clone https://github.com/<your-org>/multifil_jax.git
+git clone https://github.com/travistune3/multifil_jax.git
 cd multifil_jax
 pip install -e ".[cuda13]"
 ```
@@ -116,3 +116,4 @@ Different configurations (lattice size, batch size, `StaticParams`) each get the
 ```bash
 rm -rf ~/.cache/multifil_jax/xla/
 ```
+
