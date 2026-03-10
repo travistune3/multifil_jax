@@ -1,0 +1,771 @@
+"""
+Unified Simulation Engine for JAX Half-Sarcomere
+
+This module provides the core simulation engine with proper vmap-outside-scan
+architecture for maximum GPU utilization through XLA kernel fusion.
+
+Architecture Principle:
+    vmap OUTSIDE, scan INSIDE = single fused XLA kernel per batch
+
+Primary API:
+    run(topology, pCa=..., z_line=..., ...) -> SimulationResult
+
+Usage:
+    from multifil_jax.simulation import run, get_default_params
+    from multifil_jax.core.sarc_geometry import SarcTopology
+    from multifil_jax.core.params import StaticParams
+
+    static, dynamic = get_default_params()
+    topo = SarcTopology.create(nrows=2, ncols=2, static_params=static, dynamic_params=dynamic)
+
+    # Simple isometric simulation
+    result = run(topo, pCa=4.5, z_line=900.0, duration_ms=1000)
+    print(result.summary())
+
+    # Parameter sweep (list = sweep axis)
+    result = run(topo, pCa=[4.5, 5.0, 6.0], replicates=5)
+
+    # DynamicParams sweep
+    result = run(topo, pCa=4.5, dynamic_params={'thick_k': [1000, 2000, 3000]})
+"""
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from functools import partial
+from typing import Dict, Tuple, List, Optional, Union, TYPE_CHECKING
+
+from multifil_jax.core.params import (
+    StaticParams, DynamicParams, get_default_params, DYNAMIC_FIELDS
+)
+from multifil_jax.core.state import realize_state, State, Drivers, MetricsDict, build_preconditioner_params
+from multifil_jax.kernels.solver import build_prefactored_preconditioner
+from multifil_jax.core.sarc_geometry import SarcTopology
+from multifil_jax.kernels.geometry import update_nearest_neighbors
+from multifil_jax.kernels.solver import solve_equilibrium
+from multifil_jax.kernels.forces import axial_force_at_mline
+from multifil_jax.timestep import timestep
+from multifil_jax.metrics_fn import compute_all_metrics
+
+
+# =============================================================================
+# SIMULATION RESULT
+# =============================================================================
+
+@jax.tree_util.register_pytree_node_class
+class SimulationResult:
+    """Result container from run() with visualization and grid support.
+
+    Consolidates all simulation outputs including:
+    - Force and metrics time traces (force lives in metrics['axial_force'])
+    - Input replay (z_line, pCa, lattice_spacing traces used)
+    - Final state for continuation
+    - Grid metadata for parameter sweeps (coords, slicing, mean/std)
+
+    Data Cube Convention:
+        Shape = (Sweep_1, Sweep_2, ..., Replicates, Time)
+        - Sweep dimensions only appear if that input was a list
+        - Replicates axis always present for consistency (even if replicates=1)
+
+    Attributes:
+        metrics: MetricsDict of metric arrays from metrics_fn (includes
+                 'axial_force' and 'solver_residual' keys)
+        rng_key: Final RNG key state for continuation
+        z_line: (..., replicates, n_steps) Z-line position trace
+        pCa: (..., replicates, n_steps) pCa trace
+        lattice_spacing: (..., replicates, n_steps) lattice spacing trace
+        final_state: Nested dict or None if return_final_state=False
+        metadata: Dict with params, geometry, etc.
+        dt: Timestep in milliseconds
+        name: Simulation/experiment name
+        _grid_shape: Tuple: shape without time
+        _axis_names: List: ['pCa', 'thick_k', 'replicates', 'time']
+        coords: Dict: {'pCa': [...], 'thick_k': [...], ...}
+    """
+
+    __slots__ = (
+        'metrics', 'rng_key',
+        'z_line', 'pCa', 'lattice_spacing',
+        'final_state', 'metadata', 'dt', 'name',
+        '_grid_shape', '_axis_names', 'coords',
+        'topology_config',
+    )
+
+    def __init__(
+        self,
+        metrics: 'MetricsDict',
+        rng_key: jnp.ndarray,
+        z_line: jnp.ndarray,
+        pCa: jnp.ndarray,
+        lattice_spacing: jnp.ndarray,
+        final_state: Optional[Dict] = None,
+        metadata: Optional[Dict] = None,
+        dt: float = 1.0,
+        name: str = "",
+        grid_shape: Tuple[int, ...] = None,
+        axis_names: List[str] = None,
+        coords: Dict[str, List] = None,
+        topology_config: Optional[Dict] = None,
+    ):
+        self.metrics = metrics if isinstance(metrics, MetricsDict) else MetricsDict(metrics)
+        self.rng_key = rng_key
+        self.z_line = z_line
+        self.pCa = pCa
+        self.lattice_spacing = lattice_spacing
+        self.final_state = final_state
+        self.metadata = metadata if metadata is not None else {}
+        self.dt = float(dt)
+        self.name = str(name)
+        self._grid_shape = grid_shape
+        self._axis_names = axis_names if axis_names is not None else []
+        self.coords = coords if coords is not None else {}
+        self.topology_config = topology_config if topology_config is not None else {}
+
+    def tree_flatten(self) -> Tuple[Tuple, Tuple]:
+        """Flatten for JAX tree operations."""
+        children = (
+            self.metrics, self.rng_key,
+            self.z_line, self.pCa, self.lattice_spacing,
+            self.final_state,
+        )
+        aux_data = (
+            self.metadata, self.dt, self.name,
+            self._grid_shape, self._axis_names, self.coords,
+            self.topology_config,
+        )
+        return children, aux_data
+
+    @classmethod
+    def tree_unflatten(cls, aux_data: Tuple, children: Tuple) -> 'SimulationResult':
+        """Reconstruct SimulationResult from flattened representation."""
+        (metrics, rng_key, z_line, pCa, lattice_spacing, final_state) = children
+        (metadata, dt, name, grid_shape, axis_names, coords,
+         topology_config) = aux_data
+        return cls(
+            metrics=MetricsDict(metrics), rng_key=rng_key,
+            z_line=z_line, pCa=pCa, lattice_spacing=lattice_spacing,
+            final_state=final_state, metadata=metadata, dt=dt, name=name,
+            grid_shape=grid_shape, axis_names=axis_names, coords=coords,
+            topology_config=topology_config,
+        )
+
+    @property
+    def n_steps(self) -> int:
+        """Number of timesteps in the simulation."""
+        return self.metrics['axial_force'].shape[-1]
+
+    @property
+    def replicate_axis(self) -> Optional[int]:
+        """Index of replicate axis, derived from axis_names."""
+        if 'replicates' in self._axis_names:
+            return self._axis_names.index('replicates')
+        return None
+
+    @property
+    def time(self) -> jnp.ndarray:
+        """Time array in milliseconds."""
+        return jnp.arange(self.n_steps) * self.dt
+
+    @property
+    def axial_force(self) -> jnp.ndarray:
+        """Axial force at the M-line (pN). Equivalent to metrics['axial_force']."""
+        return self.metrics['axial_force']
+
+    @property
+    def mean_force(self) -> float:
+        """Mean axial force over simulation."""
+        return float(jnp.mean(self.metrics['axial_force']))
+
+    @property
+    def steady_state_force(self) -> float:
+        """Mean force over last 20% of simulation."""
+        n_avg = max(1, self.n_steps // 5)
+        return float(jnp.mean(self.metrics['axial_force'][..., -n_avg:]))
+
+    def mean(self) -> 'SimulationResult':
+        """Reduce across replicate axis (axis -2)."""
+        if self.replicate_axis is None:
+            raise ValueError("No replicate axis to reduce.")
+
+        new_metrics = MetricsDict({k: jnp.mean(v, axis=-2) for k, v in self.metrics.items()})
+        new_z = jnp.mean(self.z_line, axis=-2)
+        new_pCa = jnp.mean(self.pCa, axis=-2)
+        new_ls = jnp.mean(self.lattice_spacing, axis=-2)
+
+        new_coords = {k: v for k, v in self.coords.items() if k != 'replicates'}
+        new_axis_names = [n for n in self._axis_names if n != 'replicates']
+        new_force_shape = new_metrics['axial_force'].shape
+
+        return SimulationResult(
+            metrics=new_metrics, rng_key=self.rng_key,
+            z_line=new_z, pCa=new_pCa, lattice_spacing=new_ls,
+            final_state=None, metadata=self.metadata, dt=self.dt,
+            name=self.name + "_mean",
+            grid_shape=new_force_shape[:-1] if new_metrics['axial_force'].ndim > 1 else None,
+            axis_names=new_axis_names, coords=new_coords,
+        )
+
+    def std(self) -> 'SimulationResult':
+        """Standard deviation across replicate axis (axis -2)."""
+        if self.replicate_axis is None:
+            raise ValueError("No replicate axis to reduce.")
+
+        new_metrics = MetricsDict({k: jnp.std(v, axis=-2) for k, v in self.metrics.items()})
+        new_z = jnp.std(self.z_line, axis=-2)
+        new_pCa = jnp.std(self.pCa, axis=-2)
+        new_ls = jnp.std(self.lattice_spacing, axis=-2)
+
+        new_coords = {k: v for k, v in self.coords.items() if k != 'replicates'}
+        new_axis_names = [n for n in self._axis_names if n != 'replicates']
+
+        return SimulationResult(
+            metrics=new_metrics, rng_key=self.rng_key,
+            z_line=new_z, pCa=new_pCa, lattice_spacing=new_ls,
+            final_state=None, metadata=self.metadata, dt=self.dt,
+            name=self.name + "_std",
+            grid_shape=new_metrics['axial_force'].shape[:-1] if new_metrics['axial_force'].ndim > 1 else None,
+            axis_names=new_axis_names, coords=new_coords,
+        )
+
+    def __getitem__(self, key) -> 'SimulationResult':
+        """Slice all tensors identically, return new SimulationResult."""
+        new_metrics = MetricsDict({k: v[key] for k, v in self.metrics.items()})
+        new_z = self.z_line[key]
+        new_pCa = self.pCa[key]
+        new_ls = self.lattice_spacing[key]
+        new_force = new_metrics['axial_force']
+
+        return SimulationResult(
+            metrics=new_metrics, rng_key=self.rng_key,
+            z_line=new_z, pCa=new_pCa, lattice_spacing=new_ls,
+            final_state=None, metadata=self.metadata, dt=self.dt, name=self.name,
+            grid_shape=new_force.shape[:-1] if new_force.ndim > 1 else None,
+            axis_names=self._axis_names, coords=self.coords,
+        )
+
+    def summary(self) -> str:
+        """Return text summary of simulation results."""
+        lines = [
+            f"SimulationResult: {self.name}",
+            f"  Shape: {self.axial_force.shape}",
+            f"  Duration: {self.n_steps * self.dt:.1f} ms ({self.n_steps} steps @ dt={self.dt}ms)",
+            f"  Mean force: {self.mean_force:.2f} pN",
+            f"  Steady-state force: {self.steady_state_force:.2f} pN",
+            f"  Metrics: {list(self.metrics.keys()) if self.metrics else 'none'}",
+            f"  Max solver residual: {float(jnp.max(self.metrics['solver_residual'])):.4f} pN",
+        ]
+        if self._axis_names:
+            lines.append(f"  Grid axes: {self._axis_names}")
+        if self.coords:
+            lines.append(f"  Coords: {list(self.coords.keys())}")
+        return '\n'.join(lines)
+
+    def sel(self, **kwargs) -> 'SimulationResult':
+        """Coordinate-based slicing (e.g., result.sel(pCa=5.0)).
+
+        Args:
+            **kwargs: axis_name=value pairs. Value must exist in coords.
+
+        Returns:
+            Sliced SimulationResult
+        """
+        idx = [slice(None)] * self.axial_force.ndim
+        new_axis_names = list(self._axis_names)
+        new_coords = dict(self.coords)
+
+        for axis_name, value in kwargs.items():
+            if axis_name not in self.coords:
+                raise ValueError(f"Unknown axis '{axis_name}'. Available: {list(self.coords.keys())}")
+            coord_list = self.coords[axis_name]
+            if value not in coord_list:
+                raise ValueError(f"Value {value} not in {axis_name} coords: {coord_list}")
+            axis_idx = self._axis_names.index(axis_name)
+            val_idx = coord_list.index(value)
+            idx[axis_idx] = val_idx
+
+        result = self[tuple(idx)]
+        # Remove sliced axes from names/coords
+        for axis_name in kwargs:
+            if axis_name in new_axis_names:
+                new_axis_names.remove(axis_name)
+            new_coords.pop(axis_name, None)
+
+        result._axis_names = new_axis_names
+        result.coords = new_coords
+        return result
+
+    @classmethod
+    def stack(cls, results: List['SimulationResult'], axis_name: str = 'structural',
+              axis_values: Optional[List] = None) -> 'SimulationResult':
+        """Stack multiple SimulationResults along a new named axis.
+
+        Useful for structural sweeps (different topologies) that cannot be
+        batched within a single JIT call.
+
+        Args:
+            results: List of SimulationResult with compatible shapes
+            axis_name: Name for the new axis (e.g., 'nrows', 'structural')
+            axis_values: Optional coordinate values for the new axis
+
+        Returns:
+            Stacked SimulationResult with new leading axis
+        """
+        if not results:
+            raise ValueError("Cannot stack empty list of results")
+
+        stacked_z = jnp.stack([r.z_line for r in results])
+        stacked_pCa = jnp.stack([r.pCa for r in results])
+        stacked_ls = jnp.stack([r.lattice_spacing for r in results])
+
+        # Stack metrics (includes axial_force and solver_residual)
+        metric_keys = list(results[0].metrics.keys())
+        stacked_metrics = MetricsDict({
+            k: jnp.stack([r.metrics[k] for r in results]) for k in metric_keys
+        })
+
+        # Build new axis names and coords
+        new_axis_names = [axis_name] + results[0]._axis_names
+        new_coords = dict(results[0].coords)
+        new_coords[axis_name] = axis_values if axis_values is not None else list(range(len(results)))
+
+        return cls(
+            metrics=stacked_metrics,
+            rng_key=results[-1].rng_key,
+            z_line=stacked_z,
+            pCa=stacked_pCa,
+            lattice_spacing=stacked_ls,
+            final_state=None,
+            metadata=results[0].metadata,
+            dt=results[0].dt,
+            name=results[0].name + "_stacked",
+            grid_shape=stacked_metrics['axial_force'].shape[:-1],
+            axis_names=new_axis_names,
+            coords=new_coords,
+        )
+
+    def __repr__(self) -> str:
+        force = self.metrics.get('axial_force')
+        shape_str = str(force.shape) if force is not None and hasattr(force, 'shape') else '?'
+        return f"SimulationResult(name='{self.name}', shape={shape_str}, dt={self.dt})"
+
+
+# =============================================================================
+# BATCH PADDING (avoids recompilation for different sweep sizes)
+# =============================================================================
+
+BATCH_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384)
+
+
+def get_bucket_size(actual_size: int) -> int:
+    """Round up to the next bucket size for JIT cache reuse.
+
+    A 15x15 sweep (225) and a 12x12 sweep (144) both compile as 256.
+    """
+    for bucket in BATCH_BUCKETS:
+        if bucket >= actual_size:
+            return bucket
+    return actual_size  # Larger than all buckets — use exact size
+
+
+# Minibatch heuristic table: (min_padded_batch, chunk_size)
+# Benchmarked on RTX 3090, 2x2 lattice, 100ms (see benchmarking/benchmark_minibatch.py).
+#   batch=256:   no-minibatch is optimal (monotone degradation as M shrinks)
+#   batch=16384: M=4096 is 2.2% faster than no-minibatch (L2 cache fit)
+# Crossover between 256 and 16384 is not yet benchmarked — update this table
+# after running: python benchmarking/benchmark_minibatch.py --total_runs <N> --min_m 256
+#
+# Memory note (relevant for 8 GB GPUs, e.g. RTX 4060):
+#   Peak VRAM (GB) ≈ minibatch_size × n_steps × 45 × 4 bytes × 2 / 1e9
+#   Example: minibatch_size=4096, n_steps=1000 → ≈ 1.5 GB for metrics alone; ~3 GB total.
+#   If you hit OOM at large batch, reduce minibatch_size or pass it explicitly.
+_MINIBATCH_HEURISTIC = (
+    (16384, 4096),   # batch ≥ 16384 → chunk to 4096 (benchmarked optimal)
+)
+
+
+def _auto_minibatch_size(padded_batch: int) -> Optional[int]:
+    """Return the auto-selected chunk size for a given padded batch, or None."""
+    for threshold, chunk in _MINIBATCH_HEURISTIC:
+        if padded_batch >= threshold:
+            return chunk
+    return None
+
+
+# =============================================================================
+# MODULE-LEVEL SIMULATION KERNEL
+# =============================================================================
+
+@partial(jax.jit, static_argnames=['dt', 'unroll'])
+def _run_sim_kernel(
+    topology: SarcTopology,
+    batched_params: DynamicParams,
+    z_batched: jnp.ndarray,
+    pCa_batched: jnp.ndarray,
+    ls_batched: jnp.ndarray,
+    rng_keys: jnp.ndarray,
+    dt: float,
+    unroll: int,
+):
+    """JIT-compiled simulation kernel.
+
+    Always computes all metrics via compute_all_metrics(). No metrics/manifest
+    in static_argnames — changing metric selection never triggers recompilation.
+
+    Args:
+        topology: SarcTopology with pre-computed index maps (broadcast via closure)
+        batched_params: DynamicParams with batch dimension
+        z_batched: (batch, time) z-line values
+        pCa_batched: (batch, time) pCa values
+        ls_batched: (batch, time) lattice spacing values
+        rng_keys: (batch,) RNG keys
+        dt: Timestep in ms (static)
+        unroll: Scan unrolling factor (static)
+
+    Returns:
+        MetricsDict with all metric scalars, shape (batch, time).
+        Includes 'axial_force' and 'solver_residual' keys.
+    """
+
+    def create_and_equilibrate(constants, z0, pCa0, ls0):
+        """Create state from topology + constants and solve equilibrium."""
+        state = realize_state(topology, constants, z0, pCa0, ls0)
+        state = update_nearest_neighbors(state, constants, topology)
+        state, _residual = solve_equilibrium(state, constants, topology)
+        return state
+
+    def run_single_sim(state, constants, key, z_trace, pCa_trace, ls_trace):
+        """Run simulation with scan inside vmap."""
+        n_thick, n_crowns = state.thick.axial.shape
+        n_thin, n_sites = state.thin.axial.shape
+        precond_params = build_preconditioner_params(
+            n_thick, n_crowns, n_thin, n_sites,
+            constants.thick_k, constants.thin_k,
+        )
+        prefactored_precond = build_prefactored_preconditioner(precond_params)
+
+        delta_z = jnp.concatenate([jnp.zeros(1), jnp.diff(z_trace)])
+
+        def scan_fn(carry, inputs):
+            old_state, k = carry
+            z_val, pCa_val, ls_val, dz = inputs
+
+            old_state = old_state._replace(
+                thin=old_state.thin._replace(
+                    axial=old_state.thin.axial + dz
+                )
+            )
+
+            drivers = Drivers(pCa=pCa_val, z_line=z_val, lattice_spacing=ls_val)
+
+            pre_solve_thick_pos = old_state.thick.axial
+
+            new_state, new_k, solver_residual = timestep(
+                old_state, constants, drivers, topology, k, dt=dt,
+                precond_params=precond_params,
+                prefactored_precond=prefactored_precond,
+            )
+
+            force = axial_force_at_mline(new_state, constants)
+
+            all_metrics = compute_all_metrics(
+                old_state, new_state, constants, drivers, topology,
+                pre_solve_thick_pos, force, solver_residual, dt,
+            )
+
+            return (new_state, new_k), all_metrics
+
+        _, metrics_out = jax.lax.scan(
+            scan_fn,
+            (state, key),
+            (z_trace, pCa_trace, ls_trace, delta_z),
+            unroll=unroll,
+        )
+        return metrics_out
+
+    batched_states = jax.vmap(create_and_equilibrate, in_axes=(0, 0, 0, 0))(
+        batched_params,
+        z_batched[:, 0], pCa_batched[:, 0], ls_batched[:, 0],
+    )
+
+    batched_metrics = jax.vmap(
+        run_single_sim, in_axes=(0, 0, 0, 0, 0, 0)
+    )(
+        batched_states, batched_params, rng_keys,
+        z_batched, pCa_batched, ls_batched,
+    )
+
+    return batched_metrics
+
+
+# =============================================================================
+# TOP-LEVEL run() API
+# =============================================================================
+
+def run(
+    topology: SarcTopology,
+    duration_ms: float = 1000.0,
+    dt: float = 1.0,
+    pCa: Union[float, List[float], jnp.ndarray] = 4.5,
+    z_line: Union[float, List[float], jnp.ndarray] = 900.0,
+    lattice_spacing: Union[float, List[float], jnp.ndarray] = 14.0,
+    dynamic_params: Union[DynamicParams, Dict[str, Union[float, List[float]]]] = None,
+    replicates: int = 1,
+    rng_seed: int = 0,
+    unroll: int = 1,
+    minibatch_size: Optional[int] = "auto",
+    verbose: bool = False,
+) -> SimulationResult:
+    """Run a muscle simulation with the given topology.
+
+    This is the primary API. Accepts a pre-constructed SarcTopology
+    (topology defines structural configuration; changing it requires
+    recompilation). All other parameters are sweepable without recompile.
+
+    Batch padding: sweep sizes are rounded up to the nearest bucket
+    (1, 2, 4, ..., 16384), so a 225-run sweep and a 256-run sweep
+    share the same compiled kernel.
+
+    Args:
+        topology: Pre-constructed SarcTopology (from SarcTopology.create())
+        duration_ms: Simulation duration in milliseconds
+        dt: Timestep in milliseconds
+        pCa: Calcium as -log10([Ca]) -- float, list (sweep), or array (trace)
+        z_line: Z-line position (nm) -- float, list (sweep), or array (trace)
+        lattice_spacing: Lattice spacing (nm) -- float, list, or array
+        dynamic_params: DynamicParams or dict of overrides/sweeps
+        replicates: Number of statistical replicates per sweep point
+        rng_seed: Base random seed
+        unroll: Scan unrolling factor
+        minibatch_size: Chunk size for splitting the padded batch across multiple
+            _run_sim_kernel calls. "auto" (default) applies _MINIBATCH_HEURISTIC
+            based on padded batch size. None disables chunking. An explicit int
+            overrides the heuristic; snapped down to the nearest power-of-2 bucket.
+            Primary use: bounding peak GPU VRAM on memory-constrained GPUs (e.g.
+            8 GB RTX 4060). Rule of thumb: peak VRAM (GB) ≈
+            minibatch_size × n_steps × 45 × 4 bytes × 2 / 1e9. For a 4060 at
+            1000 steps, minibatch_size=4096 uses ~3 GB; 8192 uses ~6 GB.
+        verbose: Print progress info
+
+    Returns:
+        SimulationResult with shape (sweep_1, ..., replicates, time)
+
+    Example:
+        from multifil_jax.core.sarc_geometry import SarcTopology
+        from multifil_jax.core.params import get_default_params, StaticParams
+
+        static, dynamic = get_default_params()
+        topo = SarcTopology.create(nrows=2, ncols=2, static_params=static, dynamic_params=dynamic)
+
+        result = run(topo, pCa=4.5, z_line=900.0, duration_ms=100)
+        print(result.summary())
+    """
+    n_steps = int(duration_ms / dt)
+    topology = jax.device_put(topology)
+
+    # Resolve base dynamic params
+    if dynamic_params is None:
+        base_dynamic = DynamicParams()
+    elif isinstance(dynamic_params, DynamicParams):
+        base_dynamic = dynamic_params
+    elif isinstance(dynamic_params, dict):
+        base_dynamic = DynamicParams()
+    else:
+        raise ValueError(f"dynamic_params must be DynamicParams or dict, got {type(dynamic_params)}")
+
+    # Build sweep grid
+    sweep_axes = []
+    scalar_values = {}
+    trace_values = {}
+    param_sweep_names = set()
+
+    for name, value in [('z_line', z_line), ('pCa', pCa), ('lattice_spacing', lattice_spacing)]:
+        if isinstance(value, list):
+            sweep_axes.append((name, value))
+        elif hasattr(value, 'shape') and hasattr(value, 'ndim') and value.ndim > 0:
+            if value.shape[0] != n_steps:
+                raise ValueError(f"{name} array length {value.shape[0]} != n_steps {n_steps}")
+            trace_values[name] = jnp.asarray(value)
+        else:
+            scalar_values[name] = float(value)
+
+    if isinstance(dynamic_params, dict):
+        for param_name, param_values in dynamic_params.items():
+            if isinstance(param_values, list):
+                sweep_axes.append((param_name, param_values))
+                param_sweep_names.add(param_name)
+
+    # Build Cartesian product
+    if sweep_axes:
+        param_arrays = [jnp.array(vals) for _, vals in sweep_axes]
+        grids = jnp.meshgrid(*param_arrays, indexing='ij')
+        batch_size = grids[0].size
+        flat_grids = {name: g.flatten() for (name, _), g in zip(sweep_axes, grids)}
+    else:
+        batch_size = 1
+        flat_grids = {}
+
+    total_batch = batch_size * replicates
+    grid_shape = tuple(len(vals) for _, vals in sweep_axes)
+
+    axis_names = [name for name, _ in sweep_axes] + ['replicates', 'time']
+    coords = {name: list(vals) for name, vals in sweep_axes}
+    coords['replicates'] = list(range(replicates))
+    coords['time'] = (jnp.arange(n_steps) * dt).tolist()
+
+    if verbose:
+        print(f"Grid shape: {grid_shape}, axes: {axis_names}, "
+              f"batch_size: {batch_size}, total: {total_batch}")
+
+    # Tile for replicates
+    flat_grids_tiled = {name: jnp.repeat(arr, replicates) for name, arr in flat_grids.items()}
+
+    # Broadcast waveforms to (total_batch, n_steps)
+    def broadcast_waveform(name, default_val):
+        if name in flat_grids_tiled:
+            return jnp.broadcast_to(flat_grids_tiled[name][:, None], (total_batch, n_steps))
+        elif name in trace_values:
+            return jnp.broadcast_to(trace_values[name][None, :], (total_batch, n_steps))
+        elif name in scalar_values:
+            return jnp.full((total_batch, n_steps), scalar_values[name])
+        else:
+            return jnp.full((total_batch, n_steps), default_val)
+
+    z_batched = broadcast_waveform('z_line', 900.0)
+    pCa_batched = broadcast_waveform('pCa', 4.5)
+    ls_batched = broadcast_waveform('lattice_spacing', 14.0)
+
+    # Build batched DynamicParams
+    batched_param_kwargs = {}
+    for name in DYNAMIC_FIELDS:
+        if name in param_sweep_names and name in flat_grids_tiled:
+            batched_param_kwargs[name] = flat_grids_tiled[name]
+        elif isinstance(dynamic_params, dict) and name in dynamic_params:
+            val = dynamic_params[name]
+            if not isinstance(val, list):
+                batched_param_kwargs[name] = jnp.full(total_batch, float(val))
+            else:
+                batched_param_kwargs[name] = flat_grids_tiled[name]
+        else:
+            batched_param_kwargs[name] = jnp.full(total_batch, float(getattr(base_dynamic, name)))
+    batched_params = DynamicParams(**batched_param_kwargs)
+
+    # Generate unique RNG keys
+    rng_keys = jax.random.split(jax.random.PRNGKey(rng_seed), total_batch)
+
+    # Pad batch to bucket size
+    padded_batch = get_bucket_size(total_batch)
+    if padded_batch > total_batch:
+        pad_n = padded_batch - total_batch
+        z_batched = jnp.concatenate([z_batched, jnp.broadcast_to(z_batched[:1], (pad_n, n_steps))])
+        pCa_batched = jnp.concatenate([pCa_batched, jnp.broadcast_to(pCa_batched[:1], (pad_n, n_steps))])
+        ls_batched = jnp.concatenate([ls_batched, jnp.broadcast_to(ls_batched[:1], (pad_n, n_steps))])
+        rng_keys = jnp.concatenate([rng_keys, jax.random.split(jax.random.PRNGKey(rng_seed + 1), pad_n)])
+        pad_kwargs = {}
+        for name in DYNAMIC_FIELDS:
+            val = getattr(batched_params, name)
+            pad_kwargs[name] = jnp.concatenate([val, jnp.broadcast_to(val[:1], (pad_n,))])
+        batched_params = DynamicParams(**pad_kwargs)
+
+    if verbose:
+        print(f"Running simulation kernel (batch={total_batch}, padded={padded_batch})...")
+
+    resolved_minibatch = _auto_minibatch_size(padded_batch) if minibatch_size == "auto" else minibatch_size
+    # Snap to largest BATCH_BUCKETS value that (a) is <= resolved_minibatch and
+    # (b) divides padded_batch evenly. Since padded_batch is always a power of 2,
+    # any power-of-2 bucket <= padded_batch divides it. This prevents a non-bucket
+    # minibatch_size from producing a shorter last chunk and triggering a JIT recompile.
+    if resolved_minibatch is not None and resolved_minibatch not in BATCH_BUCKETS:
+        valid = [b for b in BATCH_BUCKETS if b <= resolved_minibatch and b <= padded_batch]
+        resolved_minibatch = max(valid) if valid else None
+    use_minibatch = (resolved_minibatch is not None) and (resolved_minibatch < padded_batch)
+
+    if not use_minibatch:
+        batched_metrics = _run_sim_kernel(
+            topology=topology,
+            batched_params=batched_params,
+            z_batched=z_batched,
+            pCa_batched=pCa_batched,
+            ls_batched=ls_batched,
+            rng_keys=rng_keys,
+            dt=dt,
+            unroll=unroll,
+        )
+    else:
+        if verbose:
+            print(f"Minibatching: {padded_batch // resolved_minibatch} chunks of {resolved_minibatch}")
+        chunks = []
+        for start in range(0, padded_batch, resolved_minibatch):
+            end = start + resolved_minibatch
+            chunks.append(_run_sim_kernel(
+                topology=topology,
+                batched_params=jax.tree_util.tree_map(lambda x: x[start:end], batched_params),
+                z_batched=z_batched[start:end],
+                pCa_batched=pCa_batched[start:end],
+                ls_batched=ls_batched[start:end],
+                rng_keys=rng_keys[start:end],
+                dt=dt,
+                unroll=unroll,
+            ))
+        batched_metrics = MetricsDict({
+            k: jnp.concatenate([c[k] for c in chunks], axis=0)
+            for k in chunks[0]
+        })
+
+    # Slice back to actual batch size
+    if padded_batch > total_batch:
+        batched_metrics = MetricsDict({k: v[:total_batch] for k, v in batched_metrics.items()})
+        z_batched = z_batched[:total_batch]
+        pCa_batched = pCa_batched[:total_batch]
+        ls_batched = ls_batched[:total_batch]
+
+    # Reshape to data cube
+    final_shape = grid_shape + (replicates, n_steps)
+    reshaped_metrics = MetricsDict({key: val.reshape(final_shape) for key, val in batched_metrics.items()})
+    reshaped_z = z_batched.reshape(final_shape)
+    reshaped_pCa = pCa_batched.reshape(final_shape)
+    reshaped_ls = ls_batched.reshape(final_shape)
+
+    # Post-run solver residual validation
+    max_residual = float(jnp.max(reshaped_metrics['solver_residual']))
+    tol = StaticParams().solver_residual_tol
+    if max_residual > tol:
+        import warnings
+        warnings.warn(
+            f"Solver max residual {max_residual:.2f} pN exceeds "
+            f"threshold {tol} pN (set via StaticParams.solver_residual_tol)"
+        )
+
+    if verbose:
+        print(f"Result shape: {reshaped_metrics['axial_force'].shape}")
+        print(f"Max solver residual: {max_residual:.4f} pN")
+
+    topology_config = {
+        'n_thick': topology.n_thick,
+        'n_crowns': topology.n_crowns,
+        'n_thin': topology.n_thin,
+        'n_sites': topology.n_sites,
+        'n_titin': topology.n_titin,
+        'total_xbs': topology.total_xbs,
+        'n_faces_per_thin': topology.n_faces_per_thin,
+    }
+
+    return SimulationResult(
+        metrics=reshaped_metrics,
+        rng_key=rng_keys[-1],
+        z_line=reshaped_z,
+        pCa=reshaped_pCa,
+        lattice_spacing=reshaped_ls,
+        final_state=None,
+        metadata={
+            'grid_shape': grid_shape,
+            'axis_names': axis_names,
+            'master_seed': rng_seed,
+        },
+        dt=dt,
+        name="run",
+        grid_shape=grid_shape,
+        axis_names=axis_names,
+        coords=coords,
+        topology_config=topology_config,
+    )
+

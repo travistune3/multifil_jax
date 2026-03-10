@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "multifil_jax"
+version = "3.0.0"
+description = "JAX-accelerated half-sarcomere muscle contraction simulator"
+requires-python = ">=3.10"
+dependencies = [
+    "jax>=0.4.25",
+    "jaxlib>=0.4.25",
+    "numpy>=1.23",
+]
+
+[project.optional-dependencies]
+cuda12 = ["jax[cuda12]>=0.4.25"]
+cuda13 = ["jax[cuda13]>=0.8.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["multifil_jax*"]

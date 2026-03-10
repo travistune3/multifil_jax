@@ -1,0 +1,1480 @@
+================================================================================
+NOTE TO AI ASSISTANTS: This file is a running log of development sessions.
+DO NOT overwrite previous sessions. Always APPEND a new session to the end 
+and increment the session number, keeping a consistent format. This preserves 
+the history of what was done.
+================================================================================
+
+
+Session 1 — 2026-02-10
+==============================
+
+GOAL: Eliminate GPU kernel launch overhead in Newton-CG solver by replacing
+      jax.lax.fori_loop/scan with Python for loops (XLA unrolls at trace time).
+
+CHANGES MADE
+=============
+
+1. Solver Loop Unrolling (kernels/solver.py)
+   - Thomas algorithm: lax.scan → Python for loops in thomas_factor() and thomas_solve()
+   - CG solver: fori_loop → Python for loop, renamed _preconditioned_cg_fori → _preconditioned_cg
+   - Newton solver: fori_loop → Python for loop with lambda x=x closure trick
+   - All three loop levels now unrolled at trace time — no WhileOp in solver
+
+2. Removed use_mixed_precision (solver.py, timestep.py)
+   - Deleted float64 casting paths from _newton_solve, solve_equilibrium, timestep
+   - float64 was never used and is 2-16x slower on GPU
+
+3. Preconditioner Broadcast Optimization (state.py, solver.py)
+   - PreconditionerParams now stores single-filament arrays: (n_crowns,) not (n_thick, n_crowns)
+   - build_prefactored_preconditioner factors ONE matrix per type (no vmap)
+   - apply_preconditioner broadcasts shared factors via vmap in_axes=(None, 0)
+   - Auto-detects shared (ndim==1) vs per-filament (ndim==2) for future compatibility
+
+FILES MODIFIED
+==============
+- jax/multifil_jax/kernels/solver.py  — loop unrolling, mixed precision removal, precond broadcast
+- jax/multifil_jax/timestep.py        — removed use_mixed_precision parameter
+- jax/multifil_jax/core/state.py      — PreconditionerParams to single-filament arrays
+
+PERFORMANCE RESULTS (2x2 lattice, 25 timesteps, RTX 3090)
+==========================================================
+
+GPU Kernel Events (Perfetto trace, 20 steps):
+  Before: 1,000,000+ (truncated at cap), 214k MemcpyD2D, 9.5s GPU time
+  After:  50,263 events, 2.7k MemcpyD2D, 0.17s GPU time
+  Improvement: 56x fewer GPU kernel time, 79x fewer MemcpyD2D
+
+Compile Time:
+  Before (fori_loop):           ~30s (estimated)
+  After (all unrolled):         479s
+  After (+ precond broadcast):  307s
+
+Execution Time (WITHOUT profiler — profiler adds 30x overhead!):
+  Before (fori_loop):           not measured this session
+  After (all unrolled):         6.5 ms/step
+  After (+ precond broadcast):  5.7 ms/step
+
+Correctness:
+  Solver residual max: 0.22 pN (threshold 0.5 pN) ✓
+  Force range: [28, 593] pN ✓
+
+KEY FINDING: The 2.4s "execution time" originally reported was entirely
+jax.profiler instrumentation overhead. Actual execution is 0.14s for 25 steps.
+
+LATTICE SIZE REFERENCE
+======================
+  2x2: n_thick=4,  n_thin=8,   DOF=928,    XBs=624
+  4x4: n_thick=16, n_thin=32,  DOF=3,712,  XBs=2,496
+  8x8: n_thick=64, n_thin=128, DOF=14,848, XBs=9,984
+
+
+Session 2 — 2026-02-10
+==============================
+
+GOAL: Benchmark different lattice sizes for execution time and solver convergence.
+      Determine if adaptive preconditioner is needed at large lattice sizes.
+
+BENCHMARK RESULTS (RTX 3090, 25 steps, pCa=4.0, z=900nm, dt=1.0ms)
+====================================================================
+
+Lattice  n_thick  Compile   ms/step  Realtime  Resid_max  Resid_p95  Force_range
+  2x2       4     269.8s     5.84     171x      0.215      0.211     [38, 457]
+  4x4      16     392.4s     4.54     220x      0.239      0.237     [105, 1701]
+  6x6      36     316.9s     4.90     204x      0.234      0.232     [268, 4402]
+  8x8      64     281.6s     4.70     213x      0.237      0.234     [444, 8672]
+
+Solver: 4 Newton x 6 CG, static preconditioner, threshold 0.5 pN
+
+KEY FINDINGS
+============
+
+1. EXECUTION TIME IS FLAT ACROSS LATTICE SIZES
+   - 4.5 - 5.8 ms/step from 2x2 (4 filaments) to 8x8 (64 filaments)
+   - 16x more DOF but no slowdown — GPU vmap parallelism absorbs it entirely
+   - 2x2 is actually slowest (5.84 ms/step) due to GPU underutilization
+   - All sizes achieve 170-220x realtime
+
+2. SOLVER CONVERGENCE IS ROCK SOLID
+   - Max residual: 0.21-0.24 pN across ALL sizes (threshold 0.5 pN)
+   - No degradation from 2x2 to 8x8 — conditioning does not worsen
+   - Static preconditioner is more than adequate at all tested sizes
+
+3. ADAPTIVE PRECONDITIONER IS NOT NEEDED
+   - Static preconditioner (single-filament broadcast) works perfectly
+   - No convergence degradation at 8x8
+   - Adding per-filament XB diagonal updates would add complexity for zero benefit
+   - DECISION: Do not implement adaptive preconditioner
+
+4. COMPILE TIME IS THE BOTTLENECK
+   - 270-390s regardless of lattice size (XLA optimization time dominates)
+   - No clear scaling with problem size
+   - This is the main development friction point
+
+5. FORCE SCALES LINEARLY
+   - ~107-134 pN per thick filament at steady state (pCa=4.0, z=900)
+   - Expected: force is additive across parallel filaments
+
+FILES CREATED
+=============
+- examples/benchmark_lattice.py  — Lattice size benchmark script
+
+NEXT SESSION
+============
+1. XLA Persistent Compilation Cache
+   - Enable via jax.config or XLA_FLAGS to eliminate recompilation on restarts
+   - Would reduce re-compilation from ~300s to <5s
+
+2. Longer simulation benchmarks (1000+ steps)
+   - Verify scan overhead is O(1) per step at scale
+   - Check VRAM usage at 8x8 with 1000 steps
+
+3. Parameter sweep benchmarks
+   - How does vmap batch size interact with lattice size?
+   - Does batch*lattice eventually saturate GPU?
+
+4. Consider reducing Newton/CG iteration counts
+   - Residuals are well under threshold (~0.23 vs 0.5 pN)
+   - Could try 3 Newton x 4 CG — saves compile time if residuals stay acceptable
+
+
+Session 3 — 2026-02-10
+==============================
+
+GOAL: Optimize XLA compile time (~270-390s) without sacrificing runtime or
+      solver convergence. Three compile-time optimizations plus a stress-test
+      benchmark to inform future iteration reduction.
+
+CHANGES MADE
+=============
+
+1. Thomas solve → fori_loop (kernels/solver.py, lines 98-130)
+   - Replaced Python `for` loops in thomas_solve() with jax.lax.fori_loop
+   - Forward substitution: fori_loop(1, n, fwd_step, y) with y.at[i].set()
+   - Back substitution: fori_loop(0, n-1, bwd_step, x) with reversed index n-2-i
+   - thomas_factor() UNCHANGED — called once before scan, not in hot path
+   - Rationale: Thomas is inherently sequential (each step depends on previous).
+     Unrolling gives no parallelism benefit, only graph bloat (~14K → ~560 ops).
+   - Expected: ~10-15% scan body graph reduction → ~10-15% faster compilation
+
+2. Persistent XLA compilation cache (utils/hardware.py, lines 192-202)
+   - Added jax_compilation_cache_dir config at module level (after detect_hardware())
+   - Default location: ~/.cache/multifil_jax/xla/
+   - Override via MULTIFIL_JAX_CACHE_DIR environment variable
+   - Min compile time threshold: 5s (only caches expensive compilations)
+   - Effect: second run with same config loads compiled kernel in seconds
+
+3. XLA GPU autotune level (utils/hardware.py, lines 44-53, 105-106)
+   - Added _configure_xla_for_gpu() that sets --xla_gpu_autotune_level=2
+   - Called from detect_hardware() when GPU detected
+   - Reduces autotuning from default level 4 to level 2
+   - Level 2 still selects good kernels but skips exhaustive variant search
+   - Respects existing XLA_FLAGS (won't override if user set manually)
+   - Expected: ~5-15% compile time reduction
+
+4. Stress-test benchmark protocol (examples/benchmark_lattice.py)
+   - Added benchmark_stress() function with z_line step waveform
+   - Protocol: z_line holds at 1050nm for 10 steps, steps to 900nm (~14% shortening)
+   - pCa=4.0 (high calcium, many bound crossbridges resist motion)
+   - This is worst-case for solver: pre-solve positions far from new equilibrium
+   - Reports: per-step residuals around step, worst step, force transient
+   - Added --protocol stress CLI argument (default: isometric)
+   - Purpose: determine whether iteration reduction (4Nx6CG → 3Nx4CG) is safe
+
+FILES MODIFIED
+==============
+- jax/multifil_jax/kernels/solver.py  — thomas_solve fori_loop + docstrings
+- jax/multifil_jax/utils/hardware.py  — persistent cache, GPU autotune, _configure_xla_for_gpu()
+- examples/benchmark_lattice.py       — stress-test protocol, --protocol arg
+
+EXPECTED PERFORMANCE IMPACT
+===========================
+
+| Change              | Compile Impact   | Runtime Impact | Convergence Risk |
+|---------------------|------------------|----------------|------------------|
+| Thomas fori_loop    | -10-15%          | Verify neutral | None             |
+| Persistent cache    | -100% on restart | None           | None             |
+| XLA autotune lv2    | -5-15%           | ~Neutral       | None             |
+| Stress benchmark    | Diagnostic only  | N/A            | N/A              |
+
+Combined first-compile: ~15-25% faster (est. 200-280s vs 270-390s)
+Cached restart: <5s
+
+VERIFICATION COMMANDS
+=====================
+  python examples/benchmark_lattice.py --sizes 2,4 --steps 25       # Isometric
+  python examples/benchmark_lattice.py --protocol stress --sizes 2   # Stress test
+
+NEXT SESSION
+============
+1. Run benchmarks to measure actual compile-time and runtime impact
+2. Run stress test to determine if iteration reduction is safe
+3. If stress test passes: try 3 Newton x 4 CG for further compile speedup
+4. Longer simulation benchmarks (1000+ steps) for VRAM and scan overhead
+
+
+Session 4 — 2026-02-10
+==============================
+
+GOAL: Run Session 3 verification benchmarks, analyze results, revert regressions.
+
+BENCHMARK RESULTS (Session 3 code, RTX 3090)
+=============================================
+
+Isometric (--sizes 2,4 --steps 25):
+  Lattice  Compile   ms/step  Realtime  Resid_max  Force_range
+    2x2     37.6s    108.54       9x     0.2241     [25, 492]
+    4x4     44.3s    104.38      10x     0.2335     [105, 1735]
+
+Stress (--protocol stress --sizes 2, 50 steps):
+  Lattice  Compile   ms/step  Resid_max  Worst_step  Force_range
+  2x2       37.6s    101.25    0.3125          4      [-11271, 542]
+
+Compare Session 2 baseline (all-unrolled, no cache):
+  2x2: compile 269.8s, exec 5.84 ms/step, resid 0.215
+  4x4: compile 392.4s, exec 4.54 ms/step, resid 0.239
+
+ANALYSIS
+========
+
+1. COMPILE TIME: Improved ~7-9x (270-390s → 38-44s)
+   - Persistent cache + fori_loop graph reduction both contributed
+   - Much better than the expected 15-25% improvement
+
+2. RUNTIME: Regressed ~20x (4.5-5.8 ms/step → 101-109 ms/step)
+   - thomas_solve fori_loop is the primary suspect: XLA cannot fuse memory
+     operations across fori_loop boundaries, so each of ~52 sequential steps
+     becomes a separate kernel launch instead of being fused
+   - XLA autotune level 2 (down from default 4) may also contribute:
+     less autotuning = worse kernel variant selection
+   - Persistent cache: no runtime impact (only affects compile)
+
+3. SOLVER CONVERGENCE: Unchanged (good)
+   - Residuals 0.22-0.31 pN, all under 0.5 pN threshold
+   - Stress test passed: max 0.3125 pN at step 4 (z_line transition)
+   - Iteration reduction (3Nx4CG) may be viable
+
+4. BENCHMARK SCRIPT BUG FIXED
+   - The "!!! = exceeds threshold" legend printed unconditionally in summary
+   - Misleading when all results were actually under threshold
+   - Fixed: legend now only appears when a result actually exceeds threshold;
+     otherwise prints "All runs converged" message
+
+CHANGES MADE (REVERTS)
+======================
+
+1. thomas_solve → Python for loops RESTORED (kernels/solver.py)
+   - Reverted fori_loop back to Python for loops (Session 1 style)
+   - Forward sub: list append + jnp.stack
+   - Back sub: reversed list append + jnp.stack
+   - Added docstring note explaining why fori_loop was tried and rejected
+   - Rationale: 20x runtime regression not worth compile-time savings
+
+2. XLA autotune level → default RESTORED (utils/hardware.py)
+   - Reverted _configure_xla_for_gpu() to a no-op (default autotune level 4)
+   - May have contributed to runtime regression via suboptimal kernel selection
+
+3. Persistent XLA cache → KEPT (utils/hardware.py)
+   - No runtime impact, purely beneficial for restart speed
+   - Stale cache cleared (had compiled artifacts from fori_loop version)
+
+4. Benchmark legend fix (examples/benchmark_lattice.py)
+   - "!!! = exceeds threshold" line now conditional on any result exceeding
+   - "All runs converged" printed when all results pass
+
+FILES MODIFIED
+==============
+- jax/multifil_jax/kernels/solver.py  — thomas_solve reverted to Python for loops
+- jax/multifil_jax/utils/hardware.py  — autotune level 2 reverted to default
+- examples/benchmark_lattice.py       — conditional threshold legend
+
+KEY LESSON
+==========
+fori_loop in thomas_solve trades compile time for runtime: XLA's loop body
+becomes opaque, preventing cross-iteration fusion. For sequential algorithms
+called inside vmap (once per filament per CG step per Newton step per timestep),
+the overhead compounds catastrophically. Python unrolling produces a larger XLA
+graph but allows full fusion — rely on persistent cache for fast restarts instead.
+
+NEXT SESSION
+============
+1. Re-run benchmarks to confirm runtime restored to ~5 ms/step with cache
+2. Try 3 Newton x 4 CG iteration reduction (stress test shows headroom)
+3. Longer simulation benchmarks (1000+ steps) for VRAM and scan overhead
+4. Parameter sweep benchmarks (batch*lattice GPU saturation)
+
+
+Session 5 — 2026-02-10
+==============================
+
+GOAL: Fix operator-splitting bug where transitions used stale thin filament
+      positions after z_line changes, causing unphysical force transients.
+
+PROBLEM IDENTIFIED
+==================
+
+Stress test (z_line step 1050→900nm at t=10, pCa=4.0) produced force = -11521 pN.
+Force should rarely be negative and never that magnitude. Root cause: an operator-
+splitting ordering bug present in BOTH the JAX version and the original OOP NumPy
+version (multifil_five_state/multifil/hs.py).
+
+Bug mechanism (JAX timestep.py, simulation.py scan_fn):
+  1. resolve_drivers(z_line=900)        ← constants updated to new z_line
+  2. update_nearest_neighbors(state)    ← uses state.thin.axial still at z=1050
+  3. thick_transitions(state)           ← XB distances from z=1050 geometry
+                                           XBs don't "see" 150nm strain → stay bound
+  4. solve_equilibrium(z=900)           ← solver forces 150nm shortening with all
+                                           XBs still bound → enormous compression
+  5. force = axial_force_at_mline()     ← -11521 pN (crown compressed past bare_zone)
+
+XBs should detach when strained by 150nm (detachment rate exponential in energy),
+but transitions computed rates from OLD positions that didn't reflect the z_line
+change. The -11521 pN is the correct instantaneous elastic response at t=0+, but
+at the model's 1ms timescale, XBs would detach in nanoseconds — the force is a
+discretization artifact.
+
+OOP VERSION COMPARISON
+======================
+
+Read multifil_five_state/multifil/hs.py to compare ordering. Found identical
+behavior:
+
+  OOP timestep() (line 1343):
+    self.current_timestep = current    → setter updates z_line, pCa, ls (line 2352)
+    self.set_subject_to_cooperativity()
+    self.set_xb_nearest_binding_site() → uses OLD thick.axial, thin.axial
+    self.thin_transitions()
+    self.thick_transitions()           → distances from OLD positions (line 1983)
+    while ...: self.Newton()           → solver uses NEW z_line boundary
+
+  z_line setter (line 2380):
+    self._z_line = new_z_line
+    self.update_ls_from_poisson_ratio()  ← updates lattice_spacing via Poisson
+    self.update_volume()
+    # Does NOT shift thin filament positions
+
+Confirmed: OOP version has the same bug. Tested and reproduced same phenomenon
+in the OOP version.
+
+DRIVER APPLICATION ANALYSIS
+===========================
+
+Checked how each driver is applied before transitions:
+
+  pCa:             CORRECT — used directly via resolved_constants.pCa in rate
+                   functions (transitions.py:1115). No state to update.
+
+  lattice_spacing: CORRECT — rate computation uses constants.lattice_spacing
+                   directly (transitions.py:1111), overriding stale xb_distances
+                   radial component. No position state to update.
+
+  z_line:          BROKEN — thin filament positions (state.thin.axial) remain at
+                   old z_line equilibrium. From realize_state (state.py:477):
+                   thin_axial = z_line - topology.binding_offsets. When z_line
+                   changes, all thin positions should shift by delta_z.
+
+FIX IMPLEMENTED
+===============
+
+Precompute z_line deltas from the known z_trace array. Apply thin filament
+position shift BEFORE timestep() runs in the scan function. No carry state
+modification needed.
+
+Changed file: simulation.py (run_single_sim / scan_fn)
+
+  Before scan loop:
+    delta_z = jnp.concatenate([jnp.zeros(1), jnp.diff(z_trace)])
+
+  At top of scan_fn (before timestep call):
+    old_state = old_state._replace(
+        thin=old_state.thin._replace(axial=old_state.thin.axial + dz)
+    )
+
+  Scan inputs: added delta_z as 4th element of input tuple.
+
+Rationale:
+  - delta_z precomputed from z_trace — no need to carry prev_z_line in state
+  - First delta is 0 (state already equilibrated at z_trace[0])
+  - For isometric runs (constant z_line), dz=0 every step — pure no-op
+  - Thick filaments anchored at M-line (fixed) — only thin filaments shift
+  - After shift, update_nearest_neighbors computes correct XB-BS distances
+  - XBs see real strain → detach at correct rates
+  - Solver then refines from the shifted starting point
+
+SEQUENCE AFTER FIX
+==================
+
+  1. Shift thin positions by delta_z     ← NEW: geometry reflects z_line change
+  2. resolve_drivers(z_line, pCa, ls)
+  3. update_nearest_neighbors(state)     ← distances now reflect new z_line
+  4. cooperativity, thin_transitions
+  5. thick_transitions                   ← XBs see correct strain → detach
+  6. solve_equilibrium                   ← refines positions
+  7. force = axial_force_at_mline()      ← physically reasonable force
+
+VERIFICATION
+============
+  Clear XLA cache: rm -rf ~/.cache/multifil_jax/xla/
+  Stress test:     python examples/benchmark_lattice.py --protocol stress --sizes 2
+  Isometric:       python examples/benchmark_lattice.py --sizes 2,4 --steps 25
+
+Expected: stress test force transient should no longer show -11521 pN. Force may
+still dip at step 10 (z_line change is large), but XBs should detach and force
+should recover quickly without extreme negative values.
+
+NEXT SESSION
+============
+1. Run stress test to verify fix eliminates unphysical force transient
+2. Run isometric benchmark to confirm no regression (dz=0 path)
+3. Try 3 Newton x 4 CG iteration reduction (stress test with fix)
+4. Longer simulation benchmarks (1000+ steps)
+5. Consider adding Poisson ratio coupling (OOP version updates lattice_spacing
+   from z_line via update_ls_from_poisson_ratio — JAX version treats them as
+   independent drivers)
+
+
+Session 6 — 2026-02-11
+==============================
+
+GOAL: Fix XLA autotuning failure when running large parameter sweeps at 4x4
+      lattice with 1000 timesteps.
+
+PROBLEM IDENTIFIED
+==================
+
+Running a Protocol with 15x15 parameter sweep (thick_k × thin_k), 5 replicates,
+4x4 lattice, 1000 timesteps caused:
+
+  JaxRuntimeError: INTERNAL: Autotuning failed for HLO:
+    %loop_transpose_fusion.12 = s32[1125,1000,2496]{2,1,0}
+    ...with error: NOT_FOUND: No valid config found!
+
+Dimensions: 1125 batch (15×15×5) × 1000 timesteps × 2496 XB state elements
+(16 thick × 52 crowns × 3 XBs = 2496). This tensor is ~11.2 GB of int32 alone.
+
+ROOT CAUSE
+==========
+
+METRIC_REQUIREMENTS in metrics_fn.py declared that metrics like `atp_consumed`
+need `{'xb_states'}` and energy metrics need `{'thick_axial'}` stored in
+SummaryState. This caused compute_manifest() to include those fields, so the
+scan accumulated FULL state arrays as output at every timestep:
+
+  - xb_states: s32[1125, 1000, 2496] ≈ 11.2 GB
+  - thick_axial: f32[1125, 1000, 832] ≈ 3.7 GB
+  Total: ~15 GB of scan output that nobody reads.
+
+The metrics compute scalar results inside the scan body via the handler and
+return them in the custom dict. Protocol.execute() only reads
+summaries.force and summaries.solver_residual (both scalars). The raw arrays
+in SummaryState optional fields were never accessed by any downstream code.
+
+FIX IMPLEMENTED
+===============
+
+Changed all METRIC_REQUIREMENTS values to set() (empty) in metrics_fn.py.
+This makes compute_manifest() return frozenset() for any metric combination,
+so all SummaryState optional fields default to jnp.zeros(()) sentinels.
+
+Before:
+  METRIC_REQUIREMENTS = {
+      'atp_consumed': {'xb_states'},
+      'thick_energy_first_avg': {'thick_axial'},
+      'thick_energy_first_delta_avg': {'thick_axial'},
+      'n_bound': {'xb_states'},
+      'work_thick': {'force', 'thick_axial', 'pre_solve_thick_pos'},
+      ...
+  }
+
+After:
+  METRIC_REQUIREMENTS = {
+      'atp_consumed': set(),
+      'thick_energy_first_avg': set(),
+      'thick_energy_first_delta_avg': set(),
+      'n_bound': set(),
+      'work_thick': set(),
+      ...  # all set()
+  }
+
+FILES MODIFIED
+==============
+- jax/multifil_jax/metrics_fn.py  — all METRIC_REQUIREMENTS set to empty set()
+
+IMPACT
+======
+- Eliminates ~15 GB of wasted scan output VRAM for the user's workload
+- Metric scalar results are unaffected (still computed identically in scan body)
+- XLA autotuner no longer needs to handle s32[1125,1000,2496] fusion
+- XLA compilation cache should be cleared: rm -rf ~/.cache/multifil_jax/xla/
+
+KEY LESSON
+==========
+SummaryState optional fields were designed for post-hoc raw data access, but
+no downstream code reads them. The METRIC_REQUIREMENTS dict was conflating
+"what the metric function needs to compute" with "what raw arrays to store as
+scan output." Since all metrics compute scalar results inside the scan body
+and return them via the custom dict, storing the raw arrays is pure waste.
+For large sweeps (batch × timesteps × state_dim), this waste exceeds GPU VRAM
+and causes XLA autotuning to fail entirely.
+
+NEXT SESSION
+============
+1. Verify fix by running the 15x15 sweep Protocol (compile + execute)
+2. Longer simulation benchmarks (1000+ steps) for VRAM and scan overhead
+3. Parameter sweep benchmarks (batch*lattice GPU saturation)
+4. Try 3 Newton x 4 CG iteration reduction
+
+
+Session 7 — 2026-02-14
+==============================
+
+GOAL: Implement comprehensive Simulation API refactoring plan (9 phases, 12 steps).
+      Replace Protocol with simpler run() API, always compute all metrics, add batch
+      padding, remove all legacy code and backwards-compatibility aliases.
+
+CHANGES MADE (12 IMPLEMENTATION STEPS)
+=======================================
+
+Step 1 (Phase 7): Legacy Cleanup
+- Deleted expm_pade3_single(), expm_pade3_batch() from transitions.py
+- Deleted _compute_dead_zone_Q_matrix() from transitions.py
+- Deleted __main__ test blocks from transitions.py and cooperativity.py
+- Made expm_pade6_batch() identity parameter required (not Optional)
+- Deleted find_cooperative_sites() from cooperativity.py
+- Deleted find_nearest_binding_sites() from geometry.py
+- Replaced all SarcGeometry references with SarcTopology across codebase
+- Deleted SarcGeometry = SarcTopology alias from sarc_geometry.py
+- Updated module docstrings in sarc_geometry.py
+
+Step 2 (Phase 2): Extract Shared Helper
+- Added compute_xb_transition_matrices() to transitions.py
+  Returns (Q_all, P_all, bin_indices) — shared by thick_transitions and metrics
+- Simplified thick_transitions(): removed return_P/return_Q params, returns just state
+
+Step 3 (Phase 2): Simplify timestep and solver
+- solve_equilibrium() now returns (State, residual_scalar) instead of (State, SolverInfo)
+- Removed SolverInfo import and construction from solver.py
+- Rewrote timestep.py: removed return_info param, always returns (state, rng_key, residual)
+- Deleted get_simulation_stats() function from timestep.py
+- Deleted SolverInfo, TransitionInfo, StepInfo NamedTuples from state.py
+
+Step 4 (Phase 1): Rewrite metrics_fn.py
+- Single compute_all_metrics() function returning ~43-key fixed dict
+- Internally calls compute_xb_transition_matrices() for ATP expected metrics
+- Deleted all registry machinery: METRIC_REGISTRY, register_metric, get_metrics_handler,
+  compute_manifest, composite_metrics_wrapper, get_default_metrics, get_minimal_metrics, etc.
+
+Step 5 (Phase 3): Update scan loop in simulation.py
+- Renamed kernel from _run_sim_kernel_geometry to _run_sim_kernel
+- Removed metrics/manifest from @jax.jit static_argnames (now only dt, unroll)
+- Scan body calls compute_all_metrics() directly, no handler/manifest logic
+
+Step 6 (Phase 4): Batch padding
+- Added BATCH_BUCKETS = (1,2,4,8,...,16384) and get_bucket_size()
+- Padding/unpadding logic in execute() — sweeps of similar size share compiled kernels
+
+Step 7 (Phase 5): Add run() function
+- Top-level run(topology, ...) function — standalone, doesn't create Protocol internally
+- Added FutureWarning deprecation to Protocol.__post_init__
+
+Step 8 (Phase 6): SimulationResult enhancements
+- Added topology_config dict (n_thick, n_crowns, n_thin, n_sites, etc.)
+- Added sel(**kwargs) method for coordinate-based slicing
+- Added stack() classmethod for combining results from different topologies
+- Updated tree_flatten/tree_unflatten for new fields
+- Populated topology_config in both execute() and run()
+
+Step 9 (Phase 2): Simplify SummaryState
+- Reduced SummaryState to just force + solver_residual (removed 4 optional sentinel fields)
+- Deleted project_summary() function from state.py
+
+Step 10 (Phase 7): Update __init__.py exports
+- Rewrote multifil_jax/__init__.py: exports SarcTopology, timestep, compute_all_metrics,
+  realize_state, axial_force_at_mline, get_default_params, count_transitions
+- Removed dead imports: get_simulation_stats, calculate_total_force, SarcGeometry,
+  oop_wrapper try/except, batch try/except
+- Updated core/__init__.py: SarcTopology instead of SarcGeometry, added realize_state
+- Bumped version to 3.0.0
+
+Step 11 (Phase 8): Rewrite examples/test.py
+- Uses run() API with SarcTopology.create() instead of Protocol
+- Removed metrics=[...] argument (all metrics always computed)
+- Added structural sweep example using SimulationResult.stack()
+
+Step 12 (Phase 9): Update tests
+- Rewrote test_namedtuple_state.py for tiered architecture (Drivers, topology, constants)
+- Rewrote test_sarc_geometry_parity.py: SarcGeometry→SarcTopology, NamedTuple state API
+- Created test_api_refactor.py with 9 validation tests:
+  - compute_all_metrics keys and no-NaN validation
+  - SummaryState only has 2 fields
+  - Deleted symbols not importable
+  - run() API with scalar and sweep inputs
+  - SimulationResult.sel() and .stack()
+  - Batch padding bucket sizes
+  - SarcGeometry alias removed
+
+FILES MODIFIED
+==============
+- jax/multifil_jax/metrics_fn.py           — Complete rewrite (registry → single function)
+- jax/multifil_jax/timestep.py             — Simplified (no return_info, no get_simulation_stats)
+- jax/multifil_jax/kernels/transitions.py  — Shared helper, simplified thick_transitions
+- jax/multifil_jax/kernels/solver.py       — Returns residual scalar (no SolverInfo)
+- jax/multifil_jax/core/state.py           — Deleted 3 NamedTuples, simplified SummaryState
+- jax/multifil_jax/core/sarc_geometry.py   — Deleted SarcGeometry alias, updated docstrings
+- jax/multifil_jax/kernels/cooperativity.py — Deleted legacy find_cooperative_sites
+- jax/multifil_jax/kernels/geometry.py     — Deleted legacy find_nearest_binding_sites
+- jax/multifil_jax/kernels/forces.py       — SarcGeometry → SarcTopology references
+- jax/multifil_jax/__init__.py             — Complete rewrite for new API
+- jax/multifil_jax/core/__init__.py        — Updated exports
+- jax/simulation.py                        — run() API, batch padding, SimulationResult enhancements
+- examples/test.py                         — Rewritten for new API
+- jax/tests/test_namedtuple_state.py       — Rewritten for tiered architecture
+- jax/tests/test_sarc_geometry_parity.py   — SarcGeometry→SarcTopology, NamedTuple API
+- jax/tests/test_api_refactor.py           — NEW: 9 validation tests
+
+DELETED SYMBOLS (comprehensive list)
+=====================================
+- StepInfo, TransitionInfo, SolverInfo NamedTuples (state.py)
+- project_summary() (state.py)
+- get_simulation_stats(), calculate_total_force() (timestep.py)
+- return_info parameter (timestep.py)
+- return_P, return_Q parameters (transitions.py thick_transitions)
+- METRIC_REGISTRY, register_metric, get_metrics_handler, compute_manifest,
+  composite_metrics_wrapper, get_default_metrics, get_minimal_metrics,
+  get_step_metrics, needs_extended_info, METRIC_REQUIREMENTS (metrics_fn.py)
+- SarcGeometry alias (sarc_geometry.py)
+- expm_pade3_single(), expm_pade3_batch() (transitions.py)
+- _compute_dead_zone_Q_matrix() (transitions.py)
+- find_cooperative_sites() (cooperativity.py)
+- find_nearest_binding_sites() (geometry.py — old version)
+
+VERIFICATION
+============
+- Grepped for all deleted symbols — zero hits in .py files (except test assertions)
+- SummaryState confirmed: exactly 2 fields (force, solver_residual)
+- All imports resolve correctly across 8 critical modules
+- Function signatures verified: no return_info, no return_P/Q, no SolverInfo
+
+OUTSTANDING
+===========
+- docs/LOGIC_FLOW.md (436 lines) contains stale references to old architecture.
+  Documentation-only, does not affect runtime. Can be updated in a separate pass.
+- XLA compilation cache should be cleared before first run: rm -rf ~/.cache/multifil_jax/xla/
+
+NEXT SESSION
+============
+1. Clear XLA cache and run tests to verify everything compiles and executes correctly
+2. Run benchmark to confirm no performance regression from refactoring
+3. Update docs/LOGIC_FLOW.md to reflect new architecture (optional)
+4. Consider removing Protocol class entirely (currently deprecated with FutureWarning)
+
+
+Session 8 — 2026-02-17
+==============================
+
+GOAL: Remove XB distance binning — compute per-XB transition matrices using
+      exact distances instead of bin-center approximations.
+
+PROBLEM: ADAPTIVE BINNING WAS BROKEN
+=========================================
+
+The XB transition matrix computation used adaptive binning: 300 distance bins
+× 2 permissiveness levels = 600 bins. Each XB was mapped to a bin via
+jnp.digitize, and Q/P matrices were computed per-bin. XBs in the same bin
+shared transition probabilities computed at the bin-center distance.
+
+Why it didn't work:
+1. Lattice spacing variation: Bin edges were frozen at topology creation for a
+   single lattice spacing (~14.0 nm). Under isovolumetric constraints (Poisson
+   ~0.5), lattice spacing varies ~13.2–15.7 nm, shifting the energy peak by
+   ~2.4 nm axially. XBs in the shifted fine region landed in coarse 2nm bins.
+2. Spring constant sweeps: Bin edges depended on xb_g_k_weak, xb_g_rest_weak,
+   etc. When sweeping these params, all sims used bin edges from initial params.
+3. No performance benefit: 624 XBs vs 600 bins — no reduction. Benchmarked at
+   <5% difference even at batch=500.
+
+How adaptive binning was intended to work:
+A pure-JAX function compute_adaptive_bins_fixed_count() (state.py) was written
+to recompute bin edges dynamically based on current lattice spacing and spring
+constants. It maintained fixed array shapes (300 bins) but adapted bin positions
+by sampling the weak-state energy landscape. However, this function was NEVER
+wired into the runtime pipeline — topology always used the NumPy-based
+_compute_initial_bin_edges() at creation time, and bins were never updated.
+
+FIX: REMOVED BINNING ENTIRELY
+==============================
+
+Each crossbridge now gets its own Q→P matrix computed from exact (axial, radial)
+distances. compute_xb_transition_matrices() returns a 2-tuple (Q_all, P_all)
+with shapes (n_xb_total, 6, 6) instead of (n_bins, 6, 6) + bin_indices.
+
+CHANGES MADE
+=============
+
+1. kernels/transitions.py
+   - Rewrote compute_xb_transition_matrices(): returns 2-tuple (Q_all, P_all)
+     with per-XB matrices using exact distances
+   - Updated thick_transitions(): uses jnp.arange(n_xb_total) instead of bin_indices
+   - Deleted _create_adaptive_xb_binning_key() and _adaptive_bin_to_distance()
+   - Removed XB_N_BINS import and compute_adaptive_bin_boundaries import
+   - Updated module docstring: removed binning references
+
+2. metrics_fn.py
+   - Unpacks 2-tuple from compute_xb_transition_matrices()
+   - Uses jnp.arange(n_xb_total) instead of bin_indices for P_all/Q_all indexing
+
+3. core/sarc_geometry.py
+   - Removed XB_N_BINS = 300 constant
+   - Removed from SarcTopology: xb_n_bins (slots, init, aux_data, tree_unflatten),
+     xb_bin_edges and xb_bin_centers (slots, init, children, tree_unflatten)
+   - Removed bin edge computation from create() classmethod
+   - Deleted _compute_initial_bin_edges() function
+
+4. core/state.py
+   - Deleted _compute_binding_energy_jax() and compute_adaptive_bins_fixed_count()
+   - Removed XB_N_BINS from import
+
+5. core/__init__.py
+   - Removed XB_N_BINS from import and __all__
+
+6. kernels/rate_functions.py
+   - Deleted compute_binding_energy_profile() and compute_adaptive_bin_boundaries()
+
+7. simulation.py
+   - Removed xb_n_bins from topology_config dict (2 locations)
+
+FILES MODIFIED
+==============
+- jax/multifil_jax/kernels/transitions.py  — Per-XB matrices, deleted binning code
+- jax/multifil_jax/metrics_fn.py           — 2-tuple unpacking, per-XB indexing
+- jax/multifil_jax/core/sarc_geometry.py   — Removed all binning fields/functions
+- jax/multifil_jax/core/state.py           — Removed adaptive binning JAX functions
+- jax/multifil_jax/core/__init__.py        — Removed XB_N_BINS export
+- jax/multifil_jax/kernels/rate_functions.py — Removed binning helper functions
+- jax/simulation.py                        — Removed xb_n_bins from topology_config
+
+DELETED SYMBOLS
+===============
+- XB_N_BINS constant (sarc_geometry.py)
+- xb_n_bins, xb_bin_edges, xb_bin_centers (SarcTopology fields)
+- _compute_initial_bin_edges() (sarc_geometry.py)
+- _create_adaptive_xb_binning_key() (transitions.py)
+- _adaptive_bin_to_distance() (transitions.py)
+- _compute_binding_energy_jax() (state.py)
+- compute_adaptive_bins_fixed_count() (state.py)
+- compute_binding_energy_profile() (rate_functions.py)
+- compute_adaptive_bin_boundaries() (rate_functions.py)
+
+HOW TO REIMPLEMENT IF NEEDED
+=============================
+If large lattices (8x8+) show performance regression from per-XB computation:
+1. Compute bins per-sim before scan using current lattice_spacing and spring
+   constants (not frozen at topology creation)
+2. Use union-of-ranges approach: compute fine region for min and max expected
+   lattice spacing, take union as the fine bin range
+3. Store bin arrays in constants (Tier 2) rather than topology (Tier 1) so they
+   can vary with parameter sweeps without recompilation
+
+VERIFICATION
+============
+1. pytest jax/tests/ — no tests reference binning directly
+2. Clear XLA cache: rm -rf ~/.cache/multifil_jax/xla/
+3. Short simulation with fixed lattice_spacing=14.0 — should run without error
+4. Variable lattice spacing test — confirm no errors with driven lattice_spacing
+
+NEXT SESSION
+============
+1. Run tests and benchmarks to verify correctness and performance
+2. Update docs/LOGIC_FLOW.md (stale references to binning)
+
+
+Session 9 — 2026-02-17
+==============================
+
+GOAL: Audit ATP consumption metrics in metrics_fn.py for correctness.
+
+BACKGROUND: THREE ATP METHODS
+==============================
+
+1. atp_consumed       — stochastic: sum((old_xb==4) & (new_xb==5))
+2. atp_expected_p     — P-matrix expected value: sum(mask_state4 * P[3,4])
+3. atp_expected_q     — Q branching ratio: sum(mask_state4 * k_total * dt * ratio)
+
+Method 1 is correct as-is. Methods 2 and 3 had two bugs.
+
+BUG 1 — Method 3: k_min missing exp(-f_3_4) term at rest geometry
+==================================================================
+
+r45 = r45_coeff * sqrt(U_tight_2 + 23) + exp(-f_3_4)
+  where U_tight_2 = U_tight_2_base + E_strong
+  and   E_strong and f_3_4 both depend on axial AND radial (lattice) geometry.
+
+The minimum r45 occurs at zero strain (rest geometry): both E_strong=0 and f_3_4=0.
+  r45_min = r45_coeff * sqrt(U_tight_2_base + 23) + exp(0)
+           = r45_coeff * sqrt(U_tight_2_base + 23) + 1.0
+
+Old code used:
+  k_bio = r45_coeff * sqrt(U_tight_2_base + 23)   ← missing +1.0
+
+The +1.0 comes from exp(-f_3_4=0), which implicitly accounts for BOTH axial
+geometry (globular domain rest length g_r_strong) and lattice geometry (converter
+domain rest angle c_r_strong). The old formula missed this entirely.
+
+Fix: k_min = constants.xb_r45_coeff * jnp.sqrt(constants.xb_U_tight_2 + 23.0) + 1.0
+k_min is a pure function of constants — recalculated inline each timestep, trivially fast.
+
+BUG 2 — Methods 2 & 3: compute_xb_transition_matrices called with unresolved constants
+========================================================================================
+
+timestep.py builds resolved_constants = constants.with_drivers(pCa, z_line, ls)
+and passes that to thick_transitions. But compute_all_metrics was calling:
+
+  compute_xb_transition_matrices(old_state, constants, ...)   ← unresolved
+
+Inside that function: ca_conc = 10**(-constants.pCa) and lattice_spacing =
+constants.lattice_spacing — both the defaults, not the current driver values.
+
+Effect: for time-varying protocols (calcium transients, sinusoidal length,
+force-velocity ramps), the Q/P matrices in atp_expected_p and atp_expected_q
+were computed with stale pCa and lattice_spacing. For fixed scalar or list sweep
+protocols the values were identical so there was no impact.
+
+Fix: added resolved_constants = constants.with_drivers(pCa_val, z_line, lattice_spacing)
+using the three values already resolved at the top of compute_all_metrics, then
+passed resolved_constants to compute_xb_transition_matrices.
+
+Verified: timestep.py itself is clean — all function calls after with_drivers()
+consistently use resolved_constants. The bug was isolated to metrics_fn.py.
+
+FILES MODIFIED
+==============
+- jax/multifil_jax/metrics_fn.py  — k_min fix (+1.0), resolved_constants for Q/P matrices
+
+
+Session 10 — 2026-02-18
+==============================
+
+GOAL: (1) Increase expm squaring iterations to handle extreme rate norms in stiff
+      parameter sweeps. (2) Replace Newton for-loop with while_loop to reduce
+      compile time and allow adaptive convergence. (3) Benchmark to validate.
+
+PROBLEM 1: expm norm coverage insufficient
+==========================================
+
+expm_pade6_batch uses scaling-and-squaring: scale A by 2^s so ||A/2^s|| ≤ 0.5,
+compute Pade approximant, then square s times. The fori_loop upper bound was 16,
+covering norms up to 0.5 × 2^16 = 32,768. For stiff parameter sweeps (spring
+constants up to ~5–10× default), XB rate matrices can exceed this bound.
+
+Increasing to 18 covers 0.5 × 2^18 = 131,072. The 2 extra iterations are no-ops
+for typical norms (the jnp.where guard makes i≥s iterations identity operations).
+
+PROBLEM 2: Newton for-loop compile cost and fixed iteration count
+=================================================================
+
+_newton_solve used a Python for loop with n_newton_steps=4 unrolled at trace time.
+Compile time is O(n_newton_steps × n_cg_steps). At 4×6=24 unrolled passes, the
+full simulation compiles in ~270–390s (session 2 baseline). Two consequences:
+
+1. Always runs exactly 4 Newton steps regardless of convergence — wasting iterations
+   when the solver converges in fewer (standard params typically converge in ~1 step).
+
+2. Using more iterations for stiff sweeps would worsen compile time proportionally
+   (for-16 compiles in 643s vs 135s for for-4, per benchmark).
+
+CHANGES MADE
+=============
+
+1. expm squaring: 16 → 18 iterations (kernels/transitions.py)
+   - fori_loop(0, 16, ...) → fori_loop(0, 18, ...)
+   - Updated docstring: "Handles ||A|| up to 2^18 = 262144"
+   - No runtime cost: extra iterations are no-ops when i ≥ s
+
+2. Newton while_loop behind static flag (kernels/solver.py)
+   - Added use_while_loop: bool (static arg in _newton_solve JIT)
+   - use_while_loop=True: jax.lax.while_loop, body traced once, exits when
+     max|f| < tolerance OR iteration cap reached. Compile time O(n_cg_steps).
+   - use_while_loop=False: original unrolled for-loop (unchanged code path)
+   - tolerance parameter added to _newton_solve (traced, not static)
+   - solve_equilibrium gained use_while_loop and tolerance kwargs
+   - Float32 floor: tolerance = max(user_tol, thick_k × 1e-4) — scales with
+     spring constants so while-loop exits at representable precision boundary
+   - New defaults: use_while_loop=True, n_newton_steps=16 (cap)
+
+3. New benchmark script (examples/benchmark_solver.py)
+   - Section A: expm correctness vs scipy.linalg.expm across norm ranges
+     ~10, ~1000, ~100000. All three pass at float32 tolerance.
+   - Section B: solve_equilibrium benchmarked in isolation (not via Protocol)
+     to ensure clean JIT cache separation per solver config.
+   - Three configs: A for-4, B for-16, C while-16
+   - Standard and stiff (thick_k×5, thin_k×5, titin_b×5) params
+
+FILES MODIFIED
+==============
+- jax/multifil_jax/kernels/transitions.py  — expm squaring 16 → 18
+- jax/multifil_jax/kernels/solver.py       — while_loop branch, tolerance scaling,
+                                             new defaults (use_while_loop=True, cap=16)
+- examples/benchmark_solver.py             — NEW: expm correctness + solver benchmark
+
+BENCHMARK RESULTS (RTX 3090, solve_equilibrium in isolation, 2x2 lattice)
+=========================================================================
+
+expm correctness (scipy reference):
+  norm ~10    (||A||=9):     max_err=2.1e-07  PASS
+  norm ~1000  (||A||=896):   max_err=1.2e-07  PASS
+  norm ~100000 (||A||=89600): max_err=2.4e-07  PASS
+
+Solver comparison (standard params, pCa=4.0, z=900nm):
+  Config          compile_s    ms/call    max_residual
+  A for-4           134.7s      14.49       0.167 pN
+  B for-16          643.1s      47.66       0.167 pN
+  C while-16         36.5s       1.81       0.173 pN
+
+Solver comparison (stiff params: thick_k×5, thin_k×5, titin_b×5):
+  Config          compile_s    ms/call    max_residual
+  A for-4             8.4s      14.16       0.826 pN  !!!
+  B for-16           32.3s      42.36       0.826 pN  !!!
+  C while-16          2.6s       2.56       0.931 pN  (at float32 floor)
+
+KEY FINDINGS
+============
+
+1. WHILE-LOOP IS 8× FASTER FOR STANDARD PARAMS
+   - 1.81 ms/call vs 14.49 ms/call for for-4
+   - Standard params converge in ~1 Newton step — for-4 wasted 3 iterations
+   - The while-loop exits immediately upon crossing the tolerance threshold
+
+2. WHILE-LOOP COMPILE TIME IS 3.7× SHORTER
+   - 36.5s vs 134.7s for for-4; 643.1s for for-16
+   - Body traced once (O(n_cg_steps)) vs O(n_newton_steps × n_cg_steps)
+   - First-run full simulation compile will drop proportionally
+
+3. STIFF PARAMS ARE FLOAT32 LIMITED — NOT AN ITERATION COUNT PROBLEM
+   - for-4, for-16, and while-16 all produce the same residual on stiff params
+   - More Newton steps cannot improve convergence below the float32 floor
+   - Float32 position epsilon at ~900nm ≈ 1e-4 nm; force floor = thick_k × 1e-4
+   - At 5× stiff (thick_k=10100 pN/nm): floor ≈ 1.01 pN
+   - 0.826 pN (for-4, 4 steps past floor) and 0.931 pN (while-16, exits at floor)
+     are physically equivalent — both correspond to sub-Ångström position errors
+   - Fix: tolerance scaled to thick_k × 1e-4 so while-loop exits at float32 floor
+     in ~1 step rather than running 16 useless iterations (2.56ms vs 42.36ms for-16)
+
+4. BENCHMARK METHODOLOGY NOTE
+   - Initial benchmark used monkey-patching through Protocol's outer scan JIT.
+     This failed: outer JIT cached on its own static args, ignoring the patched
+     n_newton_steps → all configs ran Config A's compiled kernel.
+   - Fixed: benchmark calls solve_equilibrium directly via jax.jit(functools.partial(...))
+     so each config has its own JIT cache entry with n_newton_steps/use_while_loop baked in.
+
+DECISION
+=========
+while_loop is the new default (use_while_loop=True, n_newton_steps=16 cap).
+The production call in timestep.py passes neither kwarg, so it uses the new defaults.
+The for-loop path remains available via use_while_loop=False for explicit use.
+
+
+Session 11 — 2026-02-19
+==============================
+
+GOAL: Codebase cleanup — remove all deprecated, dead, and redundant code
+      accumulated across Sessions 1–10. Delete Protocol class (run() covers
+      all its functionality), remove for-loop solver path (while_loop is
+      strictly superior), remove legacy wrappers, dead imports, placeholder
+      aliases, stale __main__ blocks, and rewrite stale documentation.
+
+CHANGES MADE
+=============
+
+1. Newton for-loop path removed (kernels/solver.py)
+   - Deleted the use_while_loop parameter from _newton_solve and solve_equilibrium
+   - Deleted the else: for-loop branch from _newton_solve body entirely
+   - while_loop is now the only code path (no conditional, no static arg)
+   - Removed 'use_while_loop' from _newton_solve @jax.jit static_argnames
+   - Updated module docstring: removed reference to use_while_loop=False variant
+   - Updated _newton_solve docstring: single-path description, updated defaults note
+   - Updated solve_equilibrium docstring: removed two-mode description
+
+2. Dead Lineax import removed (core/state.py)
+   - Deleted the try/except block that imported lineax as lx and set HAS_LINEAX
+   - HAS_LINEAX was set but never referenced anywhere in the codebase
+   - Thomas algorithm (Session 1) replaced Lineax; the guard was never cleaned up
+
+3. Redundant Constants alias removed (core/state.py, core/params.py)
+   - Deleted Constants = DynamicParams from state.py (duplicate; canonical is params.py)
+   - Deleted Constants = None placeholder from params.py lines 54-55
+   - Canonical definition (Constants = DynamicParams after class) retained in params.py
+
+4. Legacy backward-compatibility wrappers removed (core/state.py)
+   - Deleted realize_sarc_geometry() — thin wrapper around realize_state()
+   - Deleted realize_sarc_geometry_batched() — thin vmap wrapper around realize_state()
+   - Removed both from core/__init__.py import block and __all__
+   - Removed realize_sarc_geometry from multifil_jax/__init__.py import and __all__
+
+5. Dead __main__ test blocks removed (core/state.py, kernels/forces.py)
+   - Deleted 57-line if __name__ == "__main__" block from state.py
+     (called realize_sarc_geometry which is now deleted; tests in jax/tests/ cover this)
+   - Deleted 62-line if __name__ == "__main__" block from forces.py
+     (called realize_sarc_geometry, used old dict-based state, stale timestep signature)
+
+6. Stale module docstring fixed (core/params.py)
+   - Line 15: "Dynamic state (z_line, pCa, lattice_spacing) is NOT stored here - it goes
+     in state" → corrected to reflect that they ARE stored in DynamicParams as default
+     values; per-step overrides go in Drivers (Tier 3)
+
+7. Kernel signature corrected in docstring (core/state.py)
+   - Line 10: "kernel(state, constants, topology, rng_key, *, dt)" →
+     "kernel(state, constants, drivers, topology, rng_key, *, dt)"
+
+8. Protocol class deleted (simulation.py)
+   - Deleted the entire ~415-line Protocol dataclass (lines 504–924)
+   - run() captures all Protocol functionality: pCa/z_line/ls as scalar/list/array,
+     Cartesian product grid sweeps, dynamic_params dict sweeps, replicates, rng_seed,
+     unroll, verbose, batch padding, SimulationResult with .mean()/.std()/.sel()/.stack()
+   - Removed @dataclass, field from dataclasses import (Protocol-only)
+   - Removed Any from typing imports (Protocol-only, used in _classify_input return type)
+   - Rewrote module docstring: Protocol-centric examples replaced with run() examples
+   - Updated SimulationResult docstring: "Protocol.execute()" → "run()"
+
+9. LOGIC_FLOW.md complete rewrite (jax/docs/LOGIC_FLOW.md)
+   - Previous 436-line document described deleted files (experiments.py, template.py,
+     topology.py as standalone), deleted functions, old binning, and Protocol-centric API
+   - Replaced with 16-section document covering the actual v3.0 architecture:
+     tiered design, resolve_value() pattern, run() API, SimulationResult, JIT kernel,
+     single-timestep 7-step workflow, state hierarchy, SarcTopology, StaticParams,
+     DynamicParams, cooperativity, geometry, transitions, forces, solver, metrics
+   - Includes performance notes and DO NOT RE-ATTEMPT warnings (thomas fori_loop,
+     autotune level 2)
+
+10. Example files updated (examples/)
+    - quickstart.py: Complete rewrite — removes all Protocol usage, demonstrates
+      canonical v3.0 patterns: setup, isometric, calcium transient, pCa sweep,
+      2D grid, dynamic_params sweep, replicates, invertebrate geometry, structural
+      stack, API cheatsheet
+    - sinusoidal_analysis.py: Targeted update — replaced Protocol(...).execute()
+      with SarcTopology.create() + run(); updated import line; added topology
+      creation before the main sweep; all scientific analysis code unchanged
+    - profile_jax.py: Complete rewrite — removed broken parameters
+      (use_mixed_precision, return_final_state, old run(state, protocol, ...) signature);
+      new version uses run() + SarcTopology, warmup + timed + profiled runs
+    - test.py: Added 2-line IPython notice at top (file uses %magic syntax that
+      crashes as a plain script; designed for VS Code/Jupyter interactive mode)
+    - hysteresis.py: Fixed 3 variable-name bugs (topo used before assignment:
+      jax.device_put(topo) → jax.device_put(topo_vert/topo_invert), results.summary()
+      → results_vertebrate.summary()); added complete analysis section with steady-
+      state force comparison, thick displacement comparison, and optional matplotlib plots
+
+11. Test file missing import fixed (jax/tests/test_sarc_geometry_parity.py)
+    - Added missing "from multifil_jax.kernels.solver import solve_equilibrium" import
+    - Four tests (test_force_identity_with_bound_xbs ×3, test_rng_stream_consistency)
+      were calling solve_equilibrium without importing it — pre-existing bug
+
+FILES MODIFIED
+==============
+- jax/multifil_jax/kernels/solver.py       — Deleted for-loop path, use_while_loop param
+- jax/multifil_jax/core/state.py           — Fixed docstrings, deleted alias, HAS_LINEAX,
+                                             legacy wrappers, __main__ block
+- jax/multifil_jax/core/params.py          — Fixed docstring, deleted Constants=None placeholder
+- jax/multifil_jax/core/__init__.py        — Removed legacy wrapper exports
+- jax/multifil_jax/__init__.py             — Removed realize_sarc_geometry export
+- jax/multifil_jax/kernels/forces.py       — Deleted __main__ block
+- jax/simulation.py                        — Rewrote docstring, cleaned imports, deleted Protocol
+- jax/docs/LOGIC_FLOW.md                   — Complete rewrite for v3.0 architecture
+- examples/quickstart.py                   — Complete rewrite (Protocol → run())
+- examples/sinusoidal_analysis.py          — Targeted update (Protocol → run())
+- examples/profile_jax.py                  — Complete rewrite (broken → current API)
+- examples/test.py                         — Added IPython-only notice
+- examples/hysteresis.py                   — Fixed 3 bugs + added analysis section
+- jax/tests/test_sarc_geometry_parity.py   — Added missing solve_equilibrium import
+
+DELETED SYMBOLS
+===============
+- use_while_loop parameter (kernels/solver.py — _newton_solve and solve_equilibrium)
+- For-loop else: branch in _newton_solve body
+- HAS_LINEAX, import lineax as lx (core/state.py)
+- Constants = DynamicParams alias (core/state.py — duplicate of params.py definition)
+- Constants = None placeholder (core/params.py)
+- realize_sarc_geometry() (core/state.py)
+- realize_sarc_geometry_batched() (core/state.py)
+- Protocol class (simulation.py — entire ~415-line dataclass)
+- dataclass, field imports (simulation.py — Protocol-only)
+- Any from typing (simulation.py — Protocol-only)
+
+VERIFICATION RESULTS
+====================
+All checks passed:
+  python -c "from simulation import run; from multifil_jax.core.sarc_geometry import SarcTopology"  → OK
+  from simulation import Protocol                                                                    → ImportError ✓
+  from multifil_jax.core.state import realize_sarc_geometry                                         → ImportError ✓
+  from multifil_jax.core.state import HAS_LINEAX                                                    → ImportError ✓
+  from multifil_jax.core.params import Constants; print(Constants)                                  → DynamicParams ✓
+  use_while_loop not in inspect.signature(solve_equilibrium).parameters                             → OK ✓
+  grep -rn "Protocol|realize_sarc_geometry|HAS_LINEAX|Constants = None" multifil_jax/ simulation.py → 0 hits ✓
+  pytest jax/tests/ -v                                                                              → 35/35 passed ✓
+
+Session 12 — 2026-02-27
+==============================
+
+GOAL: Three related improvements — (1) eliminate redundant scan outputs by
+      merging force and solver_residual into the metrics dict; (2) introduce
+      MetricsDict, a dict subclass with attribute access; (3) add minibatch_size
+      to run() so large sweeps can be chunked to bound peak GPU RAM and improve
+      L2 cache utilisation.
+
+CHANGES MADE
+=============
+
+1. MetricsDict (core/state.py)
+   - Defined MetricsDict(dict) subclass with __getattr__ so that
+     result.metrics.axial_force == result.metrics['axial_force']
+   - Registered as JAX pytree: flatten → (values, keys), unflatten → MetricsDict(zip(...))
+   - Defined here (not simulation.py) to avoid circular imports: both simulation.py
+     and metrics_fn.py import from core/state.py, neither imports from the other
+
+2. SummaryState deleted (core/state.py)
+   - SummaryState(force, solver_residual) NamedTuple removed entirely
+   - Both fields now live in the MetricsDict returned by compute_all_metrics()
+     under keys 'axial_force' and 'solver_residual' respectively
+
+3. compute_all_metrics() updated (metrics_fn.py)
+   - Added solver_residual: jnp.ndarray parameter (passed from scan_fn in simulation.py)
+   - Renamed 'force' key → 'axial_force' (consistent with SimulationResult.force property)
+   - Added 'solver_residual' key
+   - Return type changed from plain dict to MetricsDict
+   - Import added: from multifil_jax.core.state import ..., MetricsDict
+
+4. _run_sim_kernel simplified (simulation.py)
+   - scan_fn no longer constructs SummaryState; passes solver_residual directly to
+     compute_all_metrics() as a positional argument
+   - scan returns (carry, all_metrics) instead of (carry, (summary, all_metrics))
+   - jax.lax.scan unpacked to _, metrics_out (single output, not a tuple)
+   - run_single_sim returns metrics_out; batched_metrics is returned from _run_sim_kernel
+   - Docstring updated: "Returns MetricsDict with 'axial_force' and 'solver_residual' keys"
+
+5. SimulationResult refactored (simulation.py)
+   - Removed __slots__: 'axial_force', 'solver_residual'
+   - Removed __init__ parameters: axial_force=, solver_residual=
+   - Both values accessed as self.metrics['axial_force'] / self.metrics['solver_residual']
+   - Added force property: return self.metrics['axial_force']  (was: return self.axial_force)
+   - Updated n_steps: self.metrics['axial_force'].shape[-1]
+   - Updated mean_force / steady_state_force to use self.metrics['axial_force']
+   - Updated __repr__ to use self.metrics.get('axial_force')
+   - tree_flatten children: dropped axial_force and solver_residual; metrics now carries both
+   - tree_unflatten: wraps metrics child in MetricsDict(...)
+   - mean() / std(): removed new_force / new_resid intermediates; MetricsDict comprehension
+     over self.metrics covers both keys automatically
+   - __getitem__(): removed new_force / new_resid; MetricsDict comprehension; derives
+     grid_shape from new_metrics['axial_force'].shape
+   - stack(): removed stacked_force / stacked_residual; MetricsDict comprehension over
+     metric_keys covers both; grid_shape derived from stacked_metrics['axial_force']
+   - summary(): replaced self.axial_force → self.force; replaced conditional
+     solver_residual block with unconditional metrics['solver_residual'] line
+
+6. run() updated — cleanup (simulation.py)
+   - Removed batched_summaries / reshaped_force / reshaped_residual intermediates
+   - Unpadding slice: MetricsDict({k: v[:total_batch] ...}) replaces SummaryState slice
+   - Reshape: MetricsDict({key: val.reshape(final_shape) ...}) in one pass
+   - Residual validation: reshaped_metrics['solver_residual'] directly
+   - SimulationResult constructor: only metrics= passed (no axial_force=, solver_residual=)
+   - SummaryState import removed; MetricsDict imported in its place
+
+7. run() updated — minibatch_size (simulation.py)
+   - Added minibatch_size: Optional[int] = None parameter (after unroll, before verbose)
+   - use_minibatch = (minibatch_size is not None) and (minibatch_size < padded_batch)
+   - Single-call path unchanged when use_minibatch is False
+   - Chunked path: Python for loop over range(0, padded_batch, minibatch_size);
+     each chunk calls _run_sim_kernel with sliced batched_params (via jax.tree_util.tree_map),
+     z/pCa/ls/rng_keys sub-arrays; JAX async dispatch pipelines chunks automatically
+   - Concatenates chunks: MetricsDict({k: jnp.concatenate([c[k] for c in chunks], axis=0) ...})
+   - Key invariant: padded_batch and minibatch_size are both powers of 2 → exact multiple,
+     every chunk identical size → same JIT kernel every iteration, zero recompilation
+   - Docstring addition explains RAM and cache-reuse motivation
+
+8. examples/benchmark_minibatch.py (new file)
+   - CLI tool: --n, --duration_ms, --total_runs (defaults: 2, 100, 256)
+   - Candidate sizes: all BATCH_BUCKETS ≤ total_runs, plus total_runs as no-minibatch baseline
+   - For each candidate: warmup run (pays JIT compile once), then 3 timed runs
+   - Timing: perf_counter, block_until_ready() on result.force; best-of-3 / total_runs → ms/sim
+   - Output: table of ms/sim and % vs no-minibatch baseline; final optimal M recommendation
+   - Follows profile_jax.py pattern (sys.path insert, jax.devices() header)
+
+FILES MODIFIED
+==============
+- jax/multifil_jax/core/state.py           — Deleted SummaryState; added MetricsDict + pytree reg
+- jax/multifil_jax/metrics_fn.py           — Added solver_residual param; 'force'→'axial_force';
+                                             added 'solver_residual' key; return MetricsDict
+- jax/simulation.py                        — MetricsDict import; SimulationResult refactor;
+                                             _run_sim_kernel simplified; run() minibatch_size
+- examples/benchmark_minibatch.py          — NEW: minibatch size benchmark CLI
+
+DELETED SYMBOLS
+===============
+- SummaryState NamedTuple (core/state.py)
+- SimulationResult.axial_force slot and __init__ param (simulation.py)
+- SimulationResult.solver_residual slot and __init__ param (simulation.py)
+- SummaryState import (simulation.py)
+
+DESIGN NOTES
+============
+
+Circular import avoidance:
+  MetricsDict defined in core/state.py (not simulation.py) because metrics_fn.py
+  already imports from core/state.py. Adding a metrics_fn → simulation import
+  would create a cycle (simulation imports metrics_fn). No new dependency edges added.
+
+Attribute access implementation:
+  __getattr__ delegates to __getitem__; KeyError is re-raised as AttributeError.
+  This means result.metrics.bad_key raises AttributeError as expected by hasattr()
+  and normal Python introspection.
+
+JAX pytree registration for MetricsDict:
+  lambda x: (list(x.values()), list(x.keys())) — keys as aux (static, not traced)
+  lambda keys, values: MetricsDict(zip(keys, values)) — reconstruct from leaves
+  dict ordering is insertion-order in Python 3.7+; round-trip is stable.
+
+Minibatch power-of-2 guarantee:
+  padded_batch = get_bucket_size(total_batch) ∈ BATCH_BUCKETS
+  minibatch_size should also be chosen from BATCH_BUCKETS (benchmark enforces this)
+  → padded_batch % minibatch_size == 0 always → no partial last chunk
+
+
+Session 13 — 2026-02-28
+==============================
+
+GOAL: (1) Audit float16 usage in Monte Carlo sampling and fix systematic bias.
+      (2) Add --min_m argument to benchmark_minibatch.py. (3) Benchmark minibatch
+      performance at batch=16384 to establish optimal minibatch_size recommendation.
+
+FLOAT16 SAMPLING BUG
+=====================
+
+Identified and fixed a systematic bias in thin_transitions() and thick_transitions()
+introduced by float16 casting of probability vectors and random values before the
+categorical sampling step (cumsum + argmax).
+
+Bug mechanism:
+  P matrices are computed and row-normalised in float32 (rows sum to exactly 1.0).
+  Casting to float16 before cumsum introduces rounding errors in intermediate
+  cumulative sums — the bin boundaries shift slightly, causing ~0.088% of Monte
+  Carlo samples to be assigned the wrong state. The wrong assignments are a
+  systematic one-state downward shift: wherever float32 would sample state k,
+  float16 samples state k-1. This consistently biases TM and XB populations
+  toward lower (less active) states, producing a small but real downward bias
+  in force output.
+
+  Additionally, for probability distributions where probabilities sum to slightly
+  less than 1.0 in float16 (e.g. uniform 1/6 rows: cumsum[-1] = 0.9995), ~0.02%
+  of random values fall in the gap and argmax returns 0, further biasing toward
+  the lowest state.
+
+  Empirically confirmed via NumPy simulation (100k samples):
+    Wrong assignments: 0.088% overall
+    Pattern: all wrong assignments are exactly one state lower than float32 result
+    Gap-induced state-0 assignments: ~0.02% for uniform distributions
+
+Why float16 gives no benefit here:
+  GPU tensor cores accelerate float16 matrix multiplication (GEMM). The cumsum +
+  argmax over 4 or 6 elements is a sequential scan, not a GEMM — no tensor core
+  acceleration regardless of dtype. The cast itself costs bandwidth with no
+  throughput benefit.
+
+FIX IMPLEMENTED
+===============
+
+Removed float16 casts from both sampling sites. cumsum and argmax now operate
+directly on the float32 prob_vectors and random_values that were already computed.
+
+Changed file: jax/multifil_jax/kernels/transitions.py
+
+  thin_transitions() (formerly lines 528-537):
+    - Deleted 6-line "MIXED PRECISION SAMPLING" block
+    - cum_probs = jnp.cumsum(prob_vectors, axis=1)          ← float32
+    - new_states = jnp.argmax(random_values[:, None] < cum_probs, axis=1)
+
+  thick_transitions() (formerly lines 839-846):
+    - Deleted 5-line "MIXED PRECISION SAMPLING" block
+    - cum_probs = jnp.cumsum(prob_vectors, axis=1)          ← float32
+    - new_states_indices = jnp.argmax(random_values[:, None] < cum_probs, axis=1)
+
+  Module docstring:
+    - Removed "4. Mixed Precision Sampling" section entirely
+
+FILES MODIFIED
+==============
+- jax/multifil_jax/kernels/transitions.py  — float16 sampling removed from
+                                             thin_transitions and thick_transitions;
+                                             docstring item 4 deleted
+
+FLOAT16 BROADER ANALYSIS (not implemented)
+==========================================
+
+Considered float16 across the full codebase. Summary of findings:
+
+  Component                  float16 viable?  Reason if not
+  -------------------------  ---------------  ------------------------------------
+  Axial positions            NO               At 900nm, f16 precision = 0.88nm;
+                                              solver already at f32 floor (0.2pN)
+  Newton-CG solver           NO               Already at float32 precision limit
+                                              for stiff params (thick_k × 1e-4)
+  Thomas algorithm           NO               Sequential accumulation compounds
+  Rate functions / expm      NO               exp() at large rates exceeds f16 max
+                                              (||A|| up to 89600 per session 10)
+  Force computations         NO               thick_k × position intermediates
+                                              overflow f16 (max 65504)
+  P/Q matrix computation     NO               Precision needed; feeds solver
+  Sampling (cumsum+argmax)   NO               No throughput benefit; bug removed
+  MetricsDict scan output    POSSIBLE         All 45 metrics are scalars in
+                                              reasonable f16 range; savings ~100MB
+                                              at batch=1125/1000 steps. Not needed
+                                              given current RAM headroom.
+
+MetricsDict float16 is a future option for very large batch×duration workloads
+approaching VRAM limits. Not implemented — no current bottleneck.
+
+BENCHMARK: benchmark_minibatch.py (batch=256, 2x2, 100ms)
+==========================================================
+
+Run first with defaults (total_runs=256, min_m=1) to verify post-fix correctness:
+
+  M        ms/sim   vs baseline
+  1         243.5   +2817%
+  2         128.4   +1437%
+  4          67.2   + 705%
+  8          37.2   + 346%
+  16         20.6   + 147%
+  32         13.8   +  66%
+  64         11.6   +  38%
+  128         9.5   +  14%
+  256         8.35  baseline
+
+  Optimal: no minibatching (M=256). Code ran cleanly — float32 fix correct.
+
+SCALING ANALYSIS: duration and lattice size
+===========================================
+
+Established that for the purpose of finding optimal minibatch_size:
+
+  Duration: scales scan output RAM linearly (batch × n_steps × 45 × 4 bytes).
+    Minibatch overhead is fixed per chunk, so overhead/work ratio improves with
+    duration → no-minibatch stays optimal or improves as duration increases.
+    At 256 runs × 1000ms: 46MB — nowhere near 24GB VRAM limit.
+
+  Lattice size: all 45 metrics are scalars computed inside scan body. Scan
+    output size is identical regardless of lattice size. Lattice size has zero
+    effect on the minibatch trade-off.
+
+  Conclusion: batch_size × n_steps is the only scaling variable for RAM pressure.
+
+BENCHMARK: benchmark_minibatch.py (batch=16384, 2x2, 100ms, min_m=256)
+========================================================================
+
+Added --min_m argument to benchmark_minibatch.py to skip impractically slow
+small-M candidates (M=1 at 16384 total ≈ 66 min per timed run).
+
+Run with: python examples/benchmark_minibatch.py --total_runs 16384 --min_m 256
+
+  M        ms/sim   vs baseline
+  256       4.509   +12.8%
+  512       4.018   + 0.5%
+  1024      3.911   - 2.2%    ← sweet spot
+  2048      3.966   - 0.8%
+  4096      3.909   - 2.2%    ← optimal (tied with 1024)
+  8192      4.094   + 2.4%
+  16384     3.997   baseline
+
+  Optimal: minibatch_size=4096 (3.909 ms/sim, 2.2% faster than no-minibatch)
+
+KEY FINDINGS
+============
+
+1. INFERENCE FROM SMALL BATCH WAS INCORRECT
+   - At batch=256 (previous test), no-minibatch was clearly optimal (monotonic)
+   - At batch=16384, M=1024 and M=4096 are ~2% faster than no-minibatch
+   - At large batch, chunking into 1024-4096 improves L2 cache utilisation
+   - Effect is small (~2%) but reproducible and in the opposite direction
+
+2. EFFECT IS SMALL BUT REAL
+   - Range from M=1024 to M=16384 is within ~2% (3.909–3.997 ms/sim)
+   - M=256 (too many chunks) shows meaningful overhead (+12.8%)
+   - M=8192 and M=16384 are essentially equivalent at this batch size
+
+3. RECOMMENDATION FOR LARGE SWEEPS
+   - For batch ≤ 256: no minibatching (single call)
+   - For batch ≥ 4096: minibatch_size=4096 is safe default (2% gain, bounded RAM)
+   - Effect is too small to matter for most use cases; RAM bounding is the
+     primary reason to use minibatch_size, not performance
+
+4. GPU UTILISATION CROSSOVER
+   - At batch=256 (2x2): GPU underutilised, any chunking adds overhead
+   - At batch=16384 (2x2): GPU more fully loaded; smaller chunks fit better in
+     L2 cache, giving marginal throughput improvement
+   - Crossover somewhere between batch=256 and batch=16384
+
+FILES MODIFIED
+==============
+- jax/multifil_jax/kernels/transitions.py  — float16 sampling fix
+- examples/benchmark_minibatch.py          — added --min_m argument
+
+NEXT SESSION
+============
+1. Run quickstart.py or a pCa-sweep to verify force values look correct after
+   float32 sampling fix (should show slightly higher force than before)
+2. Consider benchmarking at 4x4 or 8x8 lattice to confirm lattice-size
+   independence of minibatch crossover point
+3. Update LOGIC_FLOW.md if float32 fix warrants documentation
+
+Session 14 — 2026-03-06
+==============================
+
+GOAL: Implement automatic minibatch size selection in run() so optimal chunking
+      happens behind the scenes without requiring users to know benchmark results.
+
+CONTEXT
+=======
+Session 13 benchmarked two total batch sizes:
+  batch=256:   no-minibatch is optimal (monotone degradation as M shrinks)
+  batch=16384: M=4096 is 2.2% faster than no-minibatch (L2 cache fit)
+Crossover between 256 and 16384 is not yet benchmarked — only those two endpoints
+were tested. The intermediate range (512–8192) is unknown.
+
+CHANGES MADE
+=============
+
+1. _MINIBATCH_HEURISTIC table (jax/simulation.py, after get_bucket_size)
+   - Tuple of (min_padded_batch, chunk_size) pairs, checked in order
+   - Currently one entry: (16384, 4096) — the only benchmarked data point
+   - Comment in code gives exact command to run when extending the table:
+       python examples/benchmark_minibatch.py --total_runs <N> --min_m 256
+   - To add a new data point, prepend a row; function walks table in order
+
+2. _auto_minibatch_size(padded_batch) (jax/simulation.py)
+   - Walks _MINIBATCH_HEURISTIC, returns chunk size for first matching threshold
+   - Returns None if no threshold matched (→ no chunking)
+
+3. run() parameter change (jax/simulation.py)
+   - minibatch_size default: None → "auto"
+   - "auto" calls _auto_minibatch_size(padded_batch) at runtime
+   - Explicit int overrides heuristic entirely (existing benchmark workflow unchanged)
+   - None disables chunking unconditionally
+   - resolved_minibatch variable holds the final value used; existing guard
+     (resolved_minibatch < padded_batch) means auto=4096 is a no-op for batch<4096
+
+FILES MODIFIED
+==============
+- jax/simulation.py  — _MINIBATCH_HEURISTIC, _auto_minibatch_size, run() default + resolution
+
+BEHAVIOR SUMMARY
+================
+  padded_batch < 16384:  auto → None → no chunking (safe, unknown range)
+  padded_batch ≥ 16384:  auto → 4096 (benchmarked optimal on RTX 3090)
+  any batch, explicit M:  heuristic bypassed, M used directly
+  any batch, None:        no chunking unconditionally
+
+TO EXTEND HEURISTIC
+===================
+Run benchmark at an intermediate size, e.g.:
+  python examples/benchmark_minibatch.py --total_runs 4096 --min_m 64
+Then add a row to _MINIBATCH_HEURISTIC in simulation.py (keep sorted descending):
+  _MINIBATCH_HEURISTIC = (
+      (16384, 4096),
+      (4096,  XXXX),   # newly benchmarked
+  )
