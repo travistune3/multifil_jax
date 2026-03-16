@@ -257,9 +257,13 @@ class DynamicParams:
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         """Reconstruct DynamicParams from flattened representation."""
-        # Build kwargs from children
-        kwargs = dict(zip(DYNAMIC_FIELDS, children))
-        return cls(**kwargs)
+        # Bypass __init__ (which calls jnp.asarray) — children are already
+        # JAX arrays/tracers. Older JAX versions call tree_unflatten with
+        # object() sentinels during in_axes probing; __init__ would crash on those.
+        new = object.__new__(cls)
+        for name, value in zip(DYNAMIC_FIELDS, children):
+            object.__setattr__(new, name, value)
+        return new
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to flat dictionary for serialization/metadata."""
