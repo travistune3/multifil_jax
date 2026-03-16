@@ -54,6 +54,7 @@ CUDA 13 is the direction JAX is heading — CUDA 12 support will eventually be d
 ## Verifying the install
 
 ```python
+import multifil_jax  # must come before `import jax`
 import jax
 print(jax.devices())   # should show e.g. [CudaDevice(id=0)]
 from multifil_jax import run
@@ -61,6 +62,8 @@ print("multifil_jax ready")
 ```
 
 If `jax.devices()` shows a CPU device instead of CUDA, JAX is not seeing the GPU. Common causes in WSL2: the Windows NVIDIA driver is not installed (the Linux driver inside WSL2 is provided by Windows — do not install a separate Linux driver inside WSL2).
+
+**Import order:** always `import multifil_jax` before `import jax` in your scripts. `multifil_jax` sets XLA environment flags at import time that must be in place before JAX initializes. If JAX is imported first, GPU detection and multi-CPU configuration may not take effect.
 
 ## Upgrading JAX
 
