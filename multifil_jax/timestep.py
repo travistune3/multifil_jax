@@ -111,9 +111,11 @@ def timestep(state: 'State',
              rng_key: jnp.ndarray,
              *,
              dt: float,
+             K_lat=None,
+             d_ref=None,
              solver_tol: Optional[float] = None,
              precond_params=None,
-             prefactored_precond=None) -> Tuple['State', jnp.ndarray, jnp.ndarray]:
+             prefactored_precond=None) -> Tuple['State', jnp.ndarray, jnp.ndarray, float, int]:
     """Execute one timestep of the half-sarcomere simulation.
 
     Tiered Architecture:
@@ -122,15 +124,6 @@ def timestep(state: 'State',
         drivers: Time-varying overrides for pCa/z_line/ls (Tier 3)
         topology: Structural index data (Tier 1)
 
-    Workflow:
-        1. Resolve drivers (merge Tier 3 overrides with Tier 2 defaults)
-        2. Calculate INTERNAL thin filament forces for cooperativity
-        3. Update cooperativity based on INTERNAL filament tension
-        4. Update nearest binding sites
-        5. Thin filament transitions (tropomyosin states)
-        6. Thick filament transitions (crossbridge states + binding)
-        7. Solve for new equilibrium positions (Newton solver)
-
     Args:
         state: Current State NamedTuple (pure state, no embedded params)
         constants: DynamicParams/Constants with physics values
@@ -138,22 +131,25 @@ def timestep(state: 'State',
         topology: SarcTopology for indexing
         rng_key: JAX random key for stochastic transitions
         dt: Timestep size (ms) -- keyword-only, JIT static
+        K_lat: Lattice stiffness (pN/nm). None = fixed LS mode.
+        d_ref: Poisson-scaled reference lattice spacing (nm). Required if K_lat is not None.
         solver_tol: Convergence tolerance (pN). If None, uses constants.solver_tol
         precond_params: Pre-built PreconditionerParams (optional)
         prefactored_precond: Pre-factored Thomas data (optional)
 
     Returns:
-        (new_state, new_rng_key, solver_residual)
+        (new_state, new_rng_key, solver_residual, new_ls, n_iters)
     """
     state, rng_key, resolved_constants = kinetics_step(
         state, constants, drivers, topology, rng_key, dt=dt
     )
 
-    state, solver_residual = solve_equilibrium(
+    new_state, solver_residual, new_ls, n_iters = solve_equilibrium(
         state, resolved_constants, topology,
+        K_lat=K_lat, d_ref=d_ref,
         tolerance=solver_tol,
         precond_params=precond_params,
         prefactored_precond=prefactored_precond,
     )
 
-    return state, rng_key, solver_residual
+    return new_state, rng_key, solver_residual, new_ls, n_iters

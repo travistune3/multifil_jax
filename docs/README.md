@@ -22,8 +22,9 @@ minimal — this is a narrative, not a reference manual.
 10. [Batch Bucketing: Why JIT Cares About Array Sizes](#10-batch-bucketing-why-jit-cares-about-array-sizes)
 11. [What Can Be Swept (vmapped) and What Cannot](#11-what-can-be-swept-vmapped-and-what-cannot)
 12. [What Happens Inside Each Timestep](#12-what-happens-inside-each-timestep)
-13. [The Tiered Architecture: State, Topology, Constants, Drivers](#13-the-tiered-architecture-state-topology-constants-drivers)
-14. [Key File Reference](#14-key-file-reference)
+13. [Dynamic Lattice Spacing](#13-dynamic-lattice-spacing)
+14. [The Tiered Architecture: State, Topology, Constants, Drivers](#14-the-tiered-architecture-state-topology-constants-drivers)
+15. [Key File Reference](#15-key-file-reference)
 
 ---
 
@@ -93,8 +94,7 @@ concept in this codebase.
 
 ### StaticParams and DynamicParams (the parameters)
 
-`get_default_params()` (`multifil_jax/core/params.py`, line ~170) returns
-two objects:
+`get_default_params()` (`multifil_jax/core/params.py`) returns two objects:
 
 **StaticParams** is a frozen Python dataclass containing structural configuration:
 how many crowns per filament (default 52), how many actin polymers per thin
@@ -111,7 +111,7 @@ approximately 45 fields.
 
 ### SarcTopology (the geometry)
 
-`SarcTopology.create()` (`multifil_jax/core/sarc_geometry.py`, around line 250)
+`SarcTopology.create()` (`multifil_jax/core/sarc_geometry.py`)
 builds all the structural index maps that describe how thick and thin filaments
 are arranged, which crossbridges can reach which binding sites, how many titin
 connections exist, and what the rest spacings are between nodes. This process
@@ -133,14 +133,14 @@ on every call.
 
 ## 4. Running Your First Simulation
 
-The entry point for all simulations is `run()`, defined in `multifil_jax/simulation.py`
-at line 499. Here is a minimal example of a single isometric contraction (fixed
-z-line length, fixed calcium):
+The entry point for all simulations is `run()`, defined in `multifil_jax/simulation.py`.
+Here is a minimal example of a single isometric contraction (fixed z-line
+length, fixed calcium):
 
 ```python
 from multifil_jax.core.params import get_default_params
 from multifil_jax.core.sarc_geometry import SarcTopology
-from simulation import run
+from multifil_jax.simulation import run
 import jax
 
 static, dynamic = get_default_params()
@@ -167,7 +167,7 @@ work asynchronously.
 
 ## 5. Understanding SimulationResult
 
-`run()` returns a `SimulationResult` object (`multifil_jax/simulation.py`, line 56).
+`run()` returns a `SimulationResult` object (`multifil_jax/simulation.py`).
 This is essentially a structured container holding all simulation outputs as
 arrays. Every array inside it shares the same shape convention:
 
@@ -191,14 +191,20 @@ dictionary mapping each axis name to its actual values.
 **Key attributes you will use:**
 
 `result.axial_force` — the M-line force trace in piconewtons. This is the
-primary output of a mechanical simulation.
+primary output of a mechanical simulation. It is a property that returns
+`result.metrics['axial_force']`.
 
-`result.metrics` — a dictionary containing ~43 additional quantities computed
-at every timestep (described fully in the next section).
+`result.metrics` — a `MetricsDict` containing ~46 quantities computed
+at every timestep (described fully in the next section). `MetricsDict` supports
+both dict-style access (`result.metrics['n_bound']`) and attribute access
+(`result.metrics.n_bound`).
 
-`result.metrics["solver_residual"]` — a diagnostic trace showing how well the mechanical
-equilibrium solver converged at each step. Values below 0.5 pN are considered
-converged.
+`result.metrics['solver_residual']` — a diagnostic trace showing how well the
+mechanical equilibrium solver converged at each step. Values below 0.5 pN are
+considered converged.
+
+`result.metrics['newton_iters']` — the number of Newton iterations the solver
+used at each step. Typically 1–2 for standard parameters.
 
 `result.z_line`, `result.pCa`, `result.lattice_spacing` — the input traces
 actually used during the simulation, useful for aligning outputs with protocol
@@ -226,16 +232,18 @@ into a single result with a new outer sweep dimension.
 ## 6. What Is in results.metrics?
 
 Every timestep, after the mechanical state has been updated, `compute_all_metrics()`
-(`multifil_jax/metrics_fn.py`, line 25) computes 43 scalar quantities and
-accumulates them into arrays. These are returned in `result.metrics` as a
-dictionary. Every key in this dictionary maps to an array with the same shape
-as `result.axial_force`.
+(`multifil_jax/metrics_fn.py`) computes ~46 scalar quantities and accumulates
+them into arrays. These are returned in `result.metrics` as a `MetricsDict`.
+Every key in this dictionary maps to an array with the same shape as
+`result.axial_force`.
 
-**Protocol values (what was actually applied each step):**
-- `'force'` — same as `axial_force` (also stored here for convenience)
+**Protocol values (what was actually applied or measured each step):**
+- `'axial_force'` — total M-line force (pN); also accessible as `result.axial_force`
+- `'solver_residual'` — Newton solver max force imbalance (pN); below 0.5 = converged
 - `'z_line'` — z-line position trace (nm)
 - `'pCa'` — pCa trace
-- `'lattice_spacing'` — lattice spacing trace (nm)
+- `'lattice_spacing'` — lattice spacing trace (nm); when using dynamic LS, this is
+  the emergent value solved each step, not the input
 
 **Crossbridge state counts** (raw integer counts of crossbridges in each state):
 - `'n_bound'` — total number of crossbridges bound to actin (states 2, 3, 4)
@@ -286,6 +294,11 @@ as `result.axial_force`.
 - `'work_per_atp'` — ratio of work done to ATP consumed (thermodynamic
   efficiency indicator)
 
+**Solver diagnostics:**
+- `'newton_iters'` — number of Newton iterations used by the equilibrium solver
+  this step. Typically 1–2 for standard parameters; useful for diagnosing
+  convergence at extreme parameter values.
+
 ---
 
 ## 7. Post-Processing with Array Operations
@@ -324,7 +337,7 @@ efficiency = total_work / (total_atp + 1e-9) # avoid divide-by-zero
 ```
 
 **Adding custom metrics to the result dictionary** — since `result.metrics`
-is a plain Python dict, you can add new keys:
+is a dict subclass, you can add new keys:
 
 ```python
 result.metrics['efficiency'] = (
@@ -440,12 +453,11 @@ trace across different parameters in the same call.
 This section explains the internal mechanism, which is important for
 understanding what can and cannot be parallelized.
 
-When `run()` (`multifil_jax/simulation.py`, line 583) receives lists for multiple
-parameters, it builds a Cartesian product grid using `jnp.meshgrid`. If you
-pass 5 values for `thick_k` and 3 values for `thin_k`, `meshgrid` produces a
-5×3 grid of all combinations. The grid is then "flattened" to a single batch
-dimension of size 15. Replicates are tiled on top, giving a total batch of
-`15 × replicates` independent simulations.
+When `run()` receives lists for multiple parameters, it builds a Cartesian
+product grid using `jnp.meshgrid`. If you pass 5 values for `thick_k` and 3
+values for `thin_k`, `meshgrid` produces a 5×3 grid of all combinations. The
+grid is then "flattened" to a single batch dimension of size 15. Replicates are
+tiled on top, giving a total batch of `15 × replicates` independent simulations.
 
 Each simulation in the batch gets its own entry in every input array. The batch
 dimension is arranged so that element 0 has `(thick_k[0], thin_k[0])`, element
@@ -492,7 +504,7 @@ Compilation takes 30–400 seconds. Running two sweeps of slightly different
 sizes should not require two full compilations.
 
 To solve this, `run()` rounds up every batch size to the nearest value in a
-fixed list of "buckets" (`multifil_jax/simulation.py`, line 372):
+fixed list of "buckets" (`multifil_jax/simulation.py`):
 
 ```
 BATCH_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384)
@@ -508,9 +520,9 @@ many as needed, since the bucket sizes double). The benefit is that a 15-sim
 sweep and a 9-sim sweep both compile as 16, so the second call uses the cached
 kernel from the first.
 
-This bucketing is handled by `get_bucket_size()` (`multifil_jax/simulation.py`,
-line 375) and is completely transparent — you pass the exact number of
-conditions you want, and the padding happens internally.
+This bucketing is handled by `get_bucket_size()` and is completely transparent
+— you pass the exact number of conditions you want, and the padding happens
+internally.
 
 The persistent XLA cache (`~/.cache/multifil_jax/xla/`) stores compiled kernels
 across Python sessions. The first time you run a 256-bucket 2×2 lattice sweep
@@ -520,6 +532,14 @@ each get their own cache entry automatically — you do not need to clear the
 cache when switching between them. Clear it only after upgrading JAX, since
 compiled kernels from an older version are incompatible:
 `rm -rf ~/.cache/multifil_jax/xla/`
+
+**Minibatching.** For very large sweeps (≥16384 runs), the `minibatch_size`
+parameter lets `run()` split the padded batch into smaller chunks. Each chunk
+calls the same compiled kernel, so there is no recompilation. The default
+`"auto"` setting chunks batches of 16384+ into groups of 4096, which
+benchmarks show is ~2% faster due to better L2 cache utilization. The primary
+reason to use minibatching is to bound peak GPU VRAM on memory-constrained GPUs
+(e.g. 8 GB): peak VRAM ≈ minibatch_size × n_steps × 46 × 4 bytes × 2.
 
 ---
 
@@ -536,6 +556,9 @@ one call and JAX sees it as a single batch computation. The list of sweepable
 physics parameters includes all spring constants (`thick_k`, `thin_k`,
 `titin_b`, `titin_a`), all rate function parameters, calcium binding
 constants, and the default pCa/z_line/lattice_spacing.
+
+`K_lat` and `nu` (lattice stiffness and Poisson exponent) can also be swept
+as lists. They join the Cartesian product grid alongside other sweep parameters.
 
 The number of **replicates** can change freely — it just changes the batch
 size, which is handled by bucket rounding.
@@ -557,6 +580,11 @@ calls.
 are embedded into the compiled kernel at trace time. Changing any of these
 requires creating a new topology and recompiling.
 
+Switching between **fixed LS and dynamic LS** modes requires recompilation,
+because `is_dynamic_ls` is a JIT static argument. However, different `K_lat`
+values within dynamic LS mode share the same compiled kernel (K_lat is traced,
+not static).
+
 **The fundamental rule:** if two runs would produce arrays of different shapes
 anywhere inside the simulation loop, they require separate compiled kernels.
 If they produce the same shapes with different values, they share a kernel.
@@ -565,16 +593,16 @@ If they produce the same shapes with different values, they share a kernel.
 
 ## 12. What Happens Inside Each Timestep
 
-Each millisecond of simulated time, `timestep()` (`multifil_jax/timestep.py`,
-line 43) is called once. It takes the current mechanical state, the physical
-parameters, the time-varying driver values, and a random number key, and
-returns the new state plus the solver convergence residual. Here is what
-happens, in order:
+Each millisecond of simulated time, `timestep()` (`multifil_jax/timestep.py`)
+is called once. It takes the current mechanical state, the physical parameters,
+the time-varying driver values, and a random number key, and returns a 5-tuple:
+`(new_state, new_rng_key, solver_residual, new_lattice_spacing, newton_iterations)`.
+Here is what happens, in order:
 
 **Step 0: Resolve drivers.** The simulation has two ways to specify values like
 pCa, z_line, and lattice spacing: as static defaults in `DynamicParams` (Tier 2)
-or as per-step values in `Drivers` (Tier 3). `resolve_value()` (`multifil_jax/core/state.py`,
-line ~85) merges these: if the driver value is a valid number (not NaN), use
+or as per-step values in `Drivers` (Tier 3). `resolve_value()` (`multifil_jax/core/state.py`)
+merges these: if the driver value is a valid number (not NaN), use
 it; otherwise use the constant default. This allows a parameter to be constant
 for most of a simulation but overridden at specific timesteps without branching.
 A merged `resolved_constants` object is built via `DynamicParams.with_drivers()`
@@ -633,17 +661,94 @@ factored before the scan loop (via `build_prefactored_preconditioner()`,
 `multifil_jax/kernels/solver.py`) accelerates the inner conjugate-gradient
 solve. This step is by far the most computationally intensive.
 
-After all six steps, the new state and the solver residual are returned. The
-scan loop in `run_single_sim` carries the state forward to the next timestep.
+Steps 0–5 are encapsulated in `kinetics_step()`, which returns the post-kinetics
+state and `resolved_constants`. This separation exists to support future
+finite-element coupling: run kinetics across all coupled sarcomeres independently,
+then perform a coupled mechanical equilibration.
 
-**Then: compute all metrics.** Immediately after `timestep()` returns, `compute_all_metrics()`
-(`multifil_jax/metrics_fn.py`, line 25) is called inside the scan body,
-comparing the state before and after the step to produce all 43 scalar metrics.
-These are accumulated as arrays across time and returned as `result.metrics`.
+After all steps complete, the new state, solver residual, emergent lattice
+spacing, and iteration count are returned. The scan loop in `run_single_sim`
+carries the state forward to the next timestep. Immediately after `timestep()`
+returns, `compute_all_metrics()` is called inside the scan body, comparing the
+state before and after the step to produce all ~46 scalar metrics. These are
+accumulated as arrays across time and returned as `result.metrics`.
 
 ---
 
-## 13. The Tiered Architecture: State, Topology, Constants, Drivers
+## 13. Dynamic Lattice Spacing
+
+By default, the lattice spacing (the distance from a thick filament to its
+neighboring thin filaments, typically ~14 nm) is either held constant or
+prescribed externally via a Poisson ratio relation to z-line length. The
+**dynamic lattice spacing** feature makes this distance an emergent quantity
+solved self-consistently from radial force balance at each timestep.
+
+### The physics
+
+Three forces act in the radial (cross-filament) direction:
+
+1. **Lattice stiffness** (`K_lat`): a restoring spring that resists deviation
+   from the Poisson-scaled reference spacing. `F_lat = -K_lat * (d - d_ref)`.
+   This represents the combined stiffness of the Z-disc, M-line, and surrounding
+   cytoskeletal structures.
+
+2. **Crossbridge radial force**: every bound crossbridge has a two-spring model
+   (globular + converter springs) whose geometry depends on the lattice spacing.
+   When the total XB length exceeds the rest length, XBs pull filaments together
+   (compressive). When shorter than rest, they push apart (expansive). During
+   full activation (many strong-state XBs), the net XB force is typically
+   compressive.
+
+3. **Titin radial force**: titin runs diagonally from thick filament to Z-disc.
+   The radial component of its tension always pulls thick toward thin
+   (compressive).
+
+At equilibrium: `F_lat + F_xb_radial + F_titin_radial = 0`, and the emergent
+`d` satisfies this balance.
+
+### How the solver works
+
+Rather than iterating between axial and radial solves, `d` is appended as one
+extra degree of freedom to the existing Newton-CG position vector:
+
+```
+augmented positions:  [thick_crown_1, ..., thin_site_N, d]    (n+1 elements)
+augmented residual:   [f_axial_1,     ..., f_axial_N,  f_rad]  (n+1 elements)
+```
+
+JAX's automatic differentiation computes the full Jacobian-vector products for
+this augmented system, including all cross-coupling terms (how changing `d`
+affects axial forces, and how changing axial positions affects the radial
+residual). The preconditioner is block-diagonal: Thomas tridiagonal for the
+axial block, and the exact Jacobian diagonal inverse for the d block.
+
+### Three modes in `run()`
+
+| Call | Mode | What happens |
+|------|------|-------------|
+| `run(topo, pCa=4.5)` | Fixed LS | `lattice_spacing` held constant at 14.0 nm |
+| `run(topo, pCa=4.5, nu=0.5)` | Poisson LS | `ls = d0*(z0/z)^0.5` pre-computed as trace |
+| `run(topo, pCa=4.5, K_lat=5.0, nu=0.5)` | Dynamic LS | `d` solved from radial force balance |
+
+`K_lat` is specified as per-filament stiffness (pN/nm per thick filament).
+`run()` internally multiplies by `n_thick` so the lattice spacing deviation is
+independent of lattice size. This means a 2×2 and an 8×8 lattice with the same
+`K_lat` show the same mean deviation from `d_ref`.
+
+### What to expect
+
+At `K_lat=5.0 pN/nm` and `pCa=4.5` (full activation), the lattice typically
+compresses by ~6 nm from the 14 nm reference, settling around ~8 nm. This is
+driven by strong-state crossbridges pulling filaments together. The magnitude
+of compression depends on `K_lat`: stiffer lattice → smaller deviation.
+
+`result.metrics['lattice_spacing']` contains the emergent lattice spacing at
+each timestep, so you can track how the lattice responds to activation, length
+changes, or stiffness sweeps.
+
+---
+
+## 14. The Tiered Architecture: State, Topology, Constants, Drivers
 
 The codebase separates simulation data into four tiers to control what can
 change, when, and at what cost. Understanding this is helpful when you want
@@ -680,26 +785,28 @@ and "active" only during specific steps.
 
 ---
 
-## 14. Key File Reference
+## 15. Key File Reference
 
 | File | What It Contains |
 |------|-----------------|
-| `multifil_jax/simulation.py`, line 499 | `run()` — the main entry point for all simulations |
-| `multifil_jax/simulation.py`, line 56 | `SimulationResult` — the result container |
-| `multifil_jax/simulation.py`, line 372 | `BATCH_BUCKETS` and `get_bucket_size()` — bucket padding |
-| `multifil_jax/simulation.py`, line 390 | `_run_sim_kernel()` — the JIT-compiled vmap+scan kernel |
-| `multifil_jax/timestep.py`, line 43 | `timestep()` — single-step orchestrator |
-| `multifil_jax/metrics_fn.py`, line 25 | `compute_all_metrics()` — all 43 metrics |
-| `multifil_jax/core/state.py` | `State`, `realize_state()`, `Drivers`, `resolve_value()`, `SummaryState` |
+| `multifil_jax/simulation.py` | `run()` — the main entry point for all simulations |
+| `multifil_jax/simulation.py` | `SimulationResult` — the result container |
+| `multifil_jax/simulation.py` | `BATCH_BUCKETS`, `get_bucket_size()`, `_run_sim_kernel()` |
+| `multifil_jax/timestep.py` | `kinetics_step()` — stochastic phase (steps 0–5) |
+| `multifil_jax/timestep.py` | `timestep()` — full step orchestrator (kinetics + solve) |
+| `multifil_jax/metrics_fn.py` | `compute_all_metrics()` — ~46-metric MetricsDict |
+| `multifil_jax/core/state.py` | `State`, `realize_state()`, `Drivers`, `resolve_value()`, `MetricsDict` |
 | `multifil_jax/core/params.py` | `StaticParams`, `DynamicParams`, `get_default_params()` |
 | `multifil_jax/core/sarc_geometry.py` | `SarcTopology.create()` — topology builder |
 | `multifil_jax/kernels/cooperativity.py` | `update_cooperativity()` — TM cooperative activation |
 | `multifil_jax/kernels/geometry.py` | `update_nearest_neighbors()` — XB-to-BS distances |
 | `multifil_jax/kernels/transitions.py` | `thin_transitions()`, `thick_transitions()`, `compute_xb_transition_matrices()` |
-| `multifil_jax/kernels/forces.py` | `axial_force_at_mline()`, `calculate_thin_forces_for_cooperativity()` |
-| `multifil_jax/kernels/solver.py` | `solve_equilibrium()`, `build_prefactored_preconditioner()` |
+| `multifil_jax/kernels/forces.py` | `axial_force_at_mline()`, `compute_forces_vectorized()`, `_xb_radial_force_total()`, `_titin_radial_force_total()` |
+| `multifil_jax/kernels/solver.py` | `solve_equilibrium()` (unified fixed/dynamic LS), Thomas algorithm |
 | `multifil_jax/kernels/rate_functions.py` | Crossbridge rate functions (geometry-dependent) |
 | `multifil_jax/utils/hardware.py` | GPU detection, XLA cache configuration |
 | `examples/quickstart.py` | Worked examples: isometric, sweeps, transients, structural stack |
-| `examples/benchmark_lattice.py` | Lattice size and performance benchmarks |
-| `jax/tests/` | Test suite (35 tests, all passing as of Session 11) |
+| `examples/dynamic_lattice_spacing.py` | Dynamic LS demo: isometric, force comparison, K_lat sweep, length ramp |
+| `examples/benchmark_minibatch.py` | Minibatch size benchmark CLI |
+| `benchmarking/benchmark_dynamic_ls.py` | Dynamic LS performance and lattice scaling benchmark |
+| `tests/` | Test suite |

@@ -36,7 +36,7 @@ Used in every kernel to merge per-step overrides with defaults without branching
 ### vmap-outside-scan Architecture
 
 ```
-run() → vmap(_run_single_sim) → lax.scan(_run_sim_kernel)
+run() → vmap(run_single_sim) → lax.scan(scan_fn)
          ↑ batch dim                 ↑ time dim
 ```
 
@@ -47,20 +47,23 @@ into one GPU kernel — maximum parallelism with minimum kernel launch overhead.
 
 ## 2. Primary API: `run()`
 
-**File:** `multifil_jax/simulation.py`, ~line 530
+**File:** `multifil_jax/simulation.py`
 
 ```python
 result = run(
-    topology,          # SarcTopology (Tier 1)
-    pCa=4.5,           # float | list[float] | array(n_steps)
-    z_line=900.0,      # float | list[float] | array(n_steps)
+    topology,            # SarcTopology (Tier 1)
+    pCa=4.5,             # float | list[float] | array(n_steps)
+    z_line=900.0,        # float | list[float] | array(n_steps)
     lattice_spacing=14.0,
-    dynamic_params=None,  # DynamicParams | dict[str, float|list]
+    K_lat=None,          # float | list[float] | None  — lattice stiffness
+    nu=0.0,              # float | list[float]          — Poisson exponent
+    dynamic_params=None, # DynamicParams | dict[str, float|list]
     duration_ms=1000.0,
     dt=1.0,
     replicates=1,
     rng_seed=0,
     unroll=1,
+    minibatch_size="auto",  # "auto" | int | None
     verbose=False,
 )
 ```
@@ -75,12 +78,27 @@ result = run(
 **Batch padding:** sweep sizes rounded up to `BATCH_BUCKETS = (1, 2, 4, ..., 16384)`
 for JIT cache reuse. A 225-run and 256-run sweep share the same compiled kernel.
 
+**Minibatch:** `minibatch_size="auto"` chunks large batches (≥16384) into 4096-size
+pieces for L2 cache efficiency and VRAM bounding. An explicit int overrides the
+heuristic; `None` disables chunking.
+
+### Three Lattice Spacing Modes
+
+| Mode | Parameters | Behavior |
+|------|-----------|----------|
+| **Fixed** | `K_lat=None, nu=0` | Lattice spacing held constant (default) |
+| **Poisson** | `K_lat=None, nu>0` | `ls = d0 * (z0/z)^nu` pre-computed as time-series |
+| **Dynamic** | `K_lat>0` | `d` solved as DOF from radial force balance each timestep |
+
+`K_lat` is per-filament stiffness (pN/nm per thick filament); `run()` internally
+scales by `n_thick` so that `d_deviation` is lattice-size-independent.
+
 ### Typical usage
 
 ```python
-from simulation import run, get_default_params
+from multifil_jax.simulation import run
 from multifil_jax.core.sarc_geometry import SarcTopology
-from multifil_jax.core.params import StaticParams
+from multifil_jax.core.params import StaticParams, get_default_params
 
 static, dynamic = get_default_params()
 topo = SarcTopology.create(nrows=2, ncols=2, static_params=static, dynamic_params=dynamic)
@@ -93,25 +111,33 @@ result = run(topo, pCa=[9.0, 6.0, 4.5], replicates=5)
 
 # DynamicParams sweep
 result = run(topo, pCa=4.5, dynamic_params={'thick_k': [1000, 2000, 3000]})
+
+# Dynamic lattice spacing
+result = run(topo, pCa=4.5, K_lat=5.0, nu=0.5, duration_ms=500)
 ```
 
 ---
 
 ## 3. SimulationResult
 
-**File:** `multifil_jax/simulation.py`, ~line 64
+**File:** `multifil_jax/simulation.py`
 
 ```
-result.axial_force      # (... replicates, n_steps) force trace (pN)
-result.metrics          # dict of ~43 metric arrays, same shape
+result.axial_force      # property → metrics['axial_force'] (pN)
+result.metrics          # MetricsDict of ~46 metric arrays, same shape
 result.z_line           # z_line trace used
 result.pCa              # pCa trace used
-result.metrics["solver_residual"]  # Newton solver residual at each step
+result.metrics['solver_residual']  # Newton solver residual at each step
+result.metrics['newton_iters']     # Newton iterations per step
+result.metrics['lattice_spacing']  # actual LS each step (emergent if dynamic)
 result.dt               # timestep (ms)
 result.coords           # {'pCa': [...], 'z_line': [...], ...}
 result._axis_names      # ['pCa', 'replicates', 'time']
 result.topology_config  # dict with n_thick, n_thin, n_sites, etc.
 ```
+
+`MetricsDict` (defined in `core/state.py`) is a dict subclass with attribute access:
+`result.metrics.axial_force == result.metrics['axial_force']`.
 
 **Methods:**
 - `.mean()` — collapse replicates axis (returns SimulationResult)
@@ -124,44 +150,83 @@ result.topology_config  # dict with n_thick, n_thin, n_sites, etc.
 
 ## 4. JIT-compiled Kernel: `_run_sim_kernel`
 
-**File:** `multifil_jax/simulation.py`, ~line 455
+**File:** `multifil_jax/simulation.py`
 
 This is the vmapped+scanned simulation kernel:
 
 ```python
-# Outer: vmap over batch (parameter sweep × replicates)
-# Inner: lax.scan over time
-batched_summaries, batched_metrics = _run_sim_kernel(
-    topology=topology,          # passed via closure (vmap in_axes=None)
-    batched_params=batched_params,  # vmap in_axes=0
-    z_batched=z_batched,        # (batch, n_steps) vmap in_axes=0
-    pCa_batched=pCa_batched,
-    ls_batched=ls_batched,
-    rng_keys=rng_keys,          # (batch,) vmap in_axes=0
-    dt=dt,
-)
+@partial(jax.jit, static_argnames=['dt', 'unroll', 'is_dynamic_ls'])
+def _run_sim_kernel(
+    topology,           # passed via closure (vmap in_axes=None)
+    batched_params,     # vmap in_axes=0
+    z_batched,          # (batch, n_steps)
+    pCa_batched,        # (batch, n_steps)
+    ls_batched,         # (batch, n_steps)
+    rng_keys,           # (batch,)
+    dt, unroll,
+    is_dynamic_ls=False,  # static — controls fixed vs dynamic LS code path
+    K_lat_batched=None,   # (batch,) lattice stiffness
+    nu_batched=None,      # (batch,) Poisson exponent
+) -> MetricsDict:         # shape (batch, n_steps) for each key
 ```
 
-All metrics are always computed (~43 metrics). No `metrics`/`manifest` in JIT
-`static_argnames` — avoids recompilation when metrics selection changes.
+`is_dynamic_ls` is a JIT static arg — fixed LS and dynamic LS compile to separate
+kernels. `K_lat` and `nu` are traced (not static), so different stiffness values
+share the same compiled kernel.
+
+Scan carry is `(state, rng_key, current_ls)` — the third element tracks the
+emergent lattice spacing (identity passthrough for fixed LS).
+
+All ~46 metrics are always computed. No `metrics`/`manifest` in JIT
+`static_argnames` — changing metric selection never triggers recompilation.
 
 ---
 
-## 5. Single Timestep: `timestep()`
+## 5. Single Timestep
 
 **File:** `multifil_jax/timestep.py`
 
-Always returns `(state, rng_key, solver_residual)`.
+Two public functions:
+
+### `kinetics_step()` — stochastic phase (steps 0–5)
+
+```python
+state, rng_key, resolved_constants = kinetics_step(
+    state, constants, drivers, topology, rng_key, dt=dt
+)
+```
+
+Performs driver resolution, cooperativity, nearest neighbors, and stochastic
+TM/XB transitions. Returns `resolved_constants` with driver values baked in.
+
+Separated from the mechanical solve to support future FE coupling: run kinetics
+across all coupled sarcomeres, then perform a coupled equilibration.
+
+### `timestep()` — full step (kinetics + equilibrium)
+
+```python
+new_state, new_key, residual, new_ls, n_iters = timestep(
+    state, constants, drivers, topology, rng_key, dt=dt,
+    K_lat=None, d_ref=None,
+    precond_params=None, prefactored_precond=None,
+)
+```
+
+Returns a 5-tuple. `K_lat is None` selects fixed LS mode (resolved at trace time,
+no runtime branch). When `K_lat` is not None, passes `K_lat` and `d_ref` to
+`solve_equilibrium()` which handles the augmented (n+1)-DOF dynamic LS solve.
 
 **7-step workflow:**
 
 1. **resolve_value** — merge Drivers (Tier 3) with Constants (Tier 2)
-2. **update_cooperativity** — TM chain cooperative activation (tension-dependent span)
-3. **update_nearest_neighbors** — per-XB geometry (distances to binding sites)
-4. **thin_transitions** — TM 4-state Markov transitions (matrix exponential)
-5. **thick_transitions** — XB 6-state Markov transitions (per-XB matrix exponential)
-6. **solve_equilibrium** — Newton-CG solver for force balance
-7. **compute_all_metrics** → `SummaryState(force, solver_residual)` + metrics dict
+2. **calculate_thin_forces_for_cooperativity** — internal thin filament spring forces
+3. **update_cooperativity** — TM chain cooperative activation (tension-dependent span)
+4. **update_nearest_neighbors** — per-XB geometry (distances to binding sites)
+5. **thin_transitions** — TM 4-state Markov transitions (matrix exponential)
+6. **thick_transitions** — XB 6-state Markov transitions (per-XB matrix exponential)
+7. **solve_equilibrium** — Newton-CG solver (unified fixed/dynamic LS)
+
+Steps 0–6 are `kinetics_step()`. Step 7 is the mechanical solve.
 
 ---
 
@@ -190,10 +255,9 @@ State(
 )
 ```
 
-**SummaryState** — scan output (minimal, just force + residual):
-```python
-SummaryState(force, solver_residual)
-```
+**MetricsDict** — scan output. A dict subclass with attribute access, registered
+as a JAX PyTree. Contains all ~46 metric scalars per timestep (including
+`axial_force`, `solver_residual`, `newton_iters`).
 
 **Immutable updates** via `._replace()`:
 ```python
@@ -338,11 +402,20 @@ jax.lax.fori_loop(0, 18, lambda i, X: X @ X, A_scaled)
 
 **File:** `multifil_jax/kernels/forces.py`
 
+### Axial forces (for equilibrium solver and output)
 - `axial_force_at_mline(state, constants)` — total M-line force (pN)
-- `compute_forces_vectorized(...)` — per-node residual forces for solver
+- `compute_forces_vectorized(...)` — per-node axial residual forces for solver
+- `compute_forces_from_state_vectorized(state, constants, topology)` — convenience wrapper
 
 Force contributions: thick spring chain, thin spring chain, XB (converter + globular
-springs for states 2-4), titin (exp model).
+springs for states 2-4), titin (exponential model).
+
+### Radial forces (for dynamic lattice spacing solver)
+- `_xb_radial_force_total(...)` — total XB radial force Σ dV_XB/dd (pN). Differentiable w.r.t. lattice_spacing for the augmented Newton JVP.
+- `_titin_radial_force_total(...)` — total titin radial force from all thick filaments
+
+Both functions replicate the geometry from their axial counterparts but accumulate
+the radial component instead. Used by `_radial_residual()` in `solver.py`.
 
 ---
 
@@ -350,7 +423,14 @@ springs for states 2-4), titin (exp model).
 
 **File:** `multifil_jax/kernels/solver.py`
 
-`solve_equilibrium(state, constants, topology) → (State, residual_scalar)`
+### Unified solver (fixed and dynamic lattice spacing)
+
+`solve_equilibrium(state, constants, topology, K_lat=None, d_ref=None) → (State, residual, new_ls, n_iters)`
+
+Returns a 4-tuple: the equilibrated state, scalar max residual (pN), the
+lattice spacing used (solved `d` in dynamic mode, `constants.lattice_spacing` in
+fixed mode), and the number of Newton iterations used. `K_lat is None` selects
+fixed LS mode at trace time (no runtime branch).
 
 ### Newton-CG with while_loop
 
@@ -383,23 +463,58 @@ tolerance = max(tolerance, thick_k * 1e-4, MIN_FLOAT32_TOLERANCE)
 
 Prevents the while_loop from chasing an unreachable target at stiff parameter values.
 
+### Dynamic lattice spacing solve path
+
+When `K_lat is not None`, `solve_equilibrium()` appends lattice spacing `d` as an
+extra DOF to the position vector, creating an augmented (n+1)-dim system:
+
+```
+augmented residual:  [f_axial(positions, d), f_radial(positions, d)]
+augmented solution:  [positions..., d]
+```
+
+JAX's JVP on the augmented residual automatically captures all cross-coupling
+terms (∂f_axial/∂d, ∂f_radial/∂positions).
+
+Key functions:
+- `_radial_residual(d, ...)` — radial force balance: `F_rad = -K_lat*(d-d_ref) - f_xb - f_titin = 0`
+- `_augmented_residual_fn(pos_aug, ...)` — joint `[f_axial, f_radial]` residual
+- `_newton_solve_dynamic_ls(...)` — while_loop Newton with `d > 1.0 nm` projection
+- `_apply_augmented_preconditioner(...)` — block-diagonal: Thomas for axial, exact Jacobian diagonal inverse for d
+
+The d-block preconditioner uses `jax.grad(_radial_residual)` to compute `J_dd`
+(the exact Jacobian diagonal at d), giving `d_block_inv = -1/J_dd`. This replaces
+the naive `1/K_lat` which was ill-conditioned when XB radial stiffness dominated.
+
 ---
 
 ## 14. Metrics
 
 **File:** `multifil_jax/metrics_fn.py`
 
-Single function: `compute_all_metrics(state, constants, topology) → dict`
+Single function:
+```python
+metrics = compute_all_metrics(
+    old_state, new_state, constants, drivers, topology,
+    pre_solve_thick_pos, force, solver_residual, newton_iters, dt
+)
+```
 
-Returns ~43 metrics as a fixed dict. Always computed — no selection needed.
+Returns a `MetricsDict` with ~46 keys (same keys every call). Always computed —
+no selection needed.
 
 **Metric groups:**
-- Force: `axial_force`, `xb_force_*`, `titin_force`
-- XB counts: `n_bound`, `n_srx`, `n_drx`, `n_weak_bound`, `n_strong_bound`
-- XB positions: `xb_displace_mean`, `xb_displace_std`, `thick_displace_mean`
-- TM states: `n_tm_state_0/1/2/3`, `mean_permissiveness`
-- Energetics: `thick_energy_*`, `xb_energy_*`
-- Solver: `solver_residual`
+- Protocol: `axial_force`, `solver_residual`, `z_line`, `pCa`, `lattice_spacing`
+- XB counts: `n_bound`, `n_xb_drx`, `n_xb_loose`, `n_xb_tight_1`, `n_xb_tight_2`, `n_xb_free_2`, `n_xb_srx`
+- XB fractions: `frac_xb_bound`, `frac_xb_drx`, `frac_xb_loose`, `frac_xb_tight_1`, `frac_xb_tight_2`, `frac_xb_free_2`, `frac_xb_srx`
+- TM counts: `n_tm_state_0` through `n_tm_state_3`
+- TM fractions: `frac_tm_state_0` through `frac_tm_state_3`, `actin_permissiveness`
+- Transitions: `atp_consumed`, `newly_bound`
+- Displacement: `thick_displace_mean/max/min/std`, `thin_displace_mean/max/min/std`
+- Energy: `thick_energy_first_avg`, `thick_energy_first_delta_avg`, `titin_energy_avg`, `titin_energy_delta_avg`
+- Work: `work_thick`, `work_thick_mean`, `work_per_atp`
+- ATP expected: `atp_expected_p`, `atp_expected_q`
+- Solver: `newton_iters`
 
 ---
 
@@ -408,19 +523,22 @@ Returns ~43 metrics as a fixed dict. Always computed — no selection needed.
 | File | Purpose |
 |------|---------|
 | `multifil_jax/simulation.py` | `run()`, `SimulationResult`, `_run_sim_kernel` |
-| `multifil_jax/timestep.py` | `timestep()` — single step orchestrator |
-| `multifil_jax/metrics_fn.py` | `compute_all_metrics()` — ~43-metric dict |
-| `multifil_jax/core/state.py` | State hierarchy, `realize_state()`, `Drivers`, `resolve_value()` |
+| `multifil_jax/timestep.py` | `kinetics_step()`, `timestep()` — single step orchestrator |
+| `multifil_jax/metrics_fn.py` | `compute_all_metrics()` — ~46-metric MetricsDict |
+| `multifil_jax/core/state.py` | State hierarchy, `realize_state()`, `Drivers`, `resolve_value()`, `MetricsDict` |
 | `multifil_jax/core/params.py` | `StaticParams`, `DynamicParams`, `get_default_params()` |
 | `multifil_jax/core/sarc_geometry.py` | `SarcTopology` — PyTree topology |
 | `multifil_jax/kernels/cooperativity.py` | `update_cooperativity()` |
 | `multifil_jax/kernels/geometry.py` | `update_nearest_neighbors()` |
 | `multifil_jax/kernels/transitions.py` | `thin_transitions()`, `thick_transitions()`, `compute_xb_transition_matrices()` |
-| `multifil_jax/kernels/forces.py` | `axial_force_at_mline()`, `compute_forces_vectorized()` |
-| `multifil_jax/kernels/solver.py` | `solve_equilibrium()`, Thomas algorithm |
+| `multifil_jax/kernels/forces.py` | `axial_force_at_mline()`, `compute_forces_vectorized()`, `_xb_radial_force_total()`, `_titin_radial_force_total()` |
+| `multifil_jax/kernels/solver.py` | `solve_equilibrium()` (unified fixed/dynamic LS), Thomas algorithm |
 | `multifil_jax/kernels/rate_functions.py` | Rate functions (absolute values, no multipliers) |
 | `multifil_jax/helper.py` | `count_transitions()` and other utilities |
-| `jax/tests/` | Test suite |
+| `examples/dynamic_lattice_spacing.py` | Dynamic LS demo: isometric, force comparison, K_lat sweep, length ramp |
+| `examples/benchmark_minibatch.py` | Minibatch size benchmark CLI |
+| `benchmarking/benchmark_dynamic_ls.py` | Dynamic LS performance and lattice scaling benchmark |
+| `tests/` | Test suite |
 
 ---
 
@@ -441,3 +559,4 @@ Returns ~43 metrics as a fixed dict. Always computed — no selection needed.
 
 - **Thomas fori_loop**: 20× runtime regression (XLA cannot fuse across WhileOp barriers)
 - **GPU autotune level=2**: Suboptimal kernel selection
+- **float16 sampling (cumsum+argmax)**: Systematic one-state-downward bias (~0.088% of samples). No throughput benefit.

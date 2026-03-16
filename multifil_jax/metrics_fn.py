@@ -31,6 +31,7 @@ def compute_all_metrics(
     pre_solve_thick_pos: jnp.ndarray,
     force: jnp.ndarray,
     solver_residual: jnp.ndarray,
+    newton_iters,
     dt: float,
 ) -> 'MetricsDict':
     """Compute all metrics for a single timestep.
@@ -47,6 +48,7 @@ def compute_all_metrics(
         pre_solve_thick_pos: (n_thick, n_crowns) positions before equilibrium solve
         force: Scalar M-line force (already computed)
         solver_residual: Scalar equilibrium solver residual (pN)
+        newton_iters: Number of Newton iterations used by solver
         dt: Timestep size (ms)
 
     Returns:
@@ -251,4 +253,7 @@ def compute_all_metrics(
         'atp_expected_p': atp_expected_p,
         'atp_expected_q': atp_expected_q,
         'work_per_atp': work_per_atp,
+
+        # Solver diagnostics
+        'newton_iters': newton_iters,
     })

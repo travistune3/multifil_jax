@@ -395,7 +395,7 @@ def _auto_minibatch_size(padded_batch: int) -> Optional[int]:
 # MODULE-LEVEL SIMULATION KERNEL
 # =============================================================================
 
-@partial(jax.jit, static_argnames=['dt', 'unroll'])
+@partial(jax.jit, static_argnames=['dt', 'unroll', 'is_dynamic_ls'])
 def _run_sim_kernel(
     topology: SarcTopology,
     batched_params: DynamicParams,
@@ -405,8 +405,11 @@ def _run_sim_kernel(
     rng_keys: jnp.ndarray,
     dt: float,
     unroll: int,
+    is_dynamic_ls: bool = False,
+    K_lat_batched: jnp.ndarray = None,
+    nu_batched: jnp.ndarray = None,
 ):
-    """JIT-compiled simulation kernel.
+    """JIT-compiled simulation kernel (unified fixed + dynamic LS).
 
     Always computes all metrics via compute_all_metrics(). No metrics/manifest
     in static_argnames — changing metric selection never triggers recompilation.
@@ -420,20 +423,23 @@ def _run_sim_kernel(
         rng_keys: (batch,) RNG keys
         dt: Timestep in ms (static)
         unroll: Scan unrolling factor (static)
+        is_dynamic_ls: If True, solve lattice spacing as a DOF (static)
+        K_lat_batched: (batch,) per-sim lattice stiffness (ignored if not is_dynamic_ls)
+        nu_batched: (batch,) per-sim Poisson exponent (ignored if not is_dynamic_ls)
 
     Returns:
         MetricsDict with all metric scalars, shape (batch, time).
-        Includes 'axial_force' and 'solver_residual' keys.
+        Includes 'axial_force', 'solver_residual', and 'newton_iters' keys.
     """
 
     def create_and_equilibrate(constants, z0, pCa0, ls0):
         """Create state from topology + constants and solve equilibrium."""
         state = realize_state(topology, constants, z0, pCa0, ls0)
         state = update_nearest_neighbors(state, constants, topology)
-        state, _residual = solve_equilibrium(state, constants, topology)
+        state, _residual, _, _ = solve_equilibrium(state, constants, topology)
         return state
 
-    def run_single_sim(state, constants, key, z_trace, pCa_trace, ls_trace):
+    def run_single_sim(state, constants, key, z_trace, pCa_trace, ls_trace, K_lat_val, nu_val):
         """Run simulation with scan inside vmap."""
         n_thick, n_crowns = state.thick.axial.shape
         n_thin, n_sites = state.thin.axial.shape
@@ -444,9 +450,10 @@ def _run_sim_kernel(
         prefactored_precond = build_prefactored_preconditioner(precond_params)
 
         delta_z = jnp.concatenate([jnp.zeros(1), jnp.diff(z_trace)])
+        l0 = z_trace[0]  # reference z for Poisson scaling
 
         def scan_fn(carry, inputs):
-            old_state, k = carry
+            old_state, k, current_ls = carry
             z_val, pCa_val, ls_val, dz = inputs
 
             old_state = old_state._replace(
@@ -455,28 +462,38 @@ def _run_sim_kernel(
                 )
             )
 
-            drivers = Drivers(pCa=pCa_val, z_line=z_val, lattice_spacing=ls_val)
-
             pre_solve_thick_pos = old_state.thick.axial
 
-            new_state, new_k, solver_residual = timestep(
+            if is_dynamic_ls:
+                drivers = Drivers(pCa=pCa_val, z_line=z_val, lattice_spacing=current_ls)
+                d_ref = ls_val * (l0 / z_val) ** nu_val
+            else:
+                drivers = Drivers(pCa=pCa_val, z_line=z_val, lattice_spacing=ls_val)
+                d_ref = None
+
+            new_state, new_k, solver_residual, new_ls, n_iters = timestep(
                 old_state, constants, drivers, topology, k, dt=dt,
+                K_lat=K_lat_val if is_dynamic_ls else None,
+                d_ref=d_ref,
                 precond_params=precond_params,
                 prefactored_precond=prefactored_precond,
             )
 
-            force = axial_force_at_mline(new_state, constants)
+            # Build metrics with emergent new_ls for correct force computation
+            constants_for_metrics = constants.with_drivers(pCa_val, z_val, new_ls)
+            drivers_for_metrics = Drivers(pCa=pCa_val, z_line=z_val, lattice_spacing=new_ls)
+            force = axial_force_at_mline(new_state, constants_for_metrics)
 
             all_metrics = compute_all_metrics(
-                old_state, new_state, constants, drivers, topology,
-                pre_solve_thick_pos, force, solver_residual, dt,
+                old_state, new_state, constants_for_metrics, drivers_for_metrics,
+                topology, pre_solve_thick_pos, force, solver_residual, n_iters, dt,
             )
 
-            return (new_state, new_k), all_metrics
+            return (new_state, new_k, new_ls), all_metrics
 
         _, metrics_out = jax.lax.scan(
             scan_fn,
-            (state, key),
+            (state, key, ls_trace[0]),
             (z_trace, pCa_trace, ls_trace, delta_z),
             unroll=unroll,
         )
@@ -488,10 +505,10 @@ def _run_sim_kernel(
     )
 
     batched_metrics = jax.vmap(
-        run_single_sim, in_axes=(0, 0, 0, 0, 0, 0)
+        run_single_sim, in_axes=(0, 0, 0, 0, 0, 0, 0, 0)
     )(
         batched_states, batched_params, rng_keys,
-        z_batched, pCa_batched, ls_batched,
+        z_batched, pCa_batched, ls_batched, K_lat_batched, nu_batched,
     )
 
     return batched_metrics
@@ -508,6 +525,8 @@ def run(
     pCa: Union[float, List[float], jnp.ndarray] = 4.5,
     z_line: Union[float, List[float], jnp.ndarray] = 900.0,
     lattice_spacing: Union[float, List[float], jnp.ndarray] = 14.0,
+    K_lat: Union[float, List[float], None] = None,
+    nu: Union[float, List[float]] = 0.0,
     dynamic_params: Union[DynamicParams, Dict[str, Union[float, List[float]]]] = None,
     replicates: int = 1,
     rng_seed: int = 0,
@@ -532,6 +551,10 @@ def run(
         pCa: Calcium as -log10([Ca]) -- float, list (sweep), or array (trace)
         z_line: Z-line position (nm) -- float, list (sweep), or array (trace)
         lattice_spacing: Lattice spacing (nm) -- float, list, or array
+        K_lat: Lattice stiffness per thick filament (pN/nm). None = fixed LS.
+               Float or list (sweep). Internally scaled by n_thick.
+        nu: Poisson exponent for d_ref(z) = d0*(z0/z)^nu. Float or list (sweep).
+            If K_lat is None and nu>0, pre-computes Poisson LS trace.
         dynamic_params: DynamicParams or dict of overrides/sweeps
         replicates: Number of statistical replicates per sweep point
         rng_seed: Base random seed
@@ -572,6 +595,9 @@ def run(
     else:
         raise ValueError(f"dynamic_params must be DynamicParams or dict, got {type(dynamic_params)}")
 
+    # Mode selection
+    is_dynamic_ls = K_lat is not None
+
     # Build sweep grid
     sweep_axes = []
     scalar_values = {}
@@ -587,6 +613,16 @@ def run(
             trace_values[name] = jnp.asarray(value)
         else:
             scalar_values[name] = float(value)
+
+    # K_lat and nu sweep classification (scalars or lists, never time-series)
+    K_lat_sweep_values = None
+    nu_sweep_values = None
+    if isinstance(K_lat, list):
+        sweep_axes.append(('K_lat', K_lat))
+        K_lat_sweep_values = K_lat
+    if isinstance(nu, list):
+        sweep_axes.append(('nu', nu))
+        nu_sweep_values = nu
 
     if isinstance(dynamic_params, dict):
         for param_name, param_values in dynamic_params.items():
@@ -615,6 +651,8 @@ def run(
     if verbose:
         print(f"Grid shape: {grid_shape}, axes: {axis_names}, "
               f"batch_size: {batch_size}, total: {total_batch}")
+        if is_dynamic_ls:
+            print(f"Dynamic LS: K_lat={K_lat}, nu={nu}")
 
     # Tile for replicates
     flat_grids_tiled = {name: jnp.repeat(arr, replicates) for name, arr in flat_grids.items()}
@@ -633,6 +671,46 @@ def run(
     z_batched = broadcast_waveform('z_line', 900.0)
     pCa_batched = broadcast_waveform('pCa', 4.5)
     ls_batched = broadcast_waveform('lattice_spacing', 14.0)
+
+    # Build K_lat_batched and nu_batched (shape: (total_batch,))
+    if K_lat_sweep_values is not None:
+        K_lat_batched = flat_grids_tiled['K_lat']
+    elif is_dynamic_ls:
+        K_lat_batched = jnp.full(total_batch, float(K_lat))
+    else:
+        K_lat_batched = jnp.zeros(total_batch)  # dummy, ignored at trace time
+
+    if nu_sweep_values is not None:
+        nu_batched = flat_grids_tiled['nu']
+    elif isinstance(nu, (int, float)):
+        nu_batched = jnp.full(total_batch, float(nu))
+    else:
+        nu_batched = jnp.zeros(total_batch)
+
+    # K_lat × n_thick scaling: per-filament → effective lattice stiffness
+    if is_dynamic_ls:
+        K_lat_batched = K_lat_batched * topology.n_thick
+
+    # Poisson pre-computation (K_lat=None, nu>0): convert to LS time-series
+    if not is_dynamic_ls and 'lattice_spacing' not in trace_values:
+        # Check if any nu value is non-zero
+        has_nonzero_nu = False
+        if isinstance(nu, list):
+            has_nonzero_nu = any(v != 0.0 for v in nu)
+        elif isinstance(nu, (int, float)):
+            has_nonzero_nu = nu != 0.0
+
+        if has_nonzero_nu:
+            # d0 is the per-sim reference lattice spacing
+            if 'lattice_spacing' in flat_grids_tiled:
+                d0_batched = flat_grids_tiled['lattice_spacing'][:, None]  # (batch, 1)
+            else:
+                d0_val = scalar_values.get('lattice_spacing', 14.0)
+                d0_batched = jnp.full((total_batch, 1), d0_val)
+
+            l0 = z_batched[:, 0:1]  # (batch, 1) - reference z
+            nu_col = nu_batched[:, None]  # (batch, 1)
+            ls_batched = d0_batched * (l0 / z_batched) ** nu_col  # (batch, n_steps)
 
     # Build batched DynamicParams
     batched_param_kwargs = {}
@@ -659,6 +737,8 @@ def run(
         z_batched = jnp.concatenate([z_batched, jnp.broadcast_to(z_batched[:1], (pad_n, n_steps))])
         pCa_batched = jnp.concatenate([pCa_batched, jnp.broadcast_to(pCa_batched[:1], (pad_n, n_steps))])
         ls_batched = jnp.concatenate([ls_batched, jnp.broadcast_to(ls_batched[:1], (pad_n, n_steps))])
+        K_lat_batched = jnp.concatenate([K_lat_batched, jnp.broadcast_to(K_lat_batched[:1], (pad_n,))])
+        nu_batched = jnp.concatenate([nu_batched, jnp.broadcast_to(nu_batched[:1], (pad_n,))])
         rng_keys = jnp.concatenate([rng_keys, jax.random.split(jax.random.PRNGKey(rng_seed + 1), pad_n)])
         pad_kwargs = {}
         for name in DYNAMIC_FIELDS:
@@ -679,6 +759,12 @@ def run(
         resolved_minibatch = max(valid) if valid else None
     use_minibatch = (resolved_minibatch is not None) and (resolved_minibatch < padded_batch)
 
+    kernel_kwargs = dict(
+        dt=dt,
+        unroll=unroll,
+        is_dynamic_ls=is_dynamic_ls,
+    )
+
     if not use_minibatch:
         batched_metrics = _run_sim_kernel(
             topology=topology,
@@ -687,8 +773,9 @@ def run(
             pCa_batched=pCa_batched,
             ls_batched=ls_batched,
             rng_keys=rng_keys,
-            dt=dt,
-            unroll=unroll,
+            K_lat_batched=K_lat_batched,
+            nu_batched=nu_batched,
+            **kernel_kwargs,
         )
     else:
         if verbose:
@@ -703,8 +790,9 @@ def run(
                 pCa_batched=pCa_batched[start:end],
                 ls_batched=ls_batched[start:end],
                 rng_keys=rng_keys[start:end],
-                dt=dt,
-                unroll=unroll,
+                K_lat_batched=K_lat_batched[start:end],
+                nu_batched=nu_batched[start:end],
+                **kernel_kwargs,
             ))
         batched_metrics = MetricsDict({
             k: jnp.concatenate([c[k] for c in chunks], axis=0)
@@ -748,6 +836,19 @@ def run(
         'total_xbs': topology.total_xbs,
         'n_faces_per_thin': topology.n_faces_per_thin,
     }
+    if is_dynamic_ls:
+        topology_config['K_lat'] = K_lat
+        topology_config['K_lat_eff'] = float(K_lat * topology.n_thick) if not isinstance(K_lat, list) else [float(k * topology.n_thick) for k in K_lat]
+        topology_config['nu'] = nu
+
+    metadata = {
+        'grid_shape': grid_shape,
+        'axis_names': axis_names,
+        'master_seed': rng_seed,
+    }
+    if is_dynamic_ls:
+        metadata['K_lat'] = K_lat
+        metadata['nu'] = nu
 
     return SimulationResult(
         metrics=reshaped_metrics,
@@ -756,11 +857,7 @@ def run(
         pCa=reshaped_pCa,
         lattice_spacing=reshaped_ls,
         final_state=None,
-        metadata={
-            'grid_shape': grid_shape,
-            'axis_names': axis_names,
-            'master_seed': rng_seed,
-        },
+        metadata=metadata,
         dt=dt,
         name="run",
         grid_shape=grid_shape,

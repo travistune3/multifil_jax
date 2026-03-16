@@ -823,3 +823,117 @@ def axial_force_at_mline(state: 'State', constants: 'DynamicParams') -> float:
 
     return force_at_mline
 
+
+# ============================================================================
+# RADIAL FORCE FUNCTIONS (for dynamic lattice spacing solver)
+# ============================================================================
+
+# n_titin_per_thick used in radial force calculation.
+# Must match the default in compute_thick_passive_forces_vectorized (which uses
+# n_titin_per_thick=6). Changing this without changing that function would produce
+# inconsistent axial/radial force magnitudes.
+_N_TITIN_PER_THICK = 6
+
+
+def _xb_radial_force_total(
+    xb_states: jnp.ndarray,
+    xb_bound_to: jnp.ndarray,
+    positions_thick: jnp.ndarray,
+    positions_thin: jnp.ndarray,
+    lattice_spacing: float,
+    params,
+    topology,
+) -> float:
+    """Total XB radial force on the lattice from all bound crossbridges.
+
+    Replicates the geometry from compute_xb_forces_vectorized but accumulates
+    the radial component instead of axial. Differentiable w.r.t. lattice_spacing
+    for JVP in the bordered Newton solver.
+
+    Args:
+        xb_states: (n_thick, n_crowns, n_xb_per_crown) XB states (1-6)
+        xb_bound_to: (n_thick, n_crowns, n_xb_per_crown) site indices (-1 unbound)
+        positions_thick: (n_thick, n_crowns) crown axial positions
+        positions_thin: (n_thin, n_sites) binding site axial positions
+        lattice_spacing: Current lattice spacing d (nm)
+        params: DynamicParams with XB spring constants
+        topology: SarcTopology with xb_to_thin_id
+
+    Returns:
+        Scalar total radial force (pN). Positive = outward (increasing d).
+    """
+    n_thin, n_sites = positions_thin.shape
+    n_xb_per_crown = xb_states.shape[2]
+
+    xb_states_flat = xb_states.reshape(-1)
+    xb_bound_flat = xb_bound_to.reshape(-1)
+
+    xb_positions_flat = jnp.repeat(positions_thick.reshape(-1), n_xb_per_crown)
+    positions_thin_flat = positions_thin.reshape(-1)
+
+    is_bound = (xb_states_flat >= 2) & (xb_states_flat <= 4) & (xb_bound_flat >= 0)
+
+    thin_idx = topology.xb_to_thin_id
+    site_idx = xb_bound_flat
+    thin_idx_safe = jnp.clip(thin_idx, 0, n_thin - 1)
+    site_idx_safe = jnp.clip(site_idx, 0, n_sites - 1)
+    thin_flat_idx = thin_idx_safe * n_sites + site_idx_safe
+
+    bs_positions = positions_thin_flat[thin_flat_idx]
+    x_dist = bs_positions - xb_positions_flat
+
+    r = jnp.sqrt(x_dist**2 + lattice_spacing**2)
+    r_safe = jnp.where(r > 1e-10, r, 1e-10)
+    cos_theta = x_dist / r_safe
+    sin_theta = lattice_spacing / r_safe
+    theta = jnp.arctan2(lattice_spacing, x_dist)
+
+    is_strong = (xb_states_flat == 3) | (xb_states_flat == 4)
+    c_rest = jnp.where(is_strong, params.xb_c_rest_strong, params.xb_c_rest_weak)
+    c_k = jnp.where(is_strong, params.xb_c_k_strong, params.xb_c_k_weak)
+    g_rest = jnp.where(is_strong, params.xb_g_rest_strong, params.xb_g_rest_weak)
+    g_k = jnp.where(is_strong, params.xb_g_k_strong, params.xb_g_k_weak)
+
+    f_radial = (g_k * (r - g_rest) * sin_theta +
+                (1.0 / r_safe) * c_k * (theta - c_rest) * cos_theta)
+
+    forces_radial = jnp.where(is_bound, f_radial, 0.0)
+    return jnp.sum(forces_radial)
+
+
+def _titin_radial_force_total(
+    positions_thick: jnp.ndarray,
+    z_line: float,
+    lattice_spacing: float,
+    titin_a: float,
+    titin_b: float,
+    titin_rest: float,
+) -> float:
+    """Total titin radial force from all thick filaments.
+
+    Replicates geometry from compute_thick_passive_forces_single but returns
+    the radial component. Differentiable w.r.t. lattice_spacing.
+
+    Args:
+        positions_thick: (n_thick, n_crowns) crown positions
+        z_line: Z-line position (nm)
+        lattice_spacing: Current lattice spacing d (nm)
+        titin_a, titin_b, titin_rest: Titin exponential spring parameters
+
+    Returns:
+        Scalar total radial titin force (pN). Positive = outward (increasing d).
+    """
+    myo_loc = positions_thick[:, -1]
+    axial_dist = z_line - myo_loc
+
+    titin_length = jnp.sqrt(axial_dist**2 + lattice_spacing**2)
+    titin_length_safe = jnp.where(titin_length > 1e-10, titin_length, 1e-10)
+
+    exp_arg = jnp.clip(titin_b * (titin_length - titin_rest), -100.0, 100.0)
+    titin_force = jnp.maximum(titin_a * jnp.exp(exp_arg), 0.0)
+
+    sin_angle = lattice_spacing / titin_length_safe
+    titin_radial_per_thick = _N_TITIN_PER_THICK * titin_force * sin_angle
+
+    return jnp.sum(titin_radial_per_thick)
+
