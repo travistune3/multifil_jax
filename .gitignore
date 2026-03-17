@@ -29,3 +29,9 @@ Thumbs.db
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Reference files (PDFs, etc.)
+reference_files/
+
+# Fitting examples (local development, not part of repo)
+examples/fitting_examples/

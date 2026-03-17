@@ -602,11 +602,25 @@ def run(
     sweep_axes = []
     scalar_values = {}
     trace_values = {}
+    trace_sweep_stacks = {}  # name -> (n_cond, n_steps) for list-of-trace sweeps
     param_sweep_names = set()
 
     for name, value in [('z_line', z_line), ('pCa', pCa), ('lattice_spacing', lattice_spacing)]:
         if isinstance(value, list):
-            sweep_axes.append((name, value))
+            # Detect list-of-traces: each element is a 1D array of length n_steps
+            first = value[0] if value else None
+            if (first is not None
+                    and hasattr(first, '__len__')
+                    and not isinstance(first, (int, float))
+                    and np.asarray(first).ndim == 1
+                    and len(first) == n_steps):
+                # Store stacked traces; use integer indices through meshgrid
+                trace_sweep_stacks[name] = jnp.array(
+                    np.stack([np.asarray(v) for v in value])
+                )  # (n_cond, n_steps)
+                sweep_axes.append((name, list(range(len(value)))))
+            else:
+                sweep_axes.append((name, value))
         elif hasattr(value, 'shape') and hasattr(value, 'ndim') and value.ndim > 0:
             if value.shape[0] != n_steps:
                 raise ValueError(f"{name} array length {value.shape[0]} != n_steps {n_steps}")
@@ -644,7 +658,13 @@ def run(
     grid_shape = tuple(len(vals) for _, vals in sweep_axes)
 
     axis_names = [name for name, _ in sweep_axes] + ['replicates', 'time']
-    coords = {name: list(vals) for name, vals in sweep_axes}
+    coords = {}
+    for name, vals in sweep_axes:
+        if name in trace_sweep_stacks:
+            # Store actual traces, not the integer indices used internally
+            coords[name] = [np.array(trace_sweep_stacks[name][i]) for i in range(len(vals))]
+        else:
+            coords[name] = list(vals)
     coords['replicates'] = list(range(replicates))
     coords['time'] = (jnp.arange(n_steps) * dt).tolist()
 
@@ -660,6 +680,10 @@ def run(
     # Broadcast waveforms to (total_batch, n_steps)
     def broadcast_waveform(name, default_val):
         if name in flat_grids_tiled:
+            if name in trace_sweep_stacks:
+                # Integer indices into stacked traces → (total_batch, n_steps)
+                indices = flat_grids_tiled[name].astype(int)
+                return trace_sweep_stacks[name][indices]
             return jnp.broadcast_to(flat_grids_tiled[name][:, None], (total_batch, n_steps))
         elif name in trace_values:
             return jnp.broadcast_to(trace_values[name][None, :], (total_batch, n_steps))
