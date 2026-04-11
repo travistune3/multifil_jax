@@ -98,9 +98,9 @@ scales by `n_thick` so that `d_deviation` is lattice-size-independent.
 ```python
 from multifil_jax.simulation import run
 from multifil_jax.core.sarc_geometry import SarcTopology
-from multifil_jax.core.params import StaticParams, get_default_params
+from multifil_jax.core.params import StaticParams, get_skeletal_params
 
-static, dynamic = get_default_params()
+static, dynamic = get_skeletal_params()
 topo = SarcTopology.create(nrows=2, ncols=2, static_params=static, dynamic_params=dynamic)
 
 # Simple isometric
@@ -238,19 +238,18 @@ Steps 0–6 are `kinetics_step()`. Step 7 is the mechanical solve.
 State(
     thick = ThickState(
         axial,          # (n_thick, n_crowns) crown positions (nm)
-        rests,          # (n_thick, n_crowns) rest spacings
-        xb_states,      # (n_thick, n_crowns, 3) XB states (1-6)
+        xb_states,      # (n_thick, n_crowns, 3) XB states (1-6), int8
         xb_bound_to,    # (n_thick, n_crowns, 3) bound site index (-1=unbound)
         xb_nearest_bs,  # (n_thick, n_crowns, 3) nearest BS index
         xb_distances,   # (n_thick, n_crowns, 3, 2) distances to nearest BS
     ),
     thin = ThinState(
         axial,           # (n_thin, n_sites) site positions (nm)
-        rests,           # (n_thin, n_sites) rest spacings
-        tm_states,       # (n_thin, n_sites) TM states (0-3)
-        permissiveness,  # (n_thin, n_sites) float 0-1
+        tm_states,       # (n_thin, n_sites) TM states (0-3), int8
         subject_to_coop, # (n_thin, n_sites) bool
         bound_to,        # (n_thin, n_sites) XB address (-1=unbound)
+        # rests: moved to SarcTopology (Tier 1)
+        # permissiveness: derived inline as (tm_states == 3).astype(float32)
     ),
 )
 ```
@@ -324,7 +323,7 @@ static = StaticParams(
     n_polymers_per_thin=15,
     actin_geometry='vertebrate',     # or 'invertebrate'
     n_newton_steps=4,                # Newton solver cap (static for while_loop)
-    n_cg_steps=6,                    # CG iterations per Newton step
+    n_cg_steps=2,                    # CG iterations per Newton step (2 recommended; 0=Richardson, diverges with bound XBs)
     solver_residual_tol=0.5,         # post-run warning threshold (pN)
 )
 ```
@@ -451,9 +450,11 @@ precond = build_prefactored_preconditioner(precond_params)
 # precond passed into scan, applied every step
 ```
 
-Python `for` loops for forward/back substitution — enables XLA fusion.
-**Note:** `fori_loop` was tried and caused 20× runtime regression (XLA cannot fuse across
-WhileOp boundaries). Do NOT revert to fori_loop.
+`thomas_factor`: Python `for` loop — called once before the scan loop, not in the hot path.
+`thomas_solve`: `jax.lax.associative_scan` for both forward and back substitution — 5× fewer
+jaxpr equations vs the previous for-loop approach; 20% faster.
+**Note:** `fori_loop` was tried for `thomas_solve` and caused 20× runtime regression (XLA cannot
+fuse across WhileOp boundaries). Do NOT revert to fori_loop.
 
 ### Tolerance floor
 
@@ -526,7 +527,7 @@ no selection needed.
 | `multifil_jax/timestep.py` | `kinetics_step()`, `timestep()` — single step orchestrator |
 | `multifil_jax/metrics_fn.py` | `compute_all_metrics()` — ~46-metric MetricsDict |
 | `multifil_jax/core/state.py` | State hierarchy, `realize_state()`, `Drivers`, `resolve_value()`, `MetricsDict` |
-| `multifil_jax/core/params.py` | `StaticParams`, `DynamicParams`, `get_default_params()` |
+| `multifil_jax/core/params.py` | `StaticParams`, `DynamicParams`, `get_skeletal_params()`, `get_cardiac_params()` |
 | `multifil_jax/core/sarc_geometry.py` | `SarcTopology` — PyTree topology |
 | `multifil_jax/kernels/cooperativity.py` | `update_cooperativity()` |
 | `multifil_jax/kernels/geometry.py` | `update_nearest_neighbors()` |
@@ -536,8 +537,8 @@ no selection needed.
 | `multifil_jax/kernels/rate_functions.py` | Rate functions (absolute values, no multipliers) |
 | `multifil_jax/helper.py` | `count_transitions()` and other utilities |
 | `examples/dynamic_lattice_spacing.py` | Dynamic LS demo: isometric, force comparison, K_lat sweep, length ramp |
-| `examples/benchmark_minibatch.py` | Minibatch size benchmark CLI |
-| `benchmarking/benchmark_dynamic_ls.py` | Dynamic LS performance and lattice scaling benchmark |
+| `examples/benchmarks/benchmark_minibatch.py` | Minibatch size benchmark CLI |
+| `examples/benchmarks/benchmark_dynamic_ls.py` | Dynamic LS performance and lattice scaling benchmark |
 | `tests/` | Test suite |
 
 ---

@@ -1,11 +1,13 @@
 #!/usr/bin/env python
+# NOTE: Designed for interactive Jupyter/IPython use (VS Code or jupyter notebook).
+# The %% cell markers are for VS Code interactive mode.
 
 
 #%%
 
 
-%load_ext autoreload
-%autoreload 2
+# %load_ext autoreload
+# %autoreload 2
 
 
 #%%
@@ -16,7 +18,7 @@ import matplotlib.pyplot as plt
 import jax
 import jax.numpy as jnp
 
-from multifil_jax.core.params import get_default_params, StaticParams, DynamicParams
+from multifil_jax.core.params import get_skeletal_params, StaticParams, DynamicParams
 from multifil_jax.core.sarc_geometry import SarcTopology
 from multifil_jax.simulation import run, SimulationResult
 
@@ -82,7 +84,7 @@ def plot_metric_corner(results, metric_name='axial_force', last_n=20, cmap='viri
 
 print("Creating topology and running stiffness parameter sweep...")
 
-static, dynamic = get_default_params()
+static, dynamic = get_skeletal_params()
 topo_vert = SarcTopology.create(nrows=2, 
                                   ncols=2, 
                                   static_params=static, 
@@ -99,7 +101,7 @@ start = time.time()
 results_vertebrate = run(
     topo_vert,
     pCa=4,
-    z_line=900,
+    z_line=1100,
     lattice_spacing=14,
     duration_ms=1000,
     dt=1.0,
@@ -119,9 +121,9 @@ print(results_vertebrate.summary())
 # 
 # Derived metric
 
-pseudo_m6 = results.metrics['thick_displace_mean']
+pseudo_m6 = results_vertebrate.metrics['thick_displace_mean']
 
-force = results.axial_force
+force = results_vertebrate.axial_force
 
 
 # hystereisis = ...
@@ -133,7 +135,7 @@ force = results.axial_force
 
 
 
-static, dynamic = get_default_params()
+static, dynamic = get_skeletal_params()
 topo_invert = SarcTopology.create(nrows=2, 
                             ncols=2, 
                             static_params=static.replace(actin_geometry = 'invertebrate'), 
@@ -147,7 +149,7 @@ start = time.time()
 results_invertebrate = run(
     topo_invert,
     pCa=4,
-    z_line=900,
+    z_line=1100,
     lattice_spacing=14,
     duration_ms=1000,
     dt=1.0,

@@ -31,11 +31,11 @@ from dataclasses import dataclass, asdict
 from typing import Dict, Any, List, Tuple
 
 # Static fields that affect array shapes (changing these triggers recompilation)
-STATIC_FIELDS = frozenset({'n_crowns', 'n_polymers_per_thin', 'solver_max_iter', 'actin_geometry', 'n_newton_steps', 'n_cg_steps', 'solver_residual_tol'})
+STATIC_FIELDS = frozenset({'n_crowns', 'n_polymers_per_thin', 'solver_max_iter', 'actin_geometry', 'n_newton_steps', 'n_cg_steps', 'solver_residual_tol', 'n_xb_bins'})
 
 # All dynamic field names in order (for tree_flatten/unflatten)
 DYNAMIC_FIELDS = (
-    'thick_k', 'thick_bare_zone', 'thick_crown_spacing',
+    'thick_k',
     'thin_k',
     'xb_c_rest_weak', 'xb_c_rest_strong', 'xb_c_k_weak', 'xb_c_k_strong',
     'xb_g_rest_weak', 'xb_g_rest_strong', 'xb_g_k_weak', 'xb_g_k_strong',
@@ -44,6 +44,7 @@ DYNAMIC_FIELDS = (
     'tm_K1', 'tm_K2', 'tm_K3', 'tm_K4',
     'tm_coop_magnitude', 'tm_span_base', 'tm_span_force50', 'tm_span_steep',
     'xb_r12_coeff', 'xb_r23_coeff', 'xb_r34_coeff', 'xb_r45_coeff',
+    'xb_delta_34', 'xb_delta_45',
     'xb_r51', 'xb_r15', 'xb_r16',
     'xb_U_DRX', 'xb_U_loose', 'xb_U_tight_1', 'xb_U_tight_2',
     'xb_srx_k0', 'xb_srx_kmax', 'xb_srx_b', 'xb_srx_ca50',
@@ -77,9 +78,14 @@ class StaticParams:
     n_polymers_per_thin: int = 15
     solver_max_iter: int = 50
     actin_geometry: str = "vertebrate"
-    n_newton_steps: int = 4    # Fixed Newton iterations (fori_loop, no sync)
-    n_cg_steps: int = 6        # Fixed CG iterations per Newton step
+    n_newton_steps: int = 4    # Hard cap on Newton while_loop iterations (exits early at convergence)
+    n_cg_steps: int = 2        # CG steps per Newton iter; 0=Richardson (no JVP); 2 recommended for n>=8
     solver_residual_tol: float = 0.5  # pN — post-run residual warning threshold
+    n_xb_bins: int = 200       # bins per AP level; total expm = 2 × n_xb_bins per step
+    xb_bin_lo: float = -8.0    # nm — lower edge of axial distance range (baked into SarcTopology)
+    xb_bin_hi: float = 35.0    # nm — upper edge; measured range at z=1100 is [-5, 31]nm
+    thick_bare_zone: float = 58.0    # nm — M-line to first crown rest distance
+    thick_crown_spacing: float = 14.3  # nm — inter-crown rest spacing
 
     def replace(self, **kwargs) -> 'StaticParams':
         """Create a new StaticParams with updated values.
@@ -124,18 +130,18 @@ class DynamicParams:
     This is a JAX PyTree containing all tunable physical parameters.
     All fields are stored as JAX arrays, enabling vmap over parameter batches.
 
-    These values produce behavior identical to OOP with the default hs_params.
-    Users can modify any parameter by creating a copy with updated values.
+    Defaults are skeletal fast-twitch values (~26°C). For cardiac presets use
+    get_cardiac_params(). Users can modify any parameter via .copy().
 
     Usage:
-        static, dynamic = get_default_params()
+        static, dynamic = get_skeletal_params()
         dynamic = dynamic.copy(xb_r12_coeff=350.0)  # Modify binding rate
         # Pass to run() via SarcTopology.create() and dynamic_params=
     """
 
     __slots__ = (
         # All dynamic fields stored as JAX arrays
-        'thick_k', 'thick_bare_zone', 'thick_crown_spacing',
+        'thick_k',
         'thin_k',
         'xb_c_rest_weak', 'xb_c_rest_strong', 'xb_c_k_weak', 'xb_c_k_strong',
         'xb_g_rest_weak', 'xb_g_rest_strong', 'xb_g_k_weak', 'xb_g_k_strong',
@@ -144,6 +150,7 @@ class DynamicParams:
         'tm_K1', 'tm_K2', 'tm_K3', 'tm_K4',
         'tm_coop_magnitude', 'tm_span_base', 'tm_span_force50', 'tm_span_steep',
         'xb_r12_coeff', 'xb_r23_coeff', 'xb_r34_coeff', 'xb_r45_coeff',
+        'xb_delta_34', 'xb_delta_45',
         'xb_r51', 'xb_r15', 'xb_r16',
         'xb_U_DRX', 'xb_U_loose', 'xb_U_tight_1', 'xb_U_tight_2',
         'xb_srx_k0', 'xb_srx_kmax', 'xb_srx_b', 'xb_srx_ca50',
@@ -156,6 +163,8 @@ class DynamicParams:
         """Initialize DynamicParams with optional keyword arguments.
 
         All parameters are stored as JAX arrays for PyTree compatibility.
+        Defaults are skeletal fast-twitch values (~26°C). Use get_cardiac_params()
+        for cardiac-specific defaults.
         """
 
         # ==========================================================================
@@ -164,42 +173,56 @@ class DynamicParams:
 
         # Thick filament
         self.thick_k = jnp.asarray(kwargs.get('thick_k', 2020.0))  # pN/nm
-        self.thick_bare_zone = jnp.asarray(kwargs.get('thick_bare_zone', 58.0))  # nm
-        self.thick_crown_spacing = jnp.asarray(kwargs.get('thick_crown_spacing', 14.3))  # nm
 
         # Thin filament
         self.thin_k = jnp.asarray(kwargs.get('thin_k', 1743.0))  # pN/nm
 
         # Crossbridge springs - converter domain (angular spring)
+        # c_k_strong: Daniel/Chase/Regnier group lineage (Chase 2004 Ann Biomed Eng;
+        #   Tanner 2007 Biophys J; Williams 2010 Biophys J). κ = 40 pN·nm/rad is at the low
+        #   end but consistent with the model's published parameterization.
+        # c_k_weak: Kaya & Bhatt 2020 (eLife 9:e55368) show pre-stroke head stiffness is
+        #   ~5-10× lower than post-stroke. Partition between linear/angular springs unknown;
+        #   reduce both weak stiffnesses proportionally (~5× here).
         self.xb_c_rest_weak = jnp.asarray(kwargs.get('xb_c_rest_weak', 0.82309))  # radians
         self.xb_c_rest_strong = jnp.asarray(kwargs.get('xb_c_rest_strong', 1.27758))  # radians
-        self.xb_c_k_weak = jnp.asarray(kwargs.get('xb_c_k_weak', 40.0))  # pN/rad
-        self.xb_c_k_strong = jnp.asarray(kwargs.get('xb_c_k_strong', 40.0))  # pN/rad
+        self.xb_c_k_weak = jnp.asarray(kwargs.get('xb_c_k_weak', 8.0))    # pN·nm/rad — pre-stroke compliant
+        self.xb_c_k_strong = jnp.asarray(kwargs.get('xb_c_k_strong', 40.0))  # pN·nm/rad — Daniel group lineage
 
         # Crossbridge springs - globular domain (linear spring)
+        # g_k_strong: ~5 pN/nm for globular domain alone in the two-spring model; the angular
+        #   spring in series brings effective total stiffness down (Daniel group calibration).
+        # g_k_weak: Kaya & Bhatt 2020 measured ~0.2–0.4 pN/nm total pre-stroke vs
+        #   ~2.5–3.5 pN/nm post-stroke. Use 0.4 pN/nm for compliant pre-stroke globular domain.
         self.xb_g_rest_weak = jnp.asarray(kwargs.get('xb_g_rest_weak', 19.93))  # nm
         self.xb_g_rest_strong = jnp.asarray(kwargs.get('xb_g_rest_strong', 16.47))  # nm
-        self.xb_g_k_weak = jnp.asarray(kwargs.get('xb_g_k_weak', 5.0))  # pN/nm
-        self.xb_g_k_strong = jnp.asarray(kwargs.get('xb_g_k_strong', 5.0))  # pN/nm
+        self.xb_g_k_weak = jnp.asarray(kwargs.get('xb_g_k_weak', 0.4))   # pN/nm — pre-stroke compliant
+        self.xb_g_k_strong = jnp.asarray(kwargs.get('xb_g_k_strong', 5.0))  # pN/nm — Daniel group lineage
 
-        # Titin (absolute values)
-        self.titin_a = jnp.asarray(kwargs.get('titin_a', 0.899999))  # pN
-        self.titin_b = jnp.asarray(kwargs.get('titin_b', 0.011))  # nm^-1
-        self.titin_rest = jnp.asarray(kwargs.get('titin_rest', 100.0))  # nm
+        # Titin exponential spring: F = titin_a * exp(titin_b * (L - titin_rest)), clamped >= 0
+        # L = sqrt(axial_dist² + lattice_spacing²), axial_dist = z_line - last_crown_pos (~787.3 nm)
+        # Skeletal defaults (N2A isoform); cardiac overrides in get_cardiac_params()
+        # titin_a: Powers, Williams, Regnier & Daniel 2018 Integr.Comp.Biol. 58:186
+        #          (compliant N2A: 260 pN / 6 titins per thick = 43 pN per molecule)
+        # titin_b: Powers 2018 psoas calibration (4 µm⁻¹ = 0.004 nm⁻¹)
+        # titin_rest: slack at SL 2.0 µm (z_line=1000 nm → L≈213 nm); Linke 1998 PNAS 95:8052
+        self.titin_a = jnp.asarray(kwargs.get('titin_a', 43.0))     # pN/molecule
+        self.titin_b = jnp.asarray(kwargs.get('titin_b', 0.004))    # nm⁻¹
+        self.titin_rest = jnp.asarray(kwargs.get('titin_rest', 215.0))  # nm
 
         # ==========================================================================
         # TROPOMYOSIN KINETICS (absolute rates)
         # ==========================================================================
-        self.tm_k_12 = jnp.asarray(kwargs.get('tm_k_12', 54633.43))
-        self.tm_k_23 = jnp.asarray(kwargs.get('tm_k_23', 931.233))
-        self.tm_k_34 = jnp.asarray(kwargs.get('tm_k_34', 0.07490))
-        self.tm_k_41 = jnp.asarray(kwargs.get('tm_k_41', 18.1178))
+        self.tm_k_12 = jnp.asarray(kwargs.get('tm_k_12', 100000.0))   # Robertson 1981: 5e7–2e8 M⁻¹s⁻¹
+        self.tm_k_23 = jnp.asarray(kwargs.get('tm_k_23', 1.0))        # Fraser & Bhatt 2019; Geeves & Lehrer 1994: 20–1000 s⁻¹
+        self.tm_k_34 = jnp.asarray(kwargs.get('tm_k_34', 0.1))        # center of 50–200 s⁻¹
+        self.tm_k_41 = jnp.asarray(kwargs.get('tm_k_41', 0.2))        # Robertson 1981: 100–500 s⁻¹
 
         # Equilibrium constants (absolute values)
-        self.tm_K1 = jnp.asarray(kwargs.get('tm_K1', 260000.0))  # per mole Ca
-        self.tm_K2 = jnp.asarray(kwargs.get('tm_K2', 130.0))  # dimensionless
-        self.tm_K3 = jnp.asarray(kwargs.get('tm_K3', 0.91))  # dimensionless
-        self.tm_K4 = jnp.asarray(kwargs.get('tm_K4', 0.0))  # unused
+        self.tm_K1 = jnp.asarray(kwargs.get('tm_K1', 500000.0))   # skeletal TnC Kd ~2 µM; Potter & Gergely 1975
+        self.tm_K2 = jnp.asarray(kwargs.get('tm_K2', 130.0))      # dimensionless
+        self.tm_K3 = jnp.asarray(kwargs.get('tm_K3', 0.1))        # McKillop & Geeves 1993: K_T=0.09 (no Ca²⁺); close to measured
+        self.tm_K4 = jnp.asarray(kwargs.get('tm_K4', 0.0))        # unused
 
         # Cooperativity
         self.tm_coop_magnitude = jnp.asarray(kwargs.get('tm_coop_magnitude', 100.0))
@@ -211,24 +234,33 @@ class DynamicParams:
         # CROSSBRIDGE KINETICS (absolute/consolidated values)
         # ==========================================================================
         self.xb_r12_coeff = jnp.asarray(kwargs.get('xb_r12_coeff', 305.99))
-        self.xb_r23_coeff = jnp.asarray(kwargs.get('xb_r23_coeff', 32.014))
-        self.xb_r34_coeff = jnp.asarray(kwargs.get('xb_r34_coeff', 0.886879123495794))
-        self.xb_r45_coeff = jnp.asarray(kwargs.get('xb_r45_coeff', 44.531))
+        self.xb_r23_coeff = jnp.asarray(kwargs.get('xb_r23_coeff', 0.6))    # Fitting parameter targeting process B apparent rate (2πb ~ 20–60 s⁻¹ skeletal; Kawai & Zhao 1993 Biophys J 65:638)
+        self.xb_r34_coeff = jnp.asarray(kwargs.get('xb_r34_coeff', 0.15))   # Millar & Homsher 1990: 70–100 s⁻¹
+        self.xb_r45_coeff = jnp.asarray(kwargs.get('xb_r45_coeff', 0.6))    # Siemankowski & White 1984: ≥500 s⁻¹ (skeletal)
+        self.xb_delta_34 = jnp.asarray(kwargs.get('xb_delta_34', 1.0))      # nm, Bell distance for power stroke; Pate & Cooke 1989; Huxley & Simmons 1971: 1–2 nm
+        self.xb_delta_45 = jnp.asarray(kwargs.get('xb_delta_45', 0.5))      # nm, Bell distance for detachment
         self.xb_r51 = jnp.asarray(kwargs.get('xb_r51', 0.1))
-        self.xb_r15 = jnp.asarray(kwargs.get('xb_r15', 0.01))
-        self.xb_r16 = jnp.asarray(kwargs.get('xb_r16', 0.08652))
+        self.xb_r15 = jnp.asarray(kwargs.get('xb_r15', 0.01))               # Mijailovich 2020 (k−H=10 s⁻¹); detailed balance r51/r15=10
+        self.xb_r16 = jnp.asarray(kwargs.get('xb_r16', 0.007))              # 50% SRX at rest; Stewart 2010 PNAS 107:430
 
-        # Free energies (kT units)
-        self.xb_U_DRX = jnp.asarray(kwargs.get('xb_U_DRX', -2.3))
-        self.xb_U_loose = jnp.asarray(kwargs.get('xb_U_loose', -4.3))
-        self.xb_U_tight_1 = jnp.asarray(kwargs.get('xb_U_tight_1', -18.6))
-        self.xb_U_tight_2 = jnp.asarray(kwargs.get('xb_U_tight_2', -20.72))
+        # Free energies (kT units). Total cycle = ΔG_ATP ≈ -22 to -24 kT at 37°C.
+        # Partitioning per Howard 2001 Fig 14.6; Pate & Cooke 1989 JMRCM 10:181;
+        # Månsson 2016 JMRCM 37:181; Offer & Ranatunga 2013 Biophys J 105:1767:
+        #   ATP binding + dissociation:  -8 to -10 kT
+        #   Hydrolysis on myosin:        ~0 to -2 kT
+        #   Weak actin binding:          -1 to -3 kT
+        #   Pi release + power stroke:   -8 to -13 kT  (ΔG loose→tight_1 = -10 to -12 kT)
+        #   ADP release:                 -2 to -4 kT   (ΔG tight_1→tight_2 = -4 to -6 kT)
+        self.xb_U_DRX = jnp.asarray(kwargs.get('xb_U_DRX', -2.3))      # M.ATP / M.ADP.Pi (detached)
+        self.xb_U_loose = jnp.asarray(kwargs.get('xb_U_loose', -4.3))   # AM.ADP.Pi (weakly bound); hydrolysis + weak binding
+        self.xb_U_tight_1 = jnp.asarray(kwargs.get('xb_U_tight_1', -15.0))  # AM.ADP pre-lever-arm; Pi release ΔG ≈ -10.7 kT
+        self.xb_U_tight_2 = jnp.asarray(kwargs.get('xb_U_tight_2', -21.0))  # AM.ADP post-lever-arm; lever arm ΔG ≈ -6 kT
 
         # SRX -> DRX transition (r61) params
-        self.xb_srx_k0 = jnp.asarray(kwargs.get('xb_srx_k0', 0.1))  # basal rate
-        self.xb_srx_kmax = jnp.asarray(kwargs.get('xb_srx_kmax', 0.4))  # max rate
-        self.xb_srx_b = jnp.asarray(kwargs.get('xb_srx_b', 1.0))  # Hill coefficient
-        self.xb_srx_ca50 = jnp.asarray(kwargs.get('xb_srx_ca50', 1e-6))  # Ca50 (M)
+        self.xb_srx_k0 = jnp.asarray(kwargs.get('xb_srx_k0', 0.007))    # r16/k0=1 → 50% SRX at rest
+        self.xb_srx_kmax = jnp.asarray(kwargs.get('xb_srx_kmax', 0.4))  # Mijailovich 2020 (kPSmax=400 s⁻¹)
+        self.xb_srx_b = jnp.asarray(kwargs.get('xb_srx_b', 5.0))        # Mijailovich 2020; Linari 2015 Nature 528:276
+        self.xb_srx_ca50 = jnp.asarray(kwargs.get('xb_srx_ca50', 1e-6)) # Ca50 (M)
 
         # ==========================================================================
         # SIMULATION PARAMETERS
@@ -278,7 +310,7 @@ class DynamicParams:
         """Create copy with updated values (JIT-compatible).
 
         Example:
-            _, dynamic = get_default_params()
+            _, dynamic = get_skeletal_params()
             modified = dynamic.copy(xb_r12_coeff=400.0, tm_k_12=60000.0)
         """
         # Validate keys before constructing (Python-level, not traced)
@@ -322,20 +354,93 @@ class DynamicParams:
         return f"DynamicParams(thick_k={float(self.thick_k):.1f}, thin_k={float(self.thin_k):.1f}, ...)"
 
 
-def get_default_params() -> Tuple[StaticParams, DynamicParams]:
-    """Get default parameters as (StaticParams, DynamicParams) tuple.
+def get_skeletal_params() -> Tuple[StaticParams, DynamicParams]:
+    """Get fast-twitch skeletal muscle parameters (~26°C).
+
+    Returns (StaticParams, DynamicParams) with defaults calibrated to
+    fast-twitch skeletal myosin II kinetics.
+
+    Key values and citations:
+        xb_g_k_weak  = 0.4 pN/nm     — Kaya & Bhatt 2020 eLife 9:e55368 (~0.2–0.4 pN/nm pre-stroke)
+        xb_g_k_strong = 5.0 pN/nm    — Daniel group two-spring calibration (Chase 2004, Tanner 2007)
+        xb_c_k_weak  = 8.0 pN·nm/rad — ~5× reduction from strong; Kaya & Bhatt 2020 (5–10× ratio)
+        xb_c_k_strong = 40 pN·nm/rad — Daniel group lineage (Chase 2004, Williams 2010)
+        xb_U_tight_1 = -15.0 kT      — Pi release ΔG ≈ -10.7 kT; Howard 2001; Månsson 2016
+        xb_U_tight_2 = -21.0 kT      — lever arm ΔG ≈ -6 kT; Offer & Ranatunga 2013
+        xb_r23_coeff = 0.6 ms⁻¹      — fitting parameter targeting process B (2πb ~ 20–60 s⁻¹)
+        xb_delta_34  = 1.0 nm         — Pate & Cooke 1989 JMRCM 10:181; Huxley & Simmons 1971
+        xb_delta_45  = 0.5 nm         — Duke 1999 PNAS 96:2770
+        xb_r16       = 0.007 ms⁻¹    — 50% SRX at rest; Stewart 2010 PNAS 107:430
+        tm_K3        = 0.1            — McKillop & Geeves 1993 Biophys J 65:693 (K_T=0.09 no Ca²⁺)
+        titin_a      = 43.0 pN        — Powers, Williams, Regnier & Daniel 2018 Integr.Comp.Biol. 58:186
+        titin_b      = 0.004 nm⁻¹    — Powers 2018 psoas calibration (4 µm⁻¹)
+        titin_rest   = 215.0 nm       — slack at SL 2.0 µm; Linke 1998 PNAS 95:8052
+
+    Typical z_line for skeletal: 1000–1300 nm (SL 2.0–2.6 µm). Pass to run() directly:
+        run(topo, pCa=4.5, z_line=1100.0)  # working SL ~2.2 µm
 
     Returns:
         Tuple of (static_params, dynamic_params)
 
     Example:
-        static, dynamic = get_default_params()
-        # Modify static params (requires recompilation)
+        static, dynamic = get_skeletal_params()
         static = static.replace(actin_geometry='invertebrate')
-        # Modify dynamic params (no recompilation)
         dynamic = dynamic.copy(thick_k=3000.0)
     """
     return StaticParams(), DynamicParams()
+
+
+def get_cardiac_params() -> Tuple[StaticParams, DynamicParams]:
+    """Get generic cardiac muscle parameters (~27°C).
+
+    Returns (StaticParams, DynamicParams) with defaults calibrated to
+    cardiac myosin II / cardiac TnC kinetics, starting from the skeletal
+    baseline and applying cardiac-specific overrides.
+
+    Cardiac overrides and citations:
+        tm_k_23  = 0.5 ms⁻¹      — Cardiac TM dynamics slower; Lehrer & Morris 1982
+        tm_k_12  = 80000 M⁻¹ms⁻¹ — Robertson 1981: 4–8×10⁷ M⁻¹s⁻¹
+        tm_K1    = 750000 M⁻¹    — Cardiac TnC Kd ~1.3 µM; Pinto 2011 JBC 286:2007 (1–2 µM)
+        tm_k_41  = 0.04 ms⁻¹     — Cardiac Ca²⁺ off-rate ~40 s⁻¹; Davis 2007 Biophys J 92:20
+        tm_coop_magnitude = 40.0  — Hill coeff ~2–4 (cardiac); de Tombe & Stienen 1995 Circ Res 76:734
+        xb_r23_coeff = 0.175 ms⁻¹ — Process B 3–4× slower (2πb ~ 5–15 s⁻¹);
+                                     Kawai et al. 1993 Circ Res 73:35
+        xb_r34_coeff = 0.065 ms⁻¹ — Lever arm rate ~2× slower (cardiac beta-MHC);
+                                     Deacon et al. 2012 J Mol Biol 421:173
+        xb_r45_coeff = 0.065 ms⁻¹ — Cardiac ADP release ~65 s⁻¹; Siemankowski & White 1984 JBC
+        xb_r16   = 0.012 ms⁻¹    — 70% SRX at rest; Linari 2015 Nature 528:276
+        xb_srx_k0 = 0.005 ms⁻¹   — Empirically calibrated (kPS0=5 s⁻¹)
+        titin_a  = 55.0 pN        — N2B isoform stiffer than N2A;
+                                   Granzier & Labeit 2004 Circ Res 94:284
+        titin_b  = 0.008 nm⁻¹    — Powers 2018 cardiac-like stiffness (8 µm⁻¹)
+        titin_rest = 140.0 nm     — slack at SL 1.85 µm (z_line=925 → L≈138 nm); Linke 1998
+
+    Typical z_line for cardiac: 900–1100 nm (SL 1.8–2.2 µm). Pass to run() directly:
+        run(topo, pCa=4.5, z_line=950.0)  # resting SL ~1.9 µm
+
+    Returns:
+        Tuple of (static_params, dynamic_params)
+
+    Example:
+        static, dynamic = get_cardiac_params()
+        dynamic = dynamic.copy(tm_K1=1e6)
+    """
+    cardiac_overrides = {
+        'tm_k_23': 0.5,           # Cardiac TM dynamics slower; Lehrer & Morris 1982
+        'tm_k_12': 80000.0,       # Robertson 1981: 4–8×10⁷ M⁻¹s⁻¹
+        'tm_K1': 750000.0,        # Cardiac TnC Kd ~1.3 µM; Pinto 2011 JBC 286:2007
+        'tm_k_41': 0.04,          # Cardiac Ca²⁺ off-rate ~40 s⁻¹; Davis 2007 Biophys J 92:20
+        'tm_coop_magnitude': 40.0, # Hill coeff ~2–4; de Tombe & Stienen 1995 Circ Res 76:734
+        'xb_r23_coeff': 0.175,    # Process B 3–4× slower; Kawai et al. 1993 Circ Res 73:35
+        'xb_r34_coeff': 0.065,    # Lever arm ~2× slower; Deacon et al. 2012 J Mol Biol 421:173
+        'xb_r45_coeff': 0.065,    # ADP release ~65 s⁻¹; Siemankowski & White 1984 JBC
+        'xb_r16': 0.012,          # 12/(12+5)=70% SRX at rest; Linari 2015
+        'xb_srx_k0': 0.005,       # Empirically calibrated (kPS0=5 s⁻¹)
+        'titin_a': 55.0,          # N2B stiffer than N2A; Granzier & Labeit 2004 Circ Res 94:284
+        'titin_b': 0.008,         # Powers 2018 cardiac-like stiffness (8 µm⁻¹)
+        'titin_rest': 140.0,      # slack at SL 1.85 µm (z_line=925 nm → L≈138 nm)
+    }
+    return StaticParams(), DynamicParams(**cardiac_overrides)
 
 
 # Alias for tiered architecture
@@ -366,7 +471,7 @@ def print_params(static: StaticParams = None, dynamic: DynamicParams = None):
 
         # Group by prefix
         groups = {
-            'Thick Filament': ['thick_k', 'thick_bare_zone', 'thick_crown_spacing'],
+            'Thick Filament': ['thick_k'],
             'Thin Filament': ['thin_k'],
             'XB Springs': [k for k in d if k.startswith('xb_c_') or k.startswith('xb_g_')],
             'Titin': ['titin_a', 'titin_b', 'titin_rest'],
@@ -390,9 +495,9 @@ if __name__ == "__main__":
     print("Testing StaticParams and DynamicParams...")
     print()
 
-    # Test 1: Default parameters
-    print("Test 1: Get default parameters")
-    static, dynamic = get_default_params()
+    # Test 1: Skeletal parameters
+    print("Test 1: Get skeletal parameters")
+    static, dynamic = get_skeletal_params()
     print(f"Static: {static}")
     print(f"Dynamic: {dynamic}")
     print_params(static, dynamic)

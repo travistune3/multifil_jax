@@ -11,11 +11,11 @@ Primary API:
     run(topology, pCa=..., z_line=..., ...) -> SimulationResult
 
 Usage:
-    from multifil_jax.simulation import run, get_default_params
+    from multifil_jax.simulation import run, get_skeletal_params
     from multifil_jax.core.sarc_geometry import SarcTopology
     from multifil_jax.core.params import StaticParams
 
-    static, dynamic = get_default_params()
+    static, dynamic = get_skeletal_params()
     topo = SarcTopology.create(nrows=2, ncols=2, static_params=static, dynamic_params=dynamic)
 
     # Simple isometric simulation
@@ -36,7 +36,7 @@ from functools import partial
 from typing import Dict, Tuple, List, Optional, Union, TYPE_CHECKING
 
 from multifil_jax.core.params import (
-    StaticParams, DynamicParams, get_default_params, DYNAMIC_FIELDS
+    StaticParams, DynamicParams, get_skeletal_params, DYNAMIC_FIELDS
 )
 from multifil_jax.core.state import realize_state, State, Drivers, MetricsDict, build_preconditioner_params
 from multifil_jax.kernels.solver import build_prefactored_preconditioner
@@ -395,7 +395,7 @@ def _auto_minibatch_size(padded_batch: int) -> Optional[int]:
 # MODULE-LEVEL SIMULATION KERNEL
 # =============================================================================
 
-@partial(jax.jit, static_argnames=['dt', 'unroll', 'is_dynamic_ls'])
+@partial(jax.jit, static_argnames=['dt', 'unroll', 'is_dynamic_ls', 'n_cg_steps', 'n_newton_steps'])
 def _run_sim_kernel(
     topology: SarcTopology,
     batched_params: DynamicParams,
@@ -408,6 +408,8 @@ def _run_sim_kernel(
     is_dynamic_ls: bool = False,
     K_lat_batched: jnp.ndarray = None,
     nu_batched: jnp.ndarray = None,
+    n_cg_steps: int = 1,
+    n_newton_steps: int = 16,
 ):
     """JIT-compiled simulation kernel (unified fixed + dynamic LS).
 
@@ -436,7 +438,11 @@ def _run_sim_kernel(
         """Create state from topology + constants and solve equilibrium."""
         state = realize_state(topology, constants, z0, pCa0, ls0)
         state = update_nearest_neighbors(state, constants, topology)
-        state, _residual, _, _ = solve_equilibrium(state, constants, topology)
+        state, _residual, _, _ = solve_equilibrium(
+            state, constants, topology,
+            n_cg_steps=n_cg_steps,
+            n_newton_steps=n_newton_steps,
+        )
         return state
 
     def run_single_sim(state, constants, key, z_trace, pCa_trace, ls_trace, K_lat_val, nu_val):
@@ -475,6 +481,8 @@ def _run_sim_kernel(
                 old_state, constants, drivers, topology, k, dt=dt,
                 K_lat=K_lat_val if is_dynamic_ls else None,
                 d_ref=d_ref,
+                n_cg_steps=n_cg_steps,
+                n_newton_steps=n_newton_steps,
                 precond_params=precond_params,
                 prefactored_precond=prefactored_precond,
             )
@@ -482,7 +490,7 @@ def _run_sim_kernel(
             # Build metrics with emergent new_ls for correct force computation
             constants_for_metrics = constants.with_drivers(pCa_val, z_val, new_ls)
             drivers_for_metrics = Drivers(pCa=pCa_val, z_line=z_val, lattice_spacing=new_ls)
-            force = axial_force_at_mline(new_state, constants_for_metrics)
+            force = axial_force_at_mline(new_state, constants_for_metrics, topology)
 
             all_metrics = compute_all_metrics(
                 old_state, new_state, constants_for_metrics, drivers_for_metrics,
@@ -528,6 +536,7 @@ def run(
     K_lat: Union[float, List[float], None] = None,
     nu: Union[float, List[float]] = 0.0,
     dynamic_params: Union[DynamicParams, Dict[str, Union[float, List[float]]]] = None,
+    static_params: 'StaticParams' = None,
     replicates: int = 1,
     rng_seed: int = 0,
     unroll: int = 1,
@@ -555,7 +564,11 @@ def run(
                Float or list (sweep). Internally scaled by n_thick.
         nu: Poisson exponent for d_ref(z) = d0*(z0/z)^nu. Float or list (sweep).
             If K_lat is None and nu>0, pre-computes Poisson LS trace.
-        dynamic_params: DynamicParams or dict of overrides/sweeps
+        dynamic_params: DynamicParams, dict of overrides/sweeps, or list of DynamicParams.
+                        A list creates a 'candidates' sweep axis (one element per candidate),
+                        Cartesian-producted with other sweep axes. Useful for batching CMA-ES
+                        population evaluations: run(topo, z_line=traces, dynamic_params=[dp0..dpN])
+                        gives result shape (N, n_freq, replicates, time).
         replicates: Number of statistical replicates per sweep point
         rng_seed: Base random seed
         unroll: Scan unrolling factor
@@ -574,9 +587,9 @@ def run(
 
     Example:
         from multifil_jax.core.sarc_geometry import SarcTopology
-        from multifil_jax.core.params import get_default_params, StaticParams
+        from multifil_jax.core.params import get_skeletal_params, StaticParams
 
-        static, dynamic = get_default_params()
+        static, dynamic = get_skeletal_params()
         topo = SarcTopology.create(nrows=2, ncols=2, static_params=static, dynamic_params=dynamic)
 
         result = run(topo, pCa=4.5, z_line=900.0, duration_ms=100)
@@ -585,6 +598,10 @@ def run(
     n_steps = int(duration_ms / dt)
     topology = jax.device_put(topology)
 
+    if static_params is None:
+        from multifil_jax.core.params import StaticParams as _StaticParams
+        static_params = _StaticParams()
+
     # Resolve base dynamic params
     if dynamic_params is None:
         base_dynamic = DynamicParams()
@@ -592,8 +609,10 @@ def run(
         base_dynamic = dynamic_params
     elif isinstance(dynamic_params, dict):
         base_dynamic = DynamicParams()
+    elif isinstance(dynamic_params, list):
+        base_dynamic = DynamicParams()
     else:
-        raise ValueError(f"dynamic_params must be DynamicParams or dict, got {type(dynamic_params)}")
+        raise ValueError(f"dynamic_params must be DynamicParams, dict, or list of DynamicParams, got {type(dynamic_params)}")
 
     # Mode selection
     is_dynamic_ls = K_lat is not None
@@ -643,6 +662,18 @@ def run(
             if isinstance(param_values, list):
                 sweep_axes.append((param_name, param_values))
                 param_sweep_names.add(param_name)
+    elif isinstance(dynamic_params, DynamicParams):
+        for name in DYNAMIC_FIELDS:
+            val = getattr(dynamic_params, name)
+            arr = jnp.asarray(val)
+            if arr.ndim > 0 and arr.shape[0] > 1:
+                sweep_axes.append((name, list(arr.tolist())))
+                param_sweep_names.add(name)
+    elif isinstance(dynamic_params, list):
+        # List of DynamicParams = one coupled candidate per element.
+        # Creates a single 'candidates' axis; Cartesian-producted with any other
+        # sweep axes (e.g. z_line frequency traces) to give candidate × freq grid.
+        sweep_axes.append(('candidates', list(range(len(dynamic_params)))))
 
     # Build Cartesian product
     if sweep_axes:
@@ -738,17 +769,27 @@ def run(
 
     # Build batched DynamicParams
     batched_param_kwargs = {}
-    for name in DYNAMIC_FIELDS:
-        if name in param_sweep_names and name in flat_grids_tiled:
-            batched_param_kwargs[name] = flat_grids_tiled[name]
-        elif isinstance(dynamic_params, dict) and name in dynamic_params:
-            val = dynamic_params[name]
-            if not isinstance(val, list):
-                batched_param_kwargs[name] = jnp.full(total_batch, float(val))
-            else:
+    if isinstance(dynamic_params, list):
+        # Index into the candidate list using the 'candidates' flat grid.
+        # .tolist() does ONE device-to-host transfer (vs 49 fields × 48 elements
+        # = 2352 syncs if we iterate over a JAX array element-by-element).
+        cand_idx_list = flat_grids_tiled['candidates'].astype(int).tolist()
+        for name in DYNAMIC_FIELDS:
+            batched_param_kwargs[name] = jnp.array([
+                float(getattr(dynamic_params[i], name)) for i in cand_idx_list
+            ])
+    else:
+        for name in DYNAMIC_FIELDS:
+            if name in param_sweep_names and name in flat_grids_tiled:
                 batched_param_kwargs[name] = flat_grids_tiled[name]
-        else:
-            batched_param_kwargs[name] = jnp.full(total_batch, float(getattr(base_dynamic, name)))
+            elif isinstance(dynamic_params, dict) and name in dynamic_params:
+                val = dynamic_params[name]
+                if not isinstance(val, list):
+                    batched_param_kwargs[name] = jnp.full(total_batch, float(val))
+                else:
+                    batched_param_kwargs[name] = flat_grids_tiled[name]
+            else:
+                batched_param_kwargs[name] = jnp.full(total_batch, float(getattr(base_dynamic, name)))
     batched_params = DynamicParams(**batched_param_kwargs)
 
     # Generate unique RNG keys
@@ -787,6 +828,8 @@ def run(
         dt=dt,
         unroll=unroll,
         is_dynamic_ls=is_dynamic_ls,
+        n_cg_steps=static_params.n_cg_steps,
+        n_newton_steps=static_params.n_newton_steps,
     )
 
     if not use_minibatch:

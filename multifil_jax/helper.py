@@ -112,14 +112,14 @@ def validate_forces_numerical(state: 'State', constants: 'DynamicParams',
 
     pos_thick = state.thick.axial
     pos_thin = state.thin.axial
-    rests_thick = state.thick.rests
-    rests_thin = state.thin.rests
+    rests_thick = jnp.broadcast_to(topology.crown_rests[None, :], (n_thick, n_crowns))
+    rests_thin = topology.binding_rests
     xb_states = state.thick.xb_states
     xb_bound_to = state.thick.xb_bound_to
 
     # Compute analytical forces
     forces_analytical = compute_forces_vectorized(
-        pos_thick, pos_thin, rests_thick, rests_thin,
+        pos_thick, pos_thin,
         constants.thick_k, constants.thin_k,
         constants.z_line, constants.lattice_spacing,
         constants.titin_a, constants.titin_b, constants.titin_rest,

@@ -23,16 +23,16 @@ import jax.numpy as jnp
 
 from multifil_jax.simulation import run
 from multifil_jax.core.sarc_geometry import SarcTopology
-from multifil_jax.core.params import StaticParams, DynamicParams, get_default_params
+from multifil_jax.core.params import StaticParams, DynamicParams, get_skeletal_params
 
 # ---------------------------------------------------------------------------
 # Topology (small 2x2 for fast examples)
 # ---------------------------------------------------------------------------
-static, dynamic = get_default_params()
+static, dynamic = get_skeletal_params()
 topo = SarcTopology.create(nrows=2, ncols=2, static_params=static, dynamic_params=dynamic)
 
 D0 = 14.0    # nm — reference lattice spacing
-Z0 = 900.0   # nm — reference z-line
+Z0 = 1100.0  # nm — reference z-line (skeletal SL ~2.2 µm)
 NU = 0.5     # Poisson exponent
 DT = 1.0     # ms timestep
 
@@ -161,9 +161,9 @@ print("Panel 4: Length ramp...")
 dur4 = 400.0
 n4 = int(dur4 / DT)
 
-# Ramp z_line from 900 to 800 nm over 200 ms, then hold
-z_trace4 = np.linspace(Z0, 800.0, n4)
-z_trace4[200:] = 800.0
+# Ramp z_line from 1100 to 900 nm over 200 ms, then hold (shortening by 200 nm = SL 2.2→1.8 µm)
+z_trace4 = np.linspace(Z0, 900.0, n4)
+z_trace4[200:] = 900.0
 
 # pCa = 4.5 throughout (activated)
 pCa4 = 4.5

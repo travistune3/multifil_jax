@@ -24,7 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 from typing import Dict, Any, Tuple, Optional, Union, NamedTuple, TYPE_CHECKING
 from dataclasses import dataclass, asdict
-from .params import DynamicParams, StaticParams, get_default_params
+from .params import DynamicParams, StaticParams
 from .sarc_geometry import SarcTopology
 
 
@@ -43,11 +43,10 @@ class ThickState(NamedTuple):
 
     All arrays have leading dimension n_thick (number of thick filaments).
     Spring constant (k) and bare_zone moved to Constants (Tier 2).
-    Structural arrays (crown_starts, connectivity) moved to Topology (Tier 1).
+    Structural arrays (crown_starts, connectivity, crown_rests) moved to Topology (Tier 1).
     """
     axial: jnp.ndarray           # (n_thick, n_crowns) crown axial positions
-    rests: jnp.ndarray           # (n_thick, n_crowns) rest spacings between crowns
-    xb_states: jnp.ndarray       # (n_thick, n_crowns, 3) crossbridge states (1-6)
+    xb_states: jnp.ndarray       # (n_thick, n_crowns, 3) crossbridge states (1-6), int8
     xb_bound_to: jnp.ndarray     # (n_thick, n_crowns, 3) bound site indices (-1 if unbound)
     xb_nearest_bs: jnp.ndarray   # (n_thick, n_crowns, 3) nearest binding site indices
     xb_distances: jnp.ndarray    # (n_thick, n_crowns, 3, 2) distances to nearest BS
@@ -58,13 +57,11 @@ class ThinState(NamedTuple):
 
     All arrays have leading dimension n_thin (number of thin filaments).
     Spring constant (k) moved to Constants (Tier 2).
-    Structural arrays (tm_chains, connectivity, face_to_sites, n_sites_per_face)
-    moved to Topology (Tier 1).
+    Structural arrays (tm_chains, connectivity, face_to_sites, binding_rests) in Topology.
+    permissiveness is derived on-demand: (tm_states == 3).astype(float32)
     """
     axial: jnp.ndarray           # (n_thin, n_sites) binding site axial positions
-    rests: jnp.ndarray           # (n_thin, n_sites) rest spacings between sites
-    tm_states: jnp.ndarray       # (n_thin, n_sites) tropomyosin states (0-3)
-    permissiveness: jnp.ndarray  # (n_thin, n_sites) permissiveness (float 0-1)
+    tm_states: jnp.ndarray       # (n_thin, n_sites) tropomyosin states (0-3), int8
     subject_to_coop: jnp.ndarray # (n_thin, n_sites) cooperative status (bool)
     bound_to: jnp.ndarray        # (n_thin, n_sites) XB bound to this site (-1 if unbound)
 
@@ -199,19 +196,13 @@ def realize_state(
         (n_thick, n_crowns)
     ).copy()
 
-    thick_rests = jnp.broadcast_to(
-        topology.crown_rests[None, :],
-        (n_thick, n_crowns)
-    ).copy()
-
-    xb_states = jnp.ones((n_thick, n_crowns, 3), dtype=jnp.int32)
+    xb_states = jnp.ones((n_thick, n_crowns, 3), dtype=jnp.int8)
     xb_bound_to = jnp.full((n_thick, n_crowns, 3), -1, dtype=jnp.int32)
     xb_nearest_bs = jnp.zeros((n_thick, n_crowns, 3), dtype=jnp.int32)
     xb_distances = jnp.zeros((n_thick, n_crowns, 3, 2), dtype=jnp.float32)
 
     thick_state = ThickState(
         axial=thick_axial,
-        rests=thick_rests,
         xb_states=xb_states,
         xb_bound_to=xb_bound_to,
         xb_nearest_bs=xb_nearest_bs,
@@ -223,17 +214,13 @@ def realize_state(
     # Structural arrays (tm_chains, connectivity, face_to_sites) are in Topology.
     # =========================================================================
     thin_axial = z_line - topology.binding_offsets
-    thin_rests = topology.binding_rests
-    tm_states = jnp.zeros((n_thin, n_sites), dtype=jnp.int32)
-    permissiveness = jnp.zeros((n_thin, n_sites), dtype=jnp.float32)
+    tm_states = jnp.zeros((n_thin, n_sites), dtype=jnp.int8)
     subject_to_coop = jnp.zeros((n_thin, n_sites), dtype=jnp.bool_)
     bound_to = jnp.full((n_thin, n_sites), -1, dtype=jnp.int32)
 
     thin_state = ThinState(
         axial=thin_axial,
-        rests=thin_rests,
         tm_states=tm_states,
-        permissiveness=permissiveness,
         subject_to_coop=subject_to_coop,
         bound_to=bound_to,
     )

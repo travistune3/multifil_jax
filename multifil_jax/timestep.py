@@ -81,7 +81,7 @@ def kinetics_step(state: 'State',
     resolved_constants = constants.with_drivers(pCa, z_line, lattice_spacing)
 
     # Step 1: Calculate INTERNAL thin filament forces for cooperativity
-    thin_internal_forces = calculate_thin_forces_for_cooperativity(state, resolved_constants)
+    thin_internal_forces = calculate_thin_forces_for_cooperativity(state, resolved_constants, topology)
 
     # Step 2: Update cooperativity based on INTERNAL filament tension
     state = update_cooperativity(state, resolved_constants, thin_internal_forces, topology)
@@ -114,6 +114,8 @@ def timestep(state: 'State',
              K_lat=None,
              d_ref=None,
              solver_tol: Optional[float] = None,
+             n_cg_steps: int = 1,
+             n_newton_steps: int = 16,
              precond_params=None,
              prefactored_precond=None) -> Tuple['State', jnp.ndarray, jnp.ndarray, float, int]:
     """Execute one timestep of the half-sarcomere simulation.
@@ -148,6 +150,8 @@ def timestep(state: 'State',
         state, resolved_constants, topology,
         K_lat=K_lat, d_ref=d_ref,
         tolerance=solver_tol,
+        n_cg_steps=n_cg_steps,
+        n_newton_steps=n_newton_steps,
         precond_params=precond_params,
         prefactored_precond=prefactored_precond,
     )

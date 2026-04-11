@@ -33,5 +33,10 @@ Thumbs.db
 # Reference files (PDFs, etc.)
 reference_files/
 
-# Fitting examples (local development, not part of repo)
-examples/fitting_examples/
+# Exploration / development folders (local only, not part of repo)
+benchmarking/
+fitting_examples/
+notebooks/
+
+# Generated output images
+examples/*.png

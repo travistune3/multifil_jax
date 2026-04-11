@@ -5,16 +5,16 @@ Dynamic Lattice Spacing Benchmark
 Two sections:
   A. PERFORMANCE: compile time and ms/step for fixed LS vs dynamic LS (2x2 lattice).
      Run on a COLD XLA cache for valid compile times:
-       rm -rf ~/.cache/multifil_jax/xla/ && python benchmarking/benchmark_dynamic_ls.py
+       rm -rf ~/.cache/multifil_jax/xla/ && python examples/benchmarks/benchmark_dynamic_ls.py
 
   B. LATTICE SCALING: verify that the K_lat per-filament scaling fix works.
      d_deviation from d_ref should be roughly constant across lattice sizes.
      If it scales with n_thick, the fix is broken.
 
 Usage:
-    python benchmarking/benchmark_dynamic_ls.py --section A
-    python benchmarking/benchmark_dynamic_ls.py --section B
-    python benchmarking/benchmark_dynamic_ls.py --section AB  (both)
+    python examples/benchmarks/benchmark_dynamic_ls.py --section A
+    python examples/benchmarks/benchmark_dynamic_ls.py --section B
+    python examples/benchmarks/benchmark_dynamic_ls.py --section AB  (both)
 """
 
 import sys
@@ -28,7 +28,7 @@ import jax.numpy as jnp
 sys.path.insert(0, '.')
 from multifil_jax.simulation import run
 from multifil_jax.core.sarc_geometry import SarcTopology
-from multifil_jax.core.params import get_default_params
+from multifil_jax.core.params import get_skeletal_params
 
 
 def parse_args():
@@ -55,11 +55,11 @@ def run_section_a(dur, reps, seed):
     print("      To clear: rm -rf ~/.cache/multifil_jax/xla/")
     print()
 
-    static, dynamic = get_default_params()
+    static, dynamic = get_skeletal_params()
     topo = SarcTopology.create(nrows=2, ncols=2, static_params=static, dynamic_params=dynamic)
     n_steps = int(dur)
 
-    common = dict(duration_ms=dur, dt=1.0, pCa=4.5, z_line=900.0,
+    common = dict(duration_ms=dur, dt=1.0, pCa=4.5, z_line=1100.0,
                   lattice_spacing=14.0, replicates=reps, rng_seed=seed)
 
     # Two kernels: fixed LS and dynamic LS (K_lat is traced so rigid/soft share one kernel)
@@ -124,7 +124,7 @@ def run_section_b(dur, seed):
     print("K_lat per-filament fix: delta_d should be roughly constant across sizes.")
     print()
 
-    static, dynamic = get_default_params()
+    static, dynamic = get_skeletal_params()
     K_LAT = 5.0
     NU = 0.5
     n_steps = int(dur)
@@ -139,7 +139,7 @@ def run_section_b(dur, seed):
 
         common = dict(
             duration_ms=dur, dt=1.0,
-            pCa=4.5, z_line=900.0, lattice_spacing=14.0,
+            pCa=4.5, z_line=1100.0, lattice_spacing=14.0,
             K_lat=K_LAT, nu=NU,
             replicates=1, rng_seed=seed,
         )

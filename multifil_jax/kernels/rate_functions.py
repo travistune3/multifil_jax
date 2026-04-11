@@ -57,7 +57,9 @@ def tm_rate_23(k_23_base, coop_factor):
     """Rate 1->2 (Closed transition).
 
     Args:
-        k_23_base: Base rate constant (per ms) - from params.tm_k_23
+        k_23_base: Base rate constant (per ms) - from params.tm_k_23.
+                   1.0 ms⁻¹ (skeletal) / 0.5 ms⁻¹ (cardiac);
+                   Fraser & Bhatt 2019; Geeves & Lehrer 1994 (20–1000 s⁻¹).
         coop_factor: Cooperativity multiplier
 
     Returns:
@@ -161,17 +163,30 @@ def xb_rate_21(r12, U_DRX, U_loose):
     return jnp.where(jnp.isnan(r21), upper, r21)
 
 
-def xb_rate_23(r23_coeff, E_diff):
-    """Rate Loose->Tight_1 (first power stroke step).
+def xb_rate_23(A23, E_diff):
+    """Rate Loose->Tight_1 (weak-to-strong isomerization).
+
+    Symmetric barrier (α=0.5): r23 = A23 × exp(ΔG₂₃/2kT) = A23 × exp(E_diff/2).
+    Faster when the strong state has less elastic strain than the weak state (E_diff > 0),
+    restoring full position-dependent mechanosensitivity.
+    Cap at 30 kT prevents overflow without affecting physiological range.
 
     Args:
-        r23_coeff: Rate coefficient - from params.xb_r23_coeff (= OOP mh_r23)
-        E_diff: Energy difference E_weak - E_strong (computed directly to avoid cancellation)
+        A23: Pre-exponential rate coefficient (per ms) - from params.xb_r23_coeff.
+             Fitting parameter targeting process B apparent rate (2πb). Skeletal:
+             2πb ~ 20–60 s⁻¹ at 20–25°C (Kawai & Zhao 1993 Biophys J 65:638).
+             Note: 286 s⁻¹ from Kawai & Zhao 1993 is k₂ (ATP-induced detachment,
+             process C) — not the isomerization rate. The symmetric barrier (α=0.5)
+             is a modeling assumption, not derived from Duke 1999.
+        E_diff: Energy difference E_weak - E_strong (kT units, positive favors strong state)
 
     Returns:
         Rate r23 (per ms)
+
+    References:
+        Kawai & Zhao 1993 Biophys J 65:638 (process B rates); Månsson 2016 Biophys J.
     """
-    r23 = r23_coeff * (0.6 * (1.0 + jnp.tanh(5.0 + 0.4 * E_diff)) + 0.05)
+    r23 = A23 * jnp.exp(jnp.minimum(E_diff, 30.0) / 2.0)
     return jnp.where(jnp.isnan(r23), 0.0, r23)
 
 
@@ -194,59 +209,81 @@ def xb_rate_32(r23, U_loose, U_tight_1):
     return jnp.minimum(r32, upper)
 
 
-def xb_rate_34(r34_coeff, E_diff, f_3_4):
-    """Rate Tight_1->Tight_2 (power stroke completion).
+def xb_rate_34(A34, f_3_4, delta34, k_t):
+    """Rate Tight_1->Tight_2 (power stroke).
 
-    OOP formula: r34 = mh_r34 * (A * 0.5 * (1 + tanh(E_weak - E_strong)) + 0.03) + exp(-f_3_4)
-    where A = 1.0 (hardcoded)
+    Bell model: r34 = A34 × exp(-f × δ₃₄ / kT).
+    Resisting force (f > 0) slows the stroke; assisting force accelerates it.
+    δ₃₄ ≈ 0.5 nm is the lever-arm transition-state distance.
+    Tight_1 and Tight_2 share the same spring, so there is no E_diff dependence.
 
     Args:
-        r34_coeff: Rate modifier - from params.xb_r34_coeff (= OOP mh_r34 = 0.8869)
-        E_diff: Energy difference E_weak - E_strong
-        f_3_4: Force in strong state (pN)
+        A34: Pre-exponential rate (per ms) - from params.xb_r34_coeff.
+             Calibrated to ~70-100 s⁻¹ at zero load (Millar & Homsher 1990).
+        f_3_4: Force in strong state (pN); positive = resisting (toward M-line)
+        delta34: Transition-state distance for power stroke (nm) - params.xb_delta_34.
+                 1.0 nm; Pate & Cooke 1989 JMRCM 10:181; Huxley & Simmons 1971 (1–2 nm).
+        k_t: Thermal energy kT (pN·nm)
 
     Returns:
         Rate r34 (per ms)
+
+    References:
+        Bell 1978 Science; Walcott 2010 Biophys J; Reconditi 2011 PNAS; Piazzesi 2007 Cell;
+        Pate & Cooke 1989 JMRCM 10:181; Huxley & Simmons 1971 Nature.
     """
     upper = 10000.0
-    # Note: 0.5 and 0.03 are both inside the parentheses, both multiplied by r34_coeff
-    r34 = r34_coeff * (0.5 * (1.0 + jnp.tanh(E_diff)) + 0.03) + jnp.exp(-f_3_4)
+    r34 = A34 * jnp.exp(-f_3_4 * delta34 / k_t)
     return jnp.minimum(r34, upper)
 
 
-def xb_rate_43(r34, U_loose, U_tight_2):
-    """Rate Tight_2->Tight_1 (reverse) - detailed balance.
+def xb_rate_43(r34, U_tight_1, U_tight_2):
+    """Rate Tight_2->Tight_1 (reverse power stroke) - detailed balance.
 
-    NOTE: OOP uses U_loose here, not U_tight_1 (see hs.py line 1772).
+    r43 = r34 × exp(U_tight_2 - U_tight_1).
+    With new defaults (U_tight_2=-23, U_tight_1=-18.6): r43 ≈ 0.012 × r34 —
+    strongly suppresses the reverse stroke, consistent with high duty ratio.
 
     Args:
-        r34: Forward rate
-        U_loose: Free energy of loose state
-        U_tight_2: Free energy of tight_2 state
+        r34: Forward power-stroke rate (per ms)
+        U_tight_1: Free energy of tight_1 state (kT units, includes E_strong)
+        U_tight_2: Free energy of tight_2 state (kT units, includes E_strong)
 
     Returns:
         Rate r43 (per ms)
+
+    References:
+        Hill 1977 Free Energy Transduction; Pate & Cooke 1989 JMRCM 10:181.
     """
     upper = 10000.0
-    log_r43 = jnp.log(r34) - (U_loose - U_tight_2)
-    r43 = jnp.exp(log_r43)
-    return jnp.minimum(r43, upper)
+    log_r43 = jnp.log(r34 + 1e-30) + (U_tight_2 - U_tight_1)
+    return jnp.exp(jnp.minimum(log_r43, jnp.log(upper)))
 
 
-def xb_rate_45(r45_coeff, U_tight_2, f_3_4):
-    """Rate Tight_2->Free_2 (detachment).
+def xb_rate_45(A45, f_3_4, delta45, k_t):
+    """Rate Tight_2->Free_2 (ADP release / detachment).
+
+    Slip bond (Bell 1978): tensile load accelerates ADP release for fast skeletal
+    myosin II. Positive sign is essential — opposite sign to r34 (catch bond would
+    suppress detachment under load, contradicting rapid skeletal muscle kinetics).
+    δ₄₅ ≈ 0.5 nm.
 
     Args:
-        r45_coeff: Consolidated coefficient - from params.xb_r45_coeff
-                   (= OOP mh_dr * 0.5 = 89.062 * 0.5 = 44.531)
-        U_tight_2: Free energy of tight_2 state (kT units)
-        f_3_4: Force in strong state (pN)
+        A45: Pre-exponential detachment rate (per ms) - from params.xb_r45_coeff.
+             ≥500 s⁻¹ at near-zero load (Siemankowski & White 1984 JBC).
+        f_3_4: Force in strong state (pN); positive = tensile (accelerates detachment)
+        delta45: Transition-state distance for detachment (nm) - params.xb_delta_45
+        k_t: Thermal energy kT (pN·nm)
 
     Returns:
         Rate r45 (per ms)
+
+    References:
+        Bell 1978 Science; Siemankowski & White 1984 JBC; Veigel 2005 Nat Cell Biol;
+        Capitanio 2006 PNAS; Walcott 2010 Biophys J; Prodanovic 2019 J Gen Physiol.
     """
     upper = 10000.0
-    r45 = r45_coeff * jnp.sqrt(U_tight_2 + 23.0) + jnp.exp(-f_3_4)
+    r45 = A45 * jnp.exp(f_3_4 * delta45 / k_t)
     return jnp.minimum(r45, upper)
 
 
@@ -278,8 +315,8 @@ def xb_rate_15(r15_rate):
     """Rate DRX->Free_2 (rare direct transition).
 
     Args:
-        r15_rate: Rate constant - from params.xb_r15
-                  (= 0.01, was hardcoded in OOP, now parameterized)
+        r15_rate: Rate constant - from params.xb_r15.
+                  0.01 ms⁻¹; Mijailovich 2020 (k−H=10 s⁻¹); detailed balance r51/r15=10.
 
     Returns:
         Rate r15 (per ms)
@@ -294,9 +331,12 @@ def xb_rate_61(ca_conc, k0, kmax, b, ca50):
 
     Args:
         ca_conc: Calcium concentration (M)
-        k0: Basal rate (per ms) - from params.xb_srx_k0
-        kmax: Maximum rate (per ms) - from params.xb_srx_kmax
-        b: Hill coefficient - from params.xb_srx_b
+        k0: Basal rate (per ms) - from params.xb_srx_k0.
+            Skeletal 0.007 ms⁻¹; cardiac 0.005 ms⁻¹; Mijailovich 2020 (kPS0=5 s⁻¹).
+        kmax: Maximum rate (per ms) - from params.xb_srx_kmax.
+              0.4 ms⁻¹; Mijailovich 2020 (kPSmax=400 s⁻¹).
+        b: Hill coefficient - from params.xb_srx_b.
+           5.0; Mijailovich 2020; Linari 2015 Nature 528:276.
         ca50: Ca50 for half-activation (M) - from params.xb_srx_ca50
 
     Returns:
@@ -309,8 +349,9 @@ def xb_rate_16(r16_rate):
     """Rate DRX->SRX (entering super-relaxed state).
 
     Args:
-        r16_rate: Consolidated rate - from params.xb_r16
-                  (= OOP mh_srx * 0.1 = 0.8652 * 0.1 = 0.08652)
+        r16_rate: Consolidated rate - from params.xb_r16.
+                  Skeletal 0.007 ms⁻¹ (50% SRX at rest); cardiac 0.012 ms⁻¹ (70% SRX);
+                  Stewart 2010 PNAS 107:430; Linari 2015 Nature 528:276.
 
     Returns:
         Rate r16 (per ms)
@@ -478,17 +519,18 @@ if __name__ == "__main__":
     U_DRX, U_loose, U_tight_1, U_tight_2 = -2.3, -2.3, -16.8, -18.92
     f_3_4 = 5.0  # pN
 
+    k_t = 4.14  # pN*nm at ~26°C
     r12 = xb_rate_12(permissiveness, r12_coeff, E_weak)
     r21 = xb_rate_21(r12, U_DRX, U_loose)
-    r23 = xb_rate_23(32.014, E_diff)
+    r23 = xb_rate_23(0.6, E_diff)
     r32 = xb_rate_32(r23, U_loose, U_tight_1)
-    r34 = xb_rate_34(0.4435, E_diff, f_3_4)
-    r43 = xb_rate_43(r34, U_loose, U_tight_2)
-    r45 = xb_rate_45(44.531, U_tight_2, f_3_4)
+    r34 = xb_rate_34(0.15, f_3_4, 1.0, k_t)
+    r43 = xb_rate_43(r34, U_tight_1, U_tight_2)
+    r45 = xb_rate_45(0.6, f_3_4, 0.5, k_t)
     r51 = xb_rate_51(0.1)
     r15 = xb_rate_15(0.01)
-    r61 = xb_rate_61(ca_conc, 0.1, 0.4, 1.0, 1e-6)
-    r16 = xb_rate_16(0.08652)
+    r61 = xb_rate_61(ca_conc, 0.007, 0.4, 5.0, 1e-6)
+    r16 = xb_rate_16(0.007)
 
     print(f"r12 (binding): {r12:.6f}")
     print(f"r21 (unbinding): {r21:.6f}")

@@ -1,10 +1,10 @@
-# How multifil_jax Works: A Plain-English Guide
+# How multifil_jax Works: 
 
 This guide is written for someone comfortable with NumPy array operations who has
 not used JAX, GPU-accelerated computing, or JIT compilation before. It explains
 what the codebase does, how you interact with it, what comes back from a
 simulation, and why certain things are designed the way they are. Code is kept
-minimal — this is a narrative, not a reference manual.
+minimal.
 
 ---
 
@@ -94,7 +94,7 @@ concept in this codebase.
 
 ### StaticParams and DynamicParams (the parameters)
 
-`get_default_params()` (`multifil_jax/core/params.py`) returns two objects:
+`get_skeletal_params()` and `get_cardiac_params()` (`multifil_jax/core/params.py`) each return two objects:
 
 **StaticParams** is a frozen Python dataclass containing structural configuration:
 how many crowns per filament (default 52), how many actin polymers per thin
@@ -138,12 +138,12 @@ Here is a minimal example of a single isometric contraction (fixed z-line
 length, fixed calcium):
 
 ```python
-from multifil_jax.core.params import get_default_params
+from multifil_jax.core.params import get_skeletal_params
 from multifil_jax.core.sarc_geometry import SarcTopology
 from multifil_jax.simulation import run
 import jax
 
-static, dynamic = get_default_params()
+static, dynamic = get_skeletal_params()
 topo = SarcTopology.create(nrows=2, ncols=2, static_params=static, dynamic_params=dynamic)
 topo = jax.device_put(topo)
 
@@ -796,7 +796,7 @@ and "active" only during specific steps.
 | `multifil_jax/timestep.py` | `timestep()` — full step orchestrator (kinetics + solve) |
 | `multifil_jax/metrics_fn.py` | `compute_all_metrics()` — ~46-metric MetricsDict |
 | `multifil_jax/core/state.py` | `State`, `realize_state()`, `Drivers`, `resolve_value()`, `MetricsDict` |
-| `multifil_jax/core/params.py` | `StaticParams`, `DynamicParams`, `get_default_params()` |
+| `multifil_jax/core/params.py` | `StaticParams`, `DynamicParams`, `get_skeletal_params()`, `get_cardiac_params()` |
 | `multifil_jax/core/sarc_geometry.py` | `SarcTopology.create()` — topology builder |
 | `multifil_jax/kernels/cooperativity.py` | `update_cooperativity()` — TM cooperative activation |
 | `multifil_jax/kernels/geometry.py` | `update_nearest_neighbors()` — XB-to-BS distances |
@@ -807,6 +807,6 @@ and "active" only during specific steps.
 | `multifil_jax/utils/hardware.py` | GPU detection, XLA cache configuration |
 | `examples/quickstart.py` | Worked examples: isometric, sweeps, transients, structural stack |
 | `examples/dynamic_lattice_spacing.py` | Dynamic LS demo: isometric, force comparison, K_lat sweep, length ramp |
-| `examples/benchmark_minibatch.py` | Minibatch size benchmark CLI |
-| `benchmarking/benchmark_dynamic_ls.py` | Dynamic LS performance and lattice scaling benchmark |
+| `examples/benchmarks/benchmark_minibatch.py` | Minibatch size benchmark CLI |
+| `examples/benchmarks/benchmark_dynamic_ls.py` | Dynamic LS performance and lattice scaling benchmark |
 | `tests/` | Test suite |

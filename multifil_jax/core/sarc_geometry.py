@@ -23,9 +23,9 @@ ensuring shape-defining integers remain static for compilation.
 Usage
 -----
 >>> from multifil_jax.core.sarc_geometry import SarcTopology
->>> from multifil_jax.core.params import get_default_params
+>>> from multifil_jax.core.params import get_skeletal_params
 >>>
->>> static, dynamic = get_default_params()
+>>> static, dynamic = get_skeletal_params()
 >>> topo = SarcTopology.create(nrows=2, ncols=2, static_params=static, dynamic_params=dynamic)
 >>> topo = jax.device_put(topo)  # Move to GPU once
 >>>
@@ -134,6 +134,10 @@ class SarcTopology:
         'crown_offsets', 'crown_rests', 'binding_offsets', 'binding_rests',
         'tm_chains', 'thick_starts', 'thin_starts',
         'eye_4', 'eye_6',
+        # XB binning arrays (children)
+        'n_xb_bins',         # int — number of bins (= n_xb_bins from StaticParams)
+        'xb_bin_edges',      # (n_xb_bins+1,) float32 — bin boundaries
+        'xb_bin_centers',    # (n_xb_bins,)   float32 — bin midpoints
     )
 
     def __init__(
@@ -173,6 +177,11 @@ class SarcTopology:
         # === STRUCTURAL CONSTANTS (children - traced) ===
         eye_4: jnp.ndarray,                # (4, 4)
         eye_6: jnp.ndarray,                # (6, 6)
+
+        # === XB BINNING (children - traced) ===
+        n_xb_bins: int,
+        xb_bin_edges: jnp.ndarray,         # (n_xb_bins+1,) float32
+        xb_bin_centers: jnp.ndarray,       # (n_xb_bins,)   float32
     ):
         """Initialize SarcTopology with structural dimensions and pre-allocated arrays."""
         # Store integers
@@ -208,6 +217,9 @@ class SarcTopology:
         self.thin_starts = thin_starts
         self.eye_4 = eye_4
         self.eye_6 = eye_6
+        self.n_xb_bins = n_xb_bins
+        self.xb_bin_edges = xb_bin_edges
+        self.xb_bin_centers = xb_bin_centers
 
     def tree_flatten(self) -> Tuple[Tuple[jnp.ndarray, ...], Tuple[int, ...]]:
         """Flatten for JAX: arrays are children, integers are aux_data."""
@@ -221,11 +233,13 @@ class SarcTopology:
             self.crown_offsets, self.crown_rests, self.binding_offsets,
             self.binding_rests, self.tm_chains, self.thick_starts, self.thin_starts,
             self.eye_4, self.eye_6,
+            self.xb_bin_edges, self.xb_bin_centers,
         )
         aux_data = (
             self.n_thick, self.n_crowns, self.n_thin, self.n_sites,
             self.n_titin, self.n_xb_per_crown,
             self.n_faces_per_thin, self.max_sites_per_face, self.total_xbs,
+            self.n_xb_bins,
         )
         return children, aux_data
 
@@ -243,6 +257,7 @@ class SarcTopology:
             n_faces_per_thin=aux_data[6],
             max_sites_per_face=aux_data[7],
             total_xbs=aux_data[8],
+            n_xb_bins=aux_data[9],
             # Arrays from children
             xb_to_thin_id=children[0],
             xb_to_thin_face=children[1],
@@ -261,6 +276,8 @@ class SarcTopology:
             thin_starts=children[14],
             eye_4=children[15],
             eye_6=children[16],
+            xb_bin_edges=children[17],
+            xb_bin_centers=children[18],
         )
 
     @classmethod
@@ -369,7 +386,9 @@ class SarcTopology:
         titin_arr = np.array(titin_connections_list, dtype=np.int32) if titin_connections_list else np.zeros((0, 4), dtype=np.int32)
 
         # 4. Calculate crown offsets
-        crown_offsets, crown_rests = _calculate_crown_offsets(n_crowns)
+        crown_offsets, crown_rests = _calculate_crown_offsets(
+            n_crowns, static_params.thick_bare_zone, static_params.thick_crown_spacing
+        )
 
         # 5. Calculate binding site offsets
         (binding_offsets_list, binding_rests_list, face_to_sites_list,
@@ -412,6 +431,15 @@ class SarcTopology:
         eye_4 = np.eye(4, dtype=np.float32)
         eye_6 = np.eye(6, dtype=np.float32)
 
+        # XB bin edges and centers (baked in at topology creation time)
+        bin_edges = jnp.linspace(
+            static_params.xb_bin_lo,
+            static_params.xb_bin_hi,
+            static_params.n_xb_bins + 1,
+            dtype=jnp.float32,
+        )
+        bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
         return cls(
             # Structural integers
             n_thick=n_thick,
@@ -423,6 +451,7 @@ class SarcTopology:
             n_faces_per_thin=n_faces_per_thin,
             max_sites_per_face=max_sites_per_face,
             total_xbs=total_xbs,
+            n_xb_bins=static_params.n_xb_bins,
             # Flattened index maps
             xb_to_thin_id=jnp.asarray(xb_to_thin_id),
             xb_to_thin_face=jnp.asarray(xb_to_thin_face),
@@ -444,6 +473,9 @@ class SarcTopology:
             # Structural constants
             eye_4=jnp.asarray(eye_4),
             eye_6=jnp.asarray(eye_6),
+            # XB binning
+            xb_bin_edges=bin_edges,
+            xb_bin_centers=bin_centers,
         )
 
     def visualize(self, filename: str = None):
@@ -894,10 +926,10 @@ def _compute_connectivity(
 # OFFSET CALCULATION FUNCTIONS
 # =============================================================================
 
-def _calculate_crown_offsets(n_crowns: int) -> Tuple[np.ndarray, np.ndarray]:
+def _calculate_crown_offsets(n_crowns: int, bare_zone: float, crown_spacing: float) -> Tuple[np.ndarray, np.ndarray]:
     """Calculate crown axial offsets relative to M-line."""
-    bare_zone = np.float32(58.0)
-    crown_spacing = np.float32(14.3)
+    bare_zone = np.float32(bare_zone)
+    crown_spacing = np.float32(crown_spacing)
 
     offsets = bare_zone + np.arange(n_crowns, dtype=np.float32) * crown_spacing
     rests = np.full(n_crowns, crown_spacing, dtype=np.float32)
@@ -1084,12 +1116,12 @@ if __name__ == "__main__":
     print("Testing SarcTopology...")
     print("=" * 60)
 
-    from .params import get_default_params
+    from .params import get_skeletal_params
 
-    # Test 1: Create geometry with default parameters
-    print("\nTest 1: Generate geometry with default parameters")
+    # Test 1: Create geometry with skeletal parameters
+    print("\nTest 1: Generate geometry with skeletal parameters")
     print("-" * 60)
-    static, dynamic = get_default_params()
+    static, dynamic = get_skeletal_params()
     np.random.seed(42)
     geometry = SarcTopology.create(nrows=2, ncols=2, static_params=static, dynamic_params=dynamic)
     print(f"Geometry: {geometry}")

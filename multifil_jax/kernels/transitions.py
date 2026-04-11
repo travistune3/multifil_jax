@@ -151,33 +151,9 @@ def expm_pade6_batch(
 
 
 # ============================================================================
-# NUMERICAL STABILITY HELPERS
-# ============================================================================
-
-@jax.jit
-def ordered_sum(terms: jnp.ndarray) -> jnp.ndarray:
-    """Sum terms for rate matrix diagonal calculation.
-
-    OPTIMIZED: Uses standard jnp.sum instead of sorting by magnitude.
-    GPU sorting within vmap is a massive performance bottleneck.
-    The precision loss is negligible compared to the performance gain.
-
-    Args:
-        terms: 1D array of values to sum (can be negative)
-
-    Returns:
-        Sum of all terms
-    """
-    # OPTIMIZED: Remove argsort - GPU sorting in vmap is expensive
-    # Standard sum is sufficient for rate matrix calculations
-    return jnp.sum(terms)
-
-
-# ============================================================================
 # OPTIMIZED RATE MATRIX CONSTRUCTION
 # ============================================================================
 
-@jax.jit
 def _build_tm_Q_matrix_optimized(k_11, k_12, k_14, k_21, k_22, k_23,
                                   k_32, k_33, k_34, k_41, k_43, k_44):
     """Build TM rate matrices efficiently using jnp.stack.
@@ -206,7 +182,6 @@ def _build_tm_Q_matrix_optimized(k_11, k_12, k_14, k_21, k_22, k_23,
     return Q
 
 
-@jax.jit
 def _build_xb_Q_matrix_optimized(r11, r12, r15, r16, r21, r22, r23,
                                   r32, r33, r34, r43, r44, r45,
                                   r51, r54, r55, r61, r66):
@@ -283,105 +258,6 @@ def matrix_exponential_batch(
 # TROPOMYOSIN TRANSITIONS
 # ============================================================================
 
-@jax.jit
-def tm_rate_matrix(ca_concentration: float,
-                   z_line: float,
-                   tm_constants: jnp.ndarray,
-                   params: Dict) -> jnp.ndarray:
-    """Construct rate matrices for tropomyosin transitions.
-
-    Each binding site has a 4×4 rate matrix for its tropomyosin states:
-    - State 0: Unbound (no Ca2+)
-    - State 1: Ca2+-bound
-    - State 2: Closed
-    - State 3: Open (permissive for myosin binding)
-
-    Args:
-        ca_concentration: Calcium concentration (M)
-        z_line: Z-line position (nm), affects Ca sensitivity
-        tm_constants: (n_sites, 11) array of TM parameters per site
-            [:, 0:4]: K1, K2, K3, K4 (equilibrium constants)
-            [:, 4:8]: k_12, k_23, k_34, k_41 (forward rates)
-            [:, 8]: coop magnitude
-            [:, 9]: is subject to cooperativity (0/1)
-            [:, 10]: can transition from state 3 (0 if bound, 1 if free)
-        is_cooperative: (n_sites,) whether site is in cooperative region
-        is_bound: (n_sites,) whether site is bound to crossbridge
-        params: Parameter dictionary
-
-    Returns:
-        Q: (n_sites, 4, 4) rate matrices
-
-    How to modify:
-        - Different Ca dependence: Modify k_12 calculation
-        - Length dependence: Change the z_line factor in k_12
-        - New states: Expand to 5×5 matrices
-        - Cooperative mechanism: Modify coop factor
-    """
-
-    n_sites = tm_constants.shape[0]
-
-    # Extract equilibrium constants
-    K1 = tm_constants[:, 0]
-    K2 = tm_constants[:, 1]
-    K3 = tm_constants[:, 2]
-    K4 = tm_constants[:, 3]
-
-    # Extract forward rate constants (BASE rates)
-    k_12_base = tm_constants[:, 4]
-    k_23_base = tm_constants[:, 5]
-    k_34_base = tm_constants[:, 6]
-    k_41_base = tm_constants[:, 7]
-
-    # Cooperative factor (already computed in thin_transitions based on subject_to_coop)
-    # tm_constants[:, 8] = tm_coop_magnitude if subject_to_coop else 1.0
-    coop_factor = tm_constants[:, 8]
-
-    # Can transition from state 3?
-    # tm_constants[:, 10] = 0 if bound (can't leave state 3), 1 if unbound (can leave)
-    can_leave_state3 = tm_constants[:, 10]
-
-    # ========================================================================
-    # RATE DEFINITIONS (from hs.py binding_site_rate_matrix lines 1536-1553)
-    # ========================================================================
-
-    # Forward rates
-    # k_12: Ca binding, cooperative
-    k_12 = k_12_base * ca_concentration * coop_factor
-
-    # k_23: Closed to open, cooperative
-    k_23 = k_23_base * coop_factor
-
-    # k_34: Open to super-open (not used in 4-state model, but kept for symmetry)
-    k_34 = k_34_base * coop_factor
-
-    # k_41: Return to unbound, blocked if XB is bound
-    k_41 = k_41_base * can_leave_state3
-
-    # Backward rates (from detailed balance: k_backwards = k_forward / K)
-    k_21 = k_12_base / K1
-    k_32 = k_23_base / K2
-    k_43 = (k_34_base / K3) * can_leave_state3  # Also blocked if bound
-    k_14 = jnp.zeros_like(k_12)  # No direct 0→3 transition (must be array for stacking)
-
-    # Diagonal rates: row sums must be zero for valid rate matrices
-    # Direct arithmetic — avoids vmap+stack overhead (ordered_sum was just jnp.sum)
-    k_11 = -(k_12 + k_14)
-    k_22 = -(k_21 + k_23)
-    k_33 = -(k_32 + k_34)
-    k_44 = -(k_41 + k_43)
-
-    # ========================================================================
-    # CONSTRUCT Q MATRICES (optimized - single construction instead of .at[].set())
-    # ========================================================================
-
-    Q = _build_tm_Q_matrix_optimized(k_11, k_12, k_14, k_21, k_22, k_23,
-                                      k_32, k_33, k_34, k_41, k_43, k_44)
-
-    return Q
-
-
-@jax.jit
 def _compute_unique_tm_Q_matrices(ca_concentration: float,
                                    coop_magnitude: float,
                                    params) -> jnp.ndarray:
@@ -446,7 +322,6 @@ def _compute_unique_tm_Q_matrices(ca_concentration: float,
     return jnp.stack([Q_non_coop, Q_coop])
 
 
-@jax.jit
 def thin_transitions(state: 'State',
                     constants: 'DynamicParams',
                     topology: 'SarcTopology',
@@ -524,14 +399,12 @@ def thin_transitions(state: 'State',
     cum_probs = jnp.cumsum(prob_vectors, axis=1)
     new_states = jnp.argmax(random_values[:, None] < cum_probs, axis=1)
 
-    # Reshape back
-    new_tm_states = new_states.reshape(n_thin, n_sites)
-    new_permissiveness = (new_tm_states == 3).astype(jnp.float32)
+    # Reshape back — cast to int8 to match ThinState.tm_states dtype
+    new_tm_states = new_states.reshape(n_thin, n_sites).astype(jnp.int8)
 
     # Update state with _replace
     new_thin = state.thin._replace(
         tm_states=new_tm_states,
-        permissiveness=new_permissiveness
     )
     new_state = state._replace(thin=new_thin)
 
@@ -542,7 +415,6 @@ def thin_transitions(state: 'State',
 # CROSSBRIDGE TRANSITIONS
 # ============================================================================
 
-@jax.jit
 def xb_rate_matrix(xb_distances: jnp.ndarray,
                    lattice_spacing: float,
                    spring_constants: jnp.ndarray,
@@ -654,11 +526,11 @@ def xb_rate_matrix(xb_distances: jnp.ndarray,
     r32 = xb_rate_32(r23, U_loose, U_tight_1)
 
     # tight_1 (3) <-> tight_2 (4)
-    r34 = xb_rate_34(r34_coeff, E_diff, f_3_4)
-    r43 = xb_rate_43(r34, U_loose, U_tight_2)
+    r34 = xb_rate_34(r34_coeff, f_3_4, params.xb_delta_34, k_t)
+    r43 = xb_rate_43(r34, U_tight_1, U_tight_2)
 
     # tight_2 (4) <-> free_2 (5)
-    r45 = xb_rate_45(r45_coeff, U_tight_2, f_3_4)
+    r45 = xb_rate_45(r45_coeff, f_3_4, params.xb_delta_45, k_t)
     r54 = xb_rate_54() * ones  # Always 0
 
     # free_2 (5) <-> DRX (1)
@@ -694,30 +566,32 @@ def compute_xb_transition_matrices(
     constants: 'DynamicParams',
     topology: 'SarcTopology',
     dt: float,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Compute per-XB Q and P matrices for crossbridge transitions.
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Compute per-XB Q, P, and P_abs matrices via binned expm.
 
     Shared by thick_transitions() (for state sampling) and
     compute_all_metrics() (for ATP expected metrics).
 
-    Each crossbridge gets its own Q→P matrix using exact distances,
-    ensuring correctness under varying lattice spacing and spring constants.
+    Instead of computing one expm per XB (n_xb_total calls), computes expm
+    for 2*n_xb_bins positions (n_bins AP=0 + n_bins AP=1) then gathers per-XB
+    via bin index lookup. Reduces expm calls by ~6× at 4×4, 71% of step time.
 
     Args:
         state: Current State NamedTuple
         constants: DynamicParams with physics values
-        topology: SarcTopology with identity matrices
+        topology: SarcTopology with xb_bin_edges, xb_bin_centers, eye_6
         dt: Timestep length (ms)
 
     Returns:
-        Q_all: (n_xb_total, 6, 6) rate matrices per crossbridge
-        P_all: (n_xb_total, 6, 6) transition probability matrices per crossbridge
+        Q_all:    (n_xb_total, 6, 6) rate matrices per crossbridge
+        P_all:    (n_xb_total, 6, 6) transition probability matrices per crossbridge
+        P_abs_all:(n_xb_total, 6, 6) absorbing-state P (row 4 zeroed) for ATP metrics
     """
     xb_states = state.thick.xb_states
     n_thick, n_crowns, n_xb_per_crown = xb_states.shape
     n_xb_total = n_thick * n_crowns * n_xb_per_crown
 
-    # Get distances
+    # Get axial distances for bin assignment
     xb_distances = state.thick.xb_distances
     lattice_spacing = constants.lattice_spacing
 
@@ -727,15 +601,6 @@ def compute_xb_transition_matrices(
         xb_distances_flat = jnp.zeros((n_xb_total, 2))
         xb_distances_flat = xb_distances_flat.at[:, 0].set(5.0)
         xb_distances_flat = xb_distances_flat.at[:, 1].set(lattice_spacing)
-
-    # Spring constants — broadcast to (n_xb_total, 8)
-    spring_constants_single = jnp.array([
-        constants.xb_g_k_weak, constants.xb_g_rest_weak,
-        constants.xb_c_k_weak, constants.xb_c_rest_weak,
-        constants.xb_g_k_strong, constants.xb_g_rest_strong,
-        constants.xb_c_k_strong, constants.xb_c_rest_strong,
-    ])
-    all_springs = jnp.broadcast_to(spring_constants_single, (n_xb_total, 8))
 
     # Get permissiveness from nearest binding sites
     xb_nearest_bs = state.thick.xb_nearest_bs
@@ -752,15 +617,49 @@ def compute_xb_transition_matrices(
         permissiveness = jnp.ones(n_xb_total) * 0.5
 
     ca_conc = 10.0 ** (-constants.pCa)
+    n_bins = topology.xb_bin_centers.shape[0]   # static integer known to XLA
+    d = lattice_spacing
 
-    Q_all = xb_rate_matrix(
-        xb_distances_flat, lattice_spacing, all_springs,
-        permissiveness, ca_conc, constants.temp_celsius, constants,
-    )
+    # Build (n_bins, 2) distance grid: [bin_center, lattice_spacing] for each bin
+    x_centers = topology.xb_bin_centers                      # (n_bins,)
+    dist_grid = jnp.stack([x_centers, jnp.full(n_bins, d)], axis=1)  # (n_bins, 2)
 
-    P_all = matrix_exponential_batch(Q_all, dt, identity=topology.eye_6)
+    # Spring constants: same scalar for all bins
+    spring_vec = jnp.array([
+        constants.xb_g_k_weak,   constants.xb_g_rest_weak,
+        constants.xb_c_k_weak,   constants.xb_c_rest_weak,
+        constants.xb_g_k_strong, constants.xb_g_rest_strong,
+        constants.xb_c_k_strong, constants.xb_c_rest_strong,
+    ])
+    springs_grid = jnp.broadcast_to(spring_vec, (n_bins, 8))  # (n_bins, 8)
 
-    return Q_all, P_all
+    # Q matrices for AP=0 and AP=1 at each bin position
+    Q_ap0 = xb_rate_matrix(dist_grid, d, springs_grid,
+                            jnp.zeros(n_bins), ca_conc, constants.temp_celsius, constants)
+    Q_ap1 = xb_rate_matrix(dist_grid, d, springs_grid,
+                            jnp.ones(n_bins),  ca_conc, constants.temp_celsius, constants)
+    # Layout: [0..n_bins-1] = AP=0, [n_bins..2*n_bins-1] = AP=1
+    Q_bins = jnp.concatenate([Q_ap0, Q_ap1], axis=0)         # (2*n_bins, 6, 6)
+
+    P_bins = matrix_exponential_batch(Q_bins, dt, identity=topology.eye_6)
+
+    # Absorbing-state version: zero row 4 so state 5 cannot exit (ATP metric)
+    Q_abs_bins = Q_bins.at[:, 4, :].set(0.0)
+    P_abs_bins = matrix_exponential_batch(Q_abs_bins, dt, identity=topology.eye_6)
+
+    # Assign each XB to a bin via digitize + clip
+    x_axial = xb_distances_flat[:, 0]                              # (n_xb_total,)
+    bin_idx = jnp.digitize(x_axial, topology.xb_bin_edges) - 1    # in [-1, n_bins]
+    bin_idx = jnp.clip(bin_idx, 0, n_bins - 1)
+
+    ap  = permissiveness.astype(jnp.int32)                         # 0 or 1
+    key = ap * n_bins + bin_idx                                    # in [0, 2*n_bins)
+
+    Q_all     = Q_bins[key]      # (n_xb_total, 6, 6)
+    P_all     = P_bins[key]      # (n_xb_total, 6, 6)
+    P_abs_all = P_abs_bins[key]  # (n_xb_total, 6, 6)
+
+    return Q_all, P_all, P_abs_all
 
 
 def thick_transitions(state: 'State',
@@ -794,7 +693,7 @@ def thick_transitions(state: 'State',
     n_xb_total = xb_states_flat.shape[0]
 
     # Compute per-XB Q/P matrices via shared helper
-    _Q_all, P_all = compute_xb_transition_matrices(state, constants, topology, dt)
+    _Q_all, P_all, _P_abs = compute_xb_transition_matrices(state, constants, topology, dt)
 
     # Sample new states (same logic as thin_transitions)
     current_states = (xb_states_flat - 1).astype(jnp.int32)  # States are 1-6, indices are 0-5
@@ -828,8 +727,8 @@ def thick_transitions(state: 'State',
     new_states_indices = jnp.argmax(random_values[:, None] < cum_probs, axis=1)
     new_states = new_states_indices + 1  # Convert back to 1-6
 
-    # Reshape back
-    new_xb_states = new_states.reshape(n_thick, n_crowns, n_xb_per_crown)
+    # Reshape back — cast to int8 to match ThickState.xb_states dtype
+    new_xb_states = new_states.reshape(n_thick, n_crowns, n_xb_per_crown).astype(jnp.int8)
 
     # ========================================================================
     # BINDING/UNBINDING LOGIC
@@ -891,7 +790,7 @@ def thick_transitions(state: 'State',
             1,
             new_states_flat
         )
-        new_xb_states = new_states_flat.reshape(n_thick, n_crowns, n_xb_per_crown)
+        new_xb_states = new_states_flat.reshape(n_thick, n_crowns, n_xb_per_crown).astype(jnp.int8)
     else:
         new_xb_bound_to = state.thick.xb_bound_to
         new_thin_bound_to = state.thin.bound_to

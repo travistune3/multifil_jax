@@ -14,6 +14,7 @@ import jax.numpy as jnp
 from typing import Dict, TYPE_CHECKING
 
 from multifil_jax.kernels.forces import axial_force_at_mline
+from multifil_jax.kernels.transitions import compute_xb_transition_matrices
 from multifil_jax.core.state import Drivers, resolve_value, MetricsDict
 
 if TYPE_CHECKING:
@@ -85,12 +86,15 @@ def compute_all_metrics(
     n_tm_1 = jnp.sum(new_tm == 1).astype(jnp.float32)
     n_tm_2 = jnp.sum(new_tm == 2).astype(jnp.float32)
     n_tm_3 = jnp.sum(new_tm == 3).astype(jnp.float32)
-    actin_permissiveness = jnp.mean(new_state.thin.permissiveness)
+    actin_permissiveness = jnp.mean((new_state.thin.tm_states == 3).astype(jnp.float32))
 
     # ========================================================================
     # TRANSITION EVENT COUNTS
     # ========================================================================
-    atp_consumed = jnp.sum((old_xb == 4) & (new_xb == 5)).astype(jnp.float32)
+    # Count XBs that visited state 5 this timestep, including those that continued
+    # to state 1 (4→5→1) within the same timestep. State 4→3→2→1 reversal also
+    # lands in state 1 but is negligibly rare compared to the 4→5→1 path.
+    atp_consumed = jnp.sum((old_xb == 4) & ((new_xb == 5) | (new_xb == 1))).astype(jnp.float32)
     newly_bound = jnp.sum((old_xb == 1) & (new_xb == 2)).astype(jnp.float32)
 
     # ========================================================================
@@ -98,15 +102,12 @@ def compute_all_metrics(
     # ========================================================================
     thick_axial = new_state.thick.axial
     thin_axial = new_state.thin.axial
-    thick_rests = new_state.thick.rests
-    thin_rests = new_state.thin.rests
-    bare_zone = constants.thick_bare_zone
 
-    thick_rest_positions = bare_zone + jnp.cumsum(thick_rests, axis=1)
+    thick_rest_positions = topology.crown_offsets[None, :]
     thick_displacement = thick_axial - thick_rest_positions
     thick_displace_flat = thick_displacement.flatten()
 
-    thin_rest_positions = jnp.cumsum(thin_rests, axis=1)
+    thin_rest_positions = jnp.cumsum(topology.binding_rests, axis=1)
     thin_displacement = thin_axial - thin_rest_positions
     thin_displace_flat = thin_displacement.flatten()
 
@@ -114,7 +115,7 @@ def compute_all_metrics(
     # ENERGY METRICS
     # ========================================================================
     k_thick = constants.thick_k
-    L0_thick = constants.thick_bare_zone
+    L0_thick = topology.crown_offsets[0]
     x1 = new_state.thick.axial[:, 0]
     thick_energy_first = 0.5 * k_thick * (x1 - L0_thick)**2
     thick_energy_first_avg = jnp.mean(thick_energy_first)
@@ -153,29 +154,26 @@ def compute_all_metrics(
     # ========================================================================
     # ATP EXPECTED (P-matrix method) — recompute per-XB P via shared helper
     # ========================================================================
-    from multifil_jax.kernels.transitions import compute_xb_transition_matrices
     # Use resolved constants (same as timestep.py passed to thick_transitions)
     # so Q/P matrices match what actually drove the transitions this step.
     resolved_constants = constants.with_drivers(pCa_val, z_line, lattice_spacing)
-    Q_all, P_all = compute_xb_transition_matrices(
+    Q_all, P_all, P_abs_all = compute_xb_transition_matrices(
         old_state, resolved_constants, topology, dt
     )
 
     old_xb_flat = old_xb.reshape(-1)
-    current_states_0idx = (old_xb_flat - 1).astype(jnp.int32)
     mask_state4 = (old_xb_flat == 4).astype(jnp.float32)
 
-    # P[4->5]: row 3, col 4 (0-indexed) — sequential slice, no arange needed
-    P_4_to_5 = P_all[:, 3, 4]  # (n_xb_total,)
-    atp_expected_p = jnp.sum(mask_state4 * P_4_to_5)
+    # Absorbing-state trick: P_abs_all has row 4 zeroed so state 5 cannot exit.
+    # P_abs_all[:,3,4] gives the probability of visiting state 5 at any point in
+    # [0, dt], correctly counting 4→5→1 paths. Pre-computed in compute_xb_transition_matrices.
+    atp_expected_p = jnp.sum(mask_state4 * P_abs_all[:, 3, 4])
 
     # Q-matrix branching ratio method
     k_total = Q_all[:, 3, 4]  # rate 4->5 per XB
-    # Minimum r45 rate at rest geometry: both globular (g_r_strong, axial) and converter
-    # (c_r_strong, lattice) at rest → E_strong=0, f_3_4=0, exp(-f_3_4)=1.
-    # r45_min = r45_coeff * sqrt(U_tight_2_base + 23) + 1.0
+    # Minimum r45 rate at rest geometry: f_3_4=0 → Bell exp(0)=1 → r45_min = A45.
     # Pure function of constants — recalculated each call, trivially fast.
-    k_min = constants.xb_r45_coeff * jnp.sqrt(constants.xb_U_tight_2 + 23.0) + 1.0
+    k_min = constants.xb_r45_coeff
     ratio = jnp.where(k_total > 1e-10, k_min / k_total, 1.0)
     ratio = jnp.clip(ratio, 0.0, 1.0)  # clip handles XBs doing positive work (k_total < k_min possible)
     atp_expected_q = jnp.sum(mask_state4 * k_total * dt * ratio)

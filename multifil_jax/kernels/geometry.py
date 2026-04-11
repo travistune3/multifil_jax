@@ -28,7 +28,6 @@ if TYPE_CHECKING:
 # FIXED-WIDTH NEAREST NEIGHBOR SEARCH (OPTIMIZED FOR GPU)
 # ============================================================================
 
-@jax.jit
 def find_nearest_binding_sites_fixed_width(
     xb_positions: jnp.ndarray,
     bs_positions: jnp.ndarray,
@@ -58,9 +57,6 @@ def find_nearest_binding_sites_fixed_width(
     n_xb = xb_positions.shape[0]
     max_sites_per_face = xb_to_site_indices.shape[1]
 
-    # Calculate hiding_line
-    hiding_line = jnp.maximum(0.0, -jnp.min(bs_positions))
-
     # Unified Gather: bs_positions[thin_id, site_indices] for ALL XBs at once
     def gather_face_positions(thin_idx, site_indices):
         return bs_positions[thin_idx, site_indices]  # (max_sites_per_face,)
@@ -69,15 +65,14 @@ def find_nearest_binding_sites_fixed_width(
         xb_to_thin_id, xb_to_site_indices
     )  # (n_xb, max_sites_per_face)
 
-    # Apply hiding_line
-    visible_positions = jnp.maximum(hiding_line, face_bs_positions)
-
     # Compute distances for ALL sites in fixed-width window
     # Shape: (n_xb, max_sites_per_face)
-    distances = jnp.abs(visible_positions - xb_positions[:, None])
+    distances = jnp.abs(face_bs_positions - xb_positions[:, None])
 
-    # Mask invalid sites with large distance
-    valid_mask = jnp.arange(max_sites_per_face) < n_sites_per_face_flat[:, None]
+    # Mask: (1) beyond valid site count, (2) site is behind M-line (position <= 0)
+    count_mask = jnp.arange(max_sites_per_face) < n_sites_per_face_flat[:, None]
+    visible_mask = face_bs_positions > 0.0
+    valid_mask = count_mask & visible_mask
     masked_distances = jnp.where(valid_mask, distances, jnp.inf)
 
     # Find argmin across fixed-width dimension (fully parallelized)
@@ -95,7 +90,6 @@ def find_nearest_binding_sites_fixed_width(
 # DISTANCE CALCULATIONS
 # ============================================================================
 
-@jax.jit
 def calculate_xb_to_bs_distances(xb_base_positions: jnp.ndarray,
                                  bs_positions: jnp.ndarray,
                                  nearest_thin: jnp.ndarray,
@@ -135,32 +129,10 @@ def calculate_xb_to_bs_distances(xb_base_positions: jnp.ndarray,
 # CONNECTIVITY-AWARE GEOMETRY
 # ============================================================================
 
-@jax.jit
-def get_facing_binding_sites(thick_idx: int,
-                             face_idx: int,
-                             thick_to_thin_map: jnp.ndarray,
-                             bs_positions: jnp.ndarray) -> jnp.ndarray:
-    """Get positions of binding sites that this thick face is facing.
-
-    Args:
-        thick_idx: Which thick filament
-        face_idx: Which face (0-5)
-        thick_to_thin_map: (n_thick, 6, 2) connectivity
-        bs_positions: (n_thin, n_sites) BS positions
-
-    Returns:
-        facing_positions: (n_sites,) positions of facing BSs
-    """
-    thin_idx = thick_to_thin_map[thick_idx, face_idx, 0]
-    facing_positions = bs_positions[thin_idx, :]
-    return facing_positions
-
-
 # ============================================================================
 # UPDATE FUNCTIONS WITH SARC_GEOMETRY
 # ============================================================================
 
-@jax.jit
 def update_nearest_neighbors(
     state,
     constants,
@@ -239,13 +211,13 @@ update_nearest_neighbors_with_geometry = update_nearest_neighbors
 if __name__ == "__main__":
     import numpy as np
     from multifil_jax.core.sarc_geometry import SarcTopology
-    from multifil_jax.core.params import get_default_params
+    from multifil_jax.core.params import get_skeletal_params
 
     print("Testing geometry module...")
     print("="*60)
 
     # Create test state using SarcTopology
-    static_params, dynamic_params = get_default_params()
+    static_params, dynamic_params = get_skeletal_params()
     np.random.seed(42)
     geometry = SarcTopology.create(nrows=2, ncols=2, static_params=static_params, dynamic_params=dynamic_params)
 

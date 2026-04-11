@@ -49,85 +49,9 @@ if TYPE_CHECKING:
 
 
 # ============================================================================
-# CROSSBRIDGE FORCES - Single Element
-# ============================================================================
-
-@jax.jit
-def crossbridge_force_single(xb_distance: jnp.ndarray,
-                             lattice_spacing: float,
-                             state: int,
-                             params: dict) -> Tuple[float, float]:
-    """Calculate force from a single crossbridge.
-
-    This implements the two-spring model from mh.py Head class.
-
-    Args:
-        xb_distance: (x, y) distance from XB base to binding site
-            x = axial distance (nm)
-            y = lattice spacing (nm)
-        lattice_spacing: Lattice spacing (nm)
-        state: XB state (1=DRX, 2=loose, 3=tight_1, 4=tight_2, 5=free_2, 6=SRX)
-        params: Parameter dictionary with spring constants and rest lengths
-
-    Returns:
-        f_axial: Axial force (pN)
-        f_radial: Radial force (pN)
-    """
-    x, y = xb_distance[0], xb_distance[1]
-
-    # Convert to polar coordinates
-    r = jnp.sqrt(x**2 + y**2)
-
-    # OPTIMIZED: Algebraic substitution for trig functions
-    # cos(theta) = x/r, sin(theta) = y/r
-    # Safe division to avoid r=0 issues
-    r_safe = jnp.where(r > 1e-10, r, 1e-10)
-    cos_theta = x / r_safe
-    sin_theta = y / r_safe
-
-    # Keep arctan2 ONLY for angular spring displacement (theta - c_rest)
-    theta = jnp.arctan2(y, x)
-
-    # Get spring parameters based on state
-    # States 3,4 use strong (bound) springs, others use weak
-    is_strong = (state == 3) | (state == 4)
-
-    # Converter domain (angular spring)
-    c_rest = jnp.where(is_strong,
-                       params.xb_c_rest_strong,
-                       params.xb_c_rest_weak)
-    c_k = jnp.where(is_strong,
-                    params.xb_c_k_strong,
-                    params.xb_c_k_weak)
-
-    # Globular domain (linear spring)
-    g_rest = jnp.where(is_strong,
-                       params.xb_g_rest_strong,
-                       params.xb_g_rest_weak)
-    g_k = jnp.where(is_strong,
-                    params.xb_g_k_strong,
-                    params.xb_g_k_weak)
-
-    # Resolve into axial and radial components using algebraic trig
-    f_axial = (g_k * (r - g_rest) * cos_theta +
-               (1.0 / r_safe) * c_k * (theta - c_rest) * sin_theta)
-
-    f_radial = (g_k * (r - g_rest) * sin_theta +
-                (1.0 / r_safe) * c_k * (theta - c_rest) * cos_theta)
-
-    # Only bound states (2,3,4) produce force
-    is_bound = (state >= 2) & (state <= 4)
-    f_axial = jnp.where(is_bound, f_axial, 0.0)
-    f_radial = jnp.where(is_bound, f_radial, 0.0)
-
-    return f_axial, f_radial
-
-
-# ============================================================================
 # THICK FILAMENT PASSIVE FORCES (with Titin)
 # ============================================================================
 
-@jax.jit
 def compute_thick_passive_forces_single(
     positions: jnp.ndarray,
     rests: jnp.ndarray,
@@ -191,7 +115,6 @@ def compute_thick_passive_forces_single(
     return net_forces
 
 
-@jax.jit
 def compute_thick_passive_forces_vectorized(
     positions_thick: jnp.ndarray,
     rests_thick: jnp.ndarray,
@@ -237,7 +160,6 @@ def compute_thick_passive_forces_vectorized(
 # THIN FILAMENT PASSIVE FORCES
 # ============================================================================
 
-@jax.jit
 def compute_thin_passive_forces_single(
     positions: jnp.ndarray,
     rests: jnp.ndarray,
@@ -273,7 +195,6 @@ def compute_thin_passive_forces_single(
     return net_forces
 
 
-@jax.jit
 def compute_thin_passive_forces_vectorized(
     positions_thin: jnp.ndarray,
     rests_thin: jnp.ndarray,
@@ -306,7 +227,6 @@ def compute_thin_passive_forces_vectorized(
 # INTERNAL THIN FILAMENT FORCES (for cooperativity)
 # ============================================================================
 
-@jax.jit
 def thin_filament_internal_forces(axial_positions: jnp.ndarray,
                                    rest_spacings: jnp.ndarray,
                                    k: float,
@@ -351,7 +271,11 @@ def thin_filament_internal_forces(axial_positions: jnp.ndarray,
     return net_forces
 
 
-def calculate_thin_forces_for_cooperativity(state: 'State', constants: 'DynamicParams') -> jnp.ndarray:
+def calculate_thin_forces_for_cooperativity(
+    state: 'State',
+    constants: 'DynamicParams',
+    topology: 'SarcTopology',
+) -> jnp.ndarray:
     """Calculate INTERNAL thin filament forces for cooperativity calculations.
 
     PURPOSE: These forces are used by update_cooperativity() to determine
@@ -366,12 +290,9 @@ def calculate_thin_forces_for_cooperativity(state: 'State', constants: 'DynamicP
     Using crossbridge forces here would be INCORRECT for cooperativity.
 
     Args:
-        state: State NamedTuple containing:
-            - thin.axial: (n_thin, n_sites) binding site positions
-            - thin.rests: (n_thin, n_sites) rest spacings
-        constants: DynamicParams with:
-            - thin_k: thin filament spring constant
-            - z_line: Z-line position
+        state: State NamedTuple containing thin.axial: (n_thin, n_sites) positions
+        constants: DynamicParams with thin_k and z_line
+        topology: SarcTopology with binding_rests (n_thin, n_sites)
 
     Returns:
         forces: (n_thin, n_sites) internal spring forces on each binding site (pN)
@@ -381,126 +302,12 @@ def calculate_thin_forces_for_cooperativity(state: 'State', constants: 'DynamicP
         - calculate_crossbridge_forces_on_thin() - EXTERNAL forces (different purpose)
         - NumPy reference: multifil/af.py:732-753 (_axial_thin_filament_forces)
     """
-    thin_axial = state.thin.axial
-    thin_rests = state.thin.rests
-
     return thin_filament_internal_forces(
-        thin_axial,
-        thin_rests,
+        state.thin.axial,
+        topology.binding_rests,
         constants.thin_k,
         constants.z_line
     )
-
-
-@jax.jit
-def calculate_crossbridge_forces_on_thin(state: 'State', constants: 'DynamicParams', topology: 'SarcTopology') -> jnp.ndarray:
-    """Calculate EXTERNAL forces on thin filament sites from bound crossbridges.
-
-    PURPOSE: Aggregate all crossbridge forces onto their nearest binding sites.
-    Used for diagnostics, debugging, and calculating total force output.
-
-    FORCE TYPE: EXTERNAL forces from crossbridge attachments. These are the
-    forces that crossbridges exert ON the thin filament at each binding site.
-
-    DO NOT USE FOR COOPERATIVITY: Cooperativity depends on INTERNAL filament
-    tension, not external crossbridge forces. Use calculate_thin_forces_for_cooperativity()
-    for cooperativity calculations.
-
-    Uses topology.xb_to_thin_id for thin filament lookup (no division).
-    Uses jax.ops.segment_sum for efficient GPU accumulation.
-
-    Args:
-        state: State NamedTuple containing:
-            - thin.axial: (n_thin, n_sites) binding site positions
-            - thick.axial: (n_thick, n_crowns) crown positions
-            - thick.xb_states: (n_thick, n_crowns, 3) XB states (1-6)
-            - thick.xb_bound_to: (n_thick, n_crowns, 3) binding info (site_idx only, or -1)
-        constants: DynamicParams with:
-            - lattice_spacing: lattice spacing (nm)
-            - xb_* spring parameters
-        topology: SarcTopology with xb_to_thin_id (required).
-
-    Returns:
-        forces: (n_thin, n_sites) total XB force on each binding site (pN)
-            Positive = towards Z-line, Negative = towards M-line
-
-    See Also:
-        - calculate_thin_forces_for_cooperativity() - INTERNAL forces (different purpose)
-        - compute_xb_forces_vectorized() - Returns forces on both thick and thin
-    """
-    thin_axial = state.thin.axial
-    xb_states = state.thick.xb_states
-    xb_bound_to = state.thick.xb_bound_to
-    xb_positions = state.thick.axial
-    bs_positions = state.thin.axial
-    lattice_spacing = constants.lattice_spacing
-
-    n_thin, n_sites = thin_axial.shape
-    n_sites_total = n_thin * n_sites
-    n_thick, n_crowns, n_xb_per_crown = xb_states.shape
-
-    # Flatten all crossbridges for vectorized computation
-    xb_states_flat = xb_states.reshape(-1)
-    xb_bound_to_flat = xb_bound_to.reshape(-1)  # Now just site_idx!
-
-    # Repeat crown positions for each XB in the crown
-    xb_positions_expanded = jnp.repeat(xb_positions[:, :, None], n_xb_per_crown, axis=2)
-    xb_positions_flat = xb_positions_expanded.reshape(-1)
-
-    # Use topology for thin filament lookup - NO DIVISION
-    thin_idx = topology.xb_to_thin_id  # (total_xbs,) - static from topology
-    site_idx = xb_bound_to_flat  # (total_xbs,) - runtime binding state (or -1 if unbound)
-
-    # Check if bound (states 2,3,4 are bound, states 1,5,6 are unbound)
-    is_bound = (xb_states_flat >= 2) & (xb_states_flat <= 4) & (xb_bound_to_flat >= 0)
-
-    # Clip site indices to valid range for unbound XBs (forces will be zeroed anyway)
-    site_idx_safe = jnp.clip(site_idx, 0, n_sites - 1)
-    thin_idx_safe = jnp.clip(thin_idx, 0, n_thin - 1)
-
-    # Compute flat index for segment_sum
-    thin_flat_idx = thin_idx_safe * n_sites + site_idx_safe
-
-    # Get binding site positions
-    positions_thin_flat = bs_positions.reshape(-1)
-    bs_pos = positions_thin_flat[thin_flat_idx]
-
-    # Calculate distances
-    x_dist = bs_pos - xb_positions_flat
-
-    # Crossbridge force calculation (two-spring model)
-    r = jnp.sqrt(x_dist**2 + lattice_spacing**2)
-
-    # OPTIMIZED: Algebraic substitution for trig functions
-    r_safe = jnp.where(r > 1e-10, r, 1e-10)
-    cos_theta = x_dist / r_safe
-    sin_theta = lattice_spacing / r_safe
-    theta = jnp.arctan2(lattice_spacing, x_dist)
-
-    # Get spring parameters based on state
-    is_strong = (xb_states_flat == 3) | (xb_states_flat == 4)
-
-    c_rest = jnp.where(is_strong, constants.xb_c_rest_strong, constants.xb_c_rest_weak)
-    c_k = jnp.where(is_strong, constants.xb_c_k_strong, constants.xb_c_k_weak)
-    g_rest = jnp.where(is_strong, constants.xb_g_rest_strong, constants.xb_g_rest_weak)
-    g_k = jnp.where(is_strong, constants.xb_g_k_strong, constants.xb_g_k_weak)
-
-    # Calculate axial force
-    f_axial = (g_k * (r - g_rest) * cos_theta +
-               (1.0 / r_safe) * c_k * (theta - c_rest) * sin_theta)
-
-    # Zero force for unbound XBs
-    forces_contributions = jnp.where(is_bound, f_axial, 0.0)
-
-    # REFACTORED: Use segment_sum instead of jnp.zeros + scatter-add
-    # segment_sum uses GPU atomic operations for efficient accumulation
-    forces_on_thin_flat = jax.ops.segment_sum(
-        forces_contributions,
-        thin_flat_idx,
-        num_segments=n_sites_total
-    )
-
-    return forces_on_thin_flat.reshape(n_thin, n_sites)
 
 
 # ============================================================================
@@ -603,7 +410,9 @@ def compute_xb_forces_vectorized(
     g_k = jnp.where(is_strong, g_k_strong, g_k_weak)
 
     # Calculate axial force using algebraic trig
-    f_axial = (g_k * (r - g_rest) * cos_theta +
+    # Sign: F_crown_x = -∂U_g/∂x_crown - ∂U_c/∂x_crown
+    #   = +g_k*(r-g_rest)*cos_theta - (c_k/r)*(theta-c_rest)*sin_theta
+    f_axial = (g_k * (r - g_rest) * cos_theta -
                (1.0 / r_safe) * c_k * (theta - c_rest) * sin_theta)
 
     # Zero force for unbound XBs
@@ -630,12 +439,9 @@ def compute_xb_forces_vectorized(
 # COMBINED FORCE CALCULATION
 # ============================================================================
 
-@jax.jit
 def compute_forces_vectorized(
     positions_thick: jnp.ndarray,
     positions_thin: jnp.ndarray,
-    rests_thick: jnp.ndarray,
-    rests_thin: jnp.ndarray,
     thick_k: float,
     thin_k: float,
     z_line: float,
@@ -655,11 +461,13 @@ def compute_forces_vectorized(
 
     The residual is: F(x) = 0 at equilibrium
 
+    Rest spacings are sourced from geometry (topology):
+        thick: geometry.crown_rests[None, :] broadcast to (n_thick, n_crowns)
+        thin:  geometry.binding_rests (n_thin, n_sites)
+
     Args:
         positions_thick: (n_thick, n_crowns) crown positions
         positions_thin: (n_thin, n_sites) binding site positions
-        rests_thick: (n_thick, n_crowns) rest spacings
-        rests_thin: (n_thin, n_sites) rest spacings
         thick_k: Thick filament spring constant
         thin_k: Thin filament spring constant
         z_line: Z-line position
@@ -668,11 +476,15 @@ def compute_forces_vectorized(
         xb_states: Crossbridge states
         xb_bound_to: Crossbridge binding info (site_idx only, thin from geometry)
         params: Parameter dictionary
-        geometry: SarcTopology with xb_to_thin_id (required).
+        geometry: SarcTopology with xb_to_thin_id, crown_rests, binding_rests.
 
     Returns:
         forces: (n_thick_nodes + n_thin_nodes,) flattened force residual
     """
+    n_thick = positions_thick.shape[0]
+    rests_thick = jnp.broadcast_to(geometry.crown_rests[None, :], (n_thick, geometry.crown_rests.shape[0]))
+    rests_thin = geometry.binding_rests
+
     # 1. Thick filament passive forces (with titin)
     forces_thick = compute_thick_passive_forces_vectorized(
         positions_thick, rests_thick,
@@ -724,8 +536,6 @@ def compute_forces_from_state_vectorized(
     return compute_forces_vectorized(
         positions_thick=state.thick.axial,
         positions_thin=state.thin.axial,
-        rests_thick=state.thick.rests,
-        rests_thin=state.thin.rests,
         thick_k=constants.thick_k,
         thin_k=constants.thin_k,
         z_line=constants.z_line,
@@ -744,7 +554,6 @@ def compute_forces_from_state_vectorized(
 # TOTAL THICK FILAMENT FORCES (for work_thick metric)
 # ============================================================================
 
-@jax.jit
 def compute_thick_forces_vectorized(
     state: 'State',
     constants: 'DynamicParams',
@@ -764,9 +573,10 @@ def compute_thick_forces_vectorized(
         Forces on thick nodes: (n_thick, n_crowns)
     """
     # 1. Passive forces from thick filament springs (including titin)
+    n_thick = state.thick.axial.shape[0]
     f_passive = compute_thick_passive_forces_vectorized(
         state.thick.axial,
-        state.thick.rests,
+        jnp.broadcast_to(topology.crown_rests[None, :], (n_thick, topology.crown_rests.shape[0])),
         constants.thick_k,
         constants.z_line,
         constants.lattice_spacing,
@@ -794,8 +604,7 @@ def compute_thick_forces_vectorized(
 # OUTPUT METRICS
 # ============================================================================
 
-@jax.jit
-def axial_force_at_mline(state: 'State', constants: 'DynamicParams') -> float:
+def axial_force_at_mline(state: 'State', constants: 'DynamicParams', topology: 'SarcTopology') -> float:
     """Calculate total axial force at the M-line (effective axial force).
 
     This is the key output for force-length and force-velocity measurements.
@@ -809,19 +618,15 @@ def axial_force_at_mline(state: 'State', constants: 'DynamicParams') -> float:
 
     Args:
         state: State NamedTuple (pure state, no embedded params)
-        constants: DynamicParams with thick_k and thick_bare_zone
+        constants: DynamicParams with thick_k
+        topology: SarcTopology with crown_offsets[0] = bare_zone distance
 
     Returns:
         force: Total axial force at M-line (pN)
     """
-    crown_positions = state.thick.axial
-    bare_zone = constants.thick_bare_zone
-    thick_k = constants.thick_k
-
-    force_per_thick = (crown_positions[:, 0] - bare_zone) * thick_k
-    force_at_mline = jnp.sum(force_per_thick)
-
-    return force_at_mline
+    bare_zone = topology.crown_offsets[0]
+    force_per_thick = (state.thick.axial[:, 0] - bare_zone) * constants.thick_k
+    return jnp.sum(force_per_thick)
 
 
 # ============================================================================

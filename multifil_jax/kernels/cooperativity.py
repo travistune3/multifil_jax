@@ -30,7 +30,6 @@ if TYPE_CHECKING:
 # COOPERATIVE SPAN CALCULATION
 # ============================================================================
 
-@jax.jit
 def calculate_cooperative_span(tension: jnp.ndarray,
                                span_base: float = 62.0,
                                span_force50: float = -8.0,
@@ -66,7 +65,6 @@ def calculate_cooperative_span(tension: jnp.ndarray,
     return span
 
 
-@jax.jit
 def get_site_tensions(thin_forces: jnp.ndarray) -> jnp.ndarray:
     """Calculate cumulative tension at each site from crossbridge forces.
 
@@ -129,7 +127,6 @@ def _find_cooperative_sites_single_chain(chain_states: jnp.ndarray,
     return is_cooperative
 
 
-@jax.jit
 def find_cooperative_sites_with_chains(tm_states: jnp.ndarray,
                                        tm_positions: jnp.ndarray,
                                        spans: jnp.ndarray,
@@ -199,7 +196,6 @@ def find_cooperative_sites_with_chains(tm_states: jnp.ndarray,
 # FULL COOPERATIVITY UPDATE
 # ============================================================================
 
-@jax.jit
 def update_cooperativity(state: 'State',
                         constants: 'DynamicParams',
                         thin_forces: jnp.ndarray,
@@ -260,35 +256,5 @@ def update_cooperativity(state: 'State',
 
     return new_state
 
-
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
-
-@jax.jit
-def get_cooperativity_stats(state: 'State') -> Dict[str, float]:
-    """Get statistics about cooperativity state.
-
-    Useful for diagnostics and visualization.
-
-    Args:
-        state: State NamedTuple (must have state.thin with subject_to_coop, tm_states)
-
-    Returns:
-        stats: Dictionary with cooperativity statistics
-    """
-    is_coop = state.thin.subject_to_coop
-    tm_states = state.thin.tm_states
-
-    stats = {
-        'fraction_cooperative': jnp.mean(is_coop.astype(jnp.float32)),
-        'fraction_state_2': jnp.mean((tm_states == 2).astype(jnp.float32)),
-        'fraction_state_3': jnp.mean((tm_states == 3).astype(jnp.float32)),
-        'n_cooperative_sites': jnp.sum(is_coop),
-        'n_state_2_sites': jnp.sum(tm_states == 2),
-        'n_state_3_sites': jnp.sum(tm_states == 3),
-    }
-
-    return stats
 
 

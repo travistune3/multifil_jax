@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 import jax
 import jax.numpy as jnp
 
-from multifil_jax.core.params import get_default_params, StaticParams, DynamicParams
+from multifil_jax.core.params import get_skeletal_params, StaticParams, DynamicParams
 from multifil_jax.core.sarc_geometry import SarcTopology
 from multifil_jax.simulation import run, SimulationResult
 
@@ -84,7 +84,7 @@ def plot_metric_corner(results, metric_name='axial_force', last_n=20, cmap='viri
 
 print("Creating topology and running stiffness parameter sweep...")
 
-static, dynamic = get_default_params()
+static, dynamic = get_skeletal_params()
 topo = SarcTopology.create(nrows=2, 
                            ncols=2, 
                            static_params=static, 
@@ -110,15 +110,15 @@ print("Compiling + executing sweep...")
 start = time.time()
 results = run(
     topo,
-    pCa=4,
-    z_line=900,
-    lattice_spacing=14,
+    pCa=[4, 4.5, 5, 5.5, 6, 6.5, 7],
+    z_line=1100,
+    lattice_spacing=[14.,15.,16.,17.,18.],
     duration_ms=1000,
     dt=1.0,
     dynamic_params={
         # 'xb_srx_b': xb_srx_b_sweep,
-        'xb_srx_kmax': xb_srx_kmax_sweep,
-        'xb_r45_coeff': xb_r45_coeff_sweep,
+        # 'xb_srx_kmax': xb_srx_kmax_sweep,
+        # 'xb_r45_coeff': xb_r45_coeff_sweep,
         # 'xb_r51': xb_r51_sweep,
         # 'xb_srx_ca50': xb_srx_b_sweep,
         # 'thick_k': thick_sweep,
@@ -127,7 +127,7 @@ results = run(
         # 'xb_c_k_strong': xb_c_k_strong_sweep,
         # 'xb_g_k_strong': xb_g_k_strong_sweep,
     },
-    replicates=5,
+    replicates=10,
 )
 
 results.axial_force.block_until_ready()
@@ -158,7 +158,7 @@ print("=" * 60)
 start = time.time()
 result = run(topo, 
              pCa=4.0, 
-             z_line=900.0, 
+             z_line=1100.0, 
              duration_ms=10, 
              dt=1.0)
 result.axial_force.block_until_ready()
@@ -168,7 +168,7 @@ print(f"First run (with JIT): {time.time() - start:.2f}s")
 start = time.time()
 result = run(topo, 
              pCa=4.0, 
-             z_line=900.0, 
+             z_line=1100.0, 
              duration_ms=10, 
              dt=1.0, 
              rng_seed=1)
@@ -192,7 +192,7 @@ start = time.time()
 # jax.profiler.start_trace("/tmp/jax-trace")
 result = run(topo, 
              pCa=4.0, 
-             z_line=900.0, 
+             z_line=1100.0, 
              duration_ms=25, 
              dt=1.0)
 result.axial_force.block_until_ready()
@@ -208,7 +208,7 @@ print(f'Execution Time: {end-start:.2f}s')
 # LARGER GRID EXAMPLE (15x15 sweep)
 # =============================================================================
 
-static, dynamic = get_default_params()
+static, dynamic = get_skeletal_params()
 topo_4x4 = SarcTopology.create(nrows=4, 
                                ncols=4, 
                                static_params=static, 
@@ -219,7 +219,7 @@ thick_sweep = [float(dynamic.thick_k) * (i * 0.25) for i in range(1, 16)]
 thin_sweep = [float(dynamic.thin_k) * (i * 0.25) for i in range(1, 16)]
 
 print(f"15x15 sweep = {len(thick_sweep) * len(thin_sweep)} runs")
-# result = run(topo_4x4, pCa=4, z_line=900, lattice_spacing=14,
+# result = run(topo_4x4, pCa=4, z_line=1100, lattice_spacing=14,
 #              duration_ms=1000, dynamic_params={'thick_k': thick_sweep, 'thin_k': thin_sweep})
 
 
@@ -242,7 +242,7 @@ for n in sizes:
     topo_n = jax.device_put(topo_n)
     r = run(topo_n, 
             pCa=4.0, 
-            z_line=900.0, 
+            z_line=1100.0, 
             duration_ms=10, 
             dt=1.0)
     results_by_size.append(r)
