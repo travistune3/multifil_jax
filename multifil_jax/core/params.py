@@ -79,7 +79,7 @@ class StaticParams:
     solver_max_iter: int = 50
     actin_geometry: str = "vertebrate"
     n_newton_steps: int = 4    # Hard cap on Newton while_loop iterations (exits early at convergence)
-    n_cg_steps: int = 2        # CG steps per Newton iter; 0=Richardson (no JVP); 2 recommended for n>=8
+    n_cg_steps: int = 6        # CG steps per Newton iter; 0=Richardson (no JVP)
     solver_residual_tol: float = 0.5  # pN — post-run residual warning threshold
     n_xb_bins: int = 200       # bins per AP level; total expm = 2 × n_xb_bins per step
     xb_bin_lo: float = -8.0    # nm — lower edge of axial distance range (baked into SarcTopology)
