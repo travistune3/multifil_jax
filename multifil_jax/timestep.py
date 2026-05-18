@@ -114,7 +114,7 @@ def timestep(state: 'State',
              K_lat=None,
              d_ref=None,
              solver_tol: Optional[float] = None,
-             n_cg_steps: int = 1,
+             n_cg_steps: int = 6,
              n_newton_steps: int = 16,
              precond_params=None,
              prefactored_precond=None) -> Tuple['State', jnp.ndarray, jnp.ndarray, float, int]:

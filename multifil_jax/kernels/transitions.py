@@ -58,7 +58,7 @@ from .rate_functions import (
     xb_rate_12, xb_rate_21, xb_rate_23, xb_rate_32,
     xb_rate_34, xb_rate_43, xb_rate_45, xb_rate_54,
     xb_rate_51, xb_rate_15, xb_rate_61, xb_rate_16,
-    compute_xb_energies, compute_xb_free_energies, compute_xb_force,
+    compute_xb_energies,
 )
 
 
@@ -154,29 +154,29 @@ def expm_pade6_batch(
 # OPTIMIZED RATE MATRIX CONSTRUCTION
 # ============================================================================
 
-def _build_tm_Q_matrix_optimized(k_11, k_12, k_14, k_21, k_22, k_23,
+def _build_tm_Q_matrix_optimized(k_11, k_12, k_21, k_22, k_23,
                                   k_32, k_33, k_34, k_41, k_43, k_44):
     """Build TM rate matrices efficiently using jnp.stack.
 
-    This replaces the chain of .at[].set() calls with a single construction.
-    Much more efficient for JAX compilation.
+    The TM cycle is 0↔1↔2↔3↔0; there is no direct 0→3 transition,
+    so the (0,3) slot is hard-coded to zero.
 
     Args:
-        k_ij: (n_sites,) arrays of rate coefficients
+        k_ij: (n_configs,) arrays of rate coefficients
 
     Returns:
-        Q: (n_sites, 4, 4) rate matrices
+        Q: (n_configs, 4, 4) rate matrices
     """
-    n_sites = k_11.shape[0]
-    zeros = jnp.zeros(n_sites)
+    n = k_11.shape[0]
+    zeros = jnp.zeros(n)
 
-    # Build each row as (n_sites, 4)
-    row0 = jnp.stack([k_11, k_12, zeros, k_14], axis=1)
+    # Build each row as (n, 4)
+    row0 = jnp.stack([k_11, k_12, zeros, zeros], axis=1)
     row1 = jnp.stack([k_21, k_22, k_23, zeros], axis=1)
     row2 = jnp.stack([zeros, k_32, k_33, k_34], axis=1)
     row3 = jnp.stack([k_41, zeros, k_43, k_44], axis=1)
 
-    # Stack rows to form (n_sites, 4, 4)
+    # Stack rows to form (n, 4, 4)
     Q = jnp.stack([row0, row1, row2, row3], axis=1)
 
     return Q
@@ -288,38 +288,30 @@ def _compute_unique_tm_Q_matrices(ca_concentration: float,
     k_34_base = params.tm_k_34
     k_41_base = params.tm_k_41
 
-    def build_Q_matrix(coop_factor):
-        """Build a single 4x4 Q matrix for given cooperativity."""
-        # Forward rates
-        k_12 = k_12_base * ca_concentration * coop_factor
-        k_23 = k_23_base * coop_factor
-        k_34 = k_34_base * coop_factor
-        k_41 = k_41_base  # Return rate is not affected by coop
+    # Per-config cooperativity factors (index 0 = non-coop, 1 = coop)
+    coop = jnp.array([1.0, coop_magnitude], dtype=jnp.float32)
 
-        # Backward rates (detailed balance)
-        k_21 = k_12_base / K1
-        k_32 = k_23_base / K2
-        k_43 = k_34_base / K3
+    # Forward rates (per-config)
+    k_12 = k_12_base * ca_concentration * coop
+    k_23 = k_23_base * coop
+    k_34 = k_34_base * coop
+    k_41 = jnp.broadcast_to(k_41_base, (2,))  # not coop-modulated
 
-        # Diagonal rates
-        k_11 = -k_12
-        k_22 = -(k_21 + k_23)
-        k_33 = -(k_32 + k_34)
-        k_44 = -(k_41 + k_43)
+    # Backward rates (detailed balance, identical across configs)
+    k_21 = jnp.broadcast_to(k_12_base / K1, (2,))
+    k_32 = jnp.broadcast_to(k_23_base / K2, (2,))
+    k_43 = jnp.broadcast_to(k_34_base / K3, (2,))
 
-        # Build Q matrix
-        return jnp.array([
-            [k_11, k_12, 0.0, 0.0],
-            [k_21, k_22, k_23, 0.0],
-            [0.0, k_32, k_33, k_34],
-            [k_41, 0.0, k_43, k_44]
-        ], dtype=jnp.float32)
+    # Diagonal rates
+    k_11 = -k_12
+    k_22 = -(k_21 + k_23)
+    k_33 = -(k_32 + k_34)
+    k_44 = -(k_41 + k_43)
 
-    # Build Q matrices for both configurations
-    Q_non_coop = build_Q_matrix(1.0)
-    Q_coop = build_Q_matrix(coop_magnitude)
-
-    return jnp.stack([Q_non_coop, Q_coop])
+    return _build_tm_Q_matrix_optimized(
+        k_11, k_12, k_21, k_22, k_23,
+        k_32, k_33, k_34, k_41, k_43, k_44,
+    )
 
 
 def thin_transitions(state: 'State',
@@ -421,7 +413,7 @@ def xb_rate_matrix(xb_distances: jnp.ndarray,
                    permissiveness: jnp.ndarray,
                    ca_concentration: float,
                    temp_celsius: float,
-                   params: Dict) -> jnp.ndarray:
+                   params: 'DynamicParams') -> jnp.ndarray:
     """Construct rate matrices for crossbridge transitions.
 
     Each crossbridge has a 6x6 rate matrix for its states:
@@ -441,7 +433,7 @@ def xb_rate_matrix(xb_distances: jnp.ndarray,
         permissiveness: (n_xb,) binding site permissiveness (0-1)
         ca_concentration: Calcium concentration (M)
         temp_celsius: Temperature (C)
-        params: Parameter dictionary with consolidated rate coefficients
+        params: DynamicParams with consolidated rate coefficients
 
     Returns:
         Q: (n_xb, 6, 6) rate matrices

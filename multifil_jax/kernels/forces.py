@@ -320,7 +320,7 @@ def compute_xb_forces_vectorized(
     xb_states: jnp.ndarray,
     xb_bound_to: jnp.ndarray,
     lattice_spacing: float,
-    params: Dict,
+    params: 'DynamicParams',
     geometry: 'SarcTopology'
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Fully vectorized crossbridge force calculation.
@@ -451,7 +451,7 @@ def compute_forces_vectorized(
     titin_rest: float,
     xb_states: jnp.ndarray,
     xb_bound_to: jnp.ndarray,
-    params: Dict,
+    params: 'DynamicParams',
     geometry: 'SarcTopology'
 ) -> jnp.ndarray:
     """Complete vectorized force residual calculation.

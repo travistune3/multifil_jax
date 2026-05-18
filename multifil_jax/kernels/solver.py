@@ -354,7 +354,7 @@ def _newton_solve(
     n_thin: int,
     n_sites: int,
     n_newton_steps: int = 16,
-    n_cg_steps: int = 1,
+    n_cg_steps: int = 6,
     tolerance: Optional[jnp.ndarray] = None,
     prefactored_precond: Optional[PreFactoredPreconditioner] = None,
 ) -> Tuple[jnp.ndarray, int, float]:
@@ -370,7 +370,7 @@ def _newton_solve(
     Args:
         n_newton_steps: Hard cap on Newton iterations (default 16).
                         while_loop exits early when converged.
-        n_cg_steps: Fixed number of CG iterations per Newton step (default 1; 0=Richardson).
+        n_cg_steps: Fixed number of CG iterations per Newton step (default 6; 0=Richardson).
         tolerance: Convergence target (pN). If None, uses MIN_FLOAT32_TOLERANCE.
 
     Optimizations:
@@ -521,7 +521,7 @@ def _newton_solve_dynamic_ls(
     n_thin: int,
     n_sites: int,
     n_newton_steps: int = 16,
-    n_cg_steps: int = 1,
+    n_cg_steps: int = 6,
     tolerance: Optional[jnp.ndarray] = None,
 ) -> Tuple[jnp.ndarray, int, float]:
     """Newton-Raphson solver for augmented system (positions + lattice spacing).
@@ -572,7 +572,7 @@ def solve_equilibrium(
     d_ref: float = None,
     tolerance: float = None,
     n_newton_steps: int = 16,
-    n_cg_steps: int = 1,
+    n_cg_steps: int = 6,
     precond_params: Optional[PreconditionerParams] = None,
     prefactored_precond: Optional[PreFactoredPreconditioner] = None,
 ) -> Tuple['State', jnp.ndarray, float, int]:
@@ -596,8 +596,8 @@ def solve_equilibrium(
         tolerance: Convergence tolerance (pN). None -> constants.solver_tol,
                    floored at thick_k × 1e-4 (float32 precision limit).
         n_newton_steps: Hard cap on Newton iterations (default 16)
-        n_cg_steps: CG iterations per Newton step. 0 = Richardson (default, no JVP).
-                   Set >0 to use CG with exact Jacobian-vector products.
+        n_cg_steps: CG iterations per Newton step. Default 6; 0 = Richardson
+                   (no JVP — diverges with attached XBs, see CLAUDE.md DO NOT).
         precond_params: Pre-built PreconditionerParams (optional, avoids rebuild per step)
         prefactored_precond: Pre-factored Thomas data (optional, avoids re-factoring per step)
 

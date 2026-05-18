@@ -33,7 +33,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from functools import partial
-from typing import Dict, Tuple, List, Optional, Union, TYPE_CHECKING
+from typing import Dict, Tuple, List, Optional, Union
 
 from multifil_jax.core.params import (
     StaticParams, DynamicParams, get_skeletal_params, DYNAMIC_FIELDS
@@ -206,14 +206,18 @@ class SimulationResult:
         )
 
     def std(self) -> 'SimulationResult':
-        """Standard deviation across replicate axis (axis -2)."""
+        """Standard deviation across replicate axis (axis -2).
+
+        Drivers (pCa, z_line, lattice_spacing) are identical across replicates
+        by construction, so std would be 0. We broadcast their mean instead.
+        """
         if self.replicate_axis is None:
             raise ValueError("No replicate axis to reduce.")
 
         new_metrics = MetricsDict({k: jnp.std(v, axis=-2) for k, v in self.metrics.items()})
-        new_z = jnp.std(self.z_line, axis=-2)
-        new_pCa = jnp.std(self.pCa, axis=-2)
-        new_ls = jnp.std(self.lattice_spacing, axis=-2)
+        new_z = jnp.mean(self.z_line, axis=-2)
+        new_pCa = jnp.mean(self.pCa, axis=-2)
+        new_ls = jnp.mean(self.lattice_spacing, axis=-2)
 
         new_coords = {k: v for k, v in self.coords.items() if k != 'replicates'}
         new_axis_names = [n for n in self._axis_names if n != 'replicates']
@@ -228,19 +232,57 @@ class SimulationResult:
         )
 
     def __getitem__(self, key) -> 'SimulationResult':
-        """Slice all tensors identically, return new SimulationResult."""
+        """Slice all tensors identically, return new SimulationResult.
+
+        Tracks axis bookkeeping: integer indices drop the axis from
+        `_axis_names`/`coords`; slice indices subset the coord list; opaque
+        keys (e.g. boolean masks) fall back to copying axis metadata as-is.
+        """
         new_metrics = MetricsDict({k: v[key] for k, v in self.metrics.items()})
         new_z = self.z_line[key]
         new_pCa = self.pCa[key]
         new_ls = self.lattice_spacing[key]
         new_force = new_metrics['axial_force']
 
+        # Update axis bookkeeping based on key shape
+        key_tuple = key if isinstance(key, tuple) else (key,)
+        new_axis_names = list(self._axis_names)
+        new_coords = dict(self.coords)
+        axis_pos = 0
+        opaque = False
+        for k in key_tuple:
+            if axis_pos >= len(self._axis_names):
+                break
+            name = self._axis_names[axis_pos]
+            if isinstance(k, (int, np.integer)):
+                # Drop this axis
+                if name in new_axis_names:
+                    new_axis_names.remove(name)
+                new_coords.pop(name, None)
+                # Do not advance axis_pos in new_axis_names list, but original axis
+                # consumed: just skip
+            elif isinstance(k, slice):
+                # Keep axis; subset coords
+                if name in new_coords:
+                    try:
+                        new_coords[name] = list(new_coords[name])[k]
+                    except Exception:
+                        opaque = True
+            else:
+                opaque = True
+            axis_pos += 1
+
+        if opaque:
+            # Fall back to original metadata for safety
+            new_axis_names = list(self._axis_names)
+            new_coords = dict(self.coords)
+
         return SimulationResult(
             metrics=new_metrics, rng_key=self.rng_key,
             z_line=new_z, pCa=new_pCa, lattice_spacing=new_ls,
             final_state=None, metadata=self.metadata, dt=self.dt, name=self.name,
             grid_shape=new_force.shape[:-1] if new_force.ndim > 1 else None,
-            axis_names=self._axis_names, coords=self.coords,
+            axis_names=new_axis_names, coords=new_coords,
         )
 
     def summary(self) -> str:
@@ -356,6 +398,11 @@ class SimulationResult:
 BATCH_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384)
 
 
+def _pad(arr, pad_n):
+    """Pad arr along axis 0 by replicating arr[:1] pad_n times."""
+    return jnp.concatenate([arr, jnp.broadcast_to(arr[:1], (pad_n,) + arr.shape[1:])])
+
+
 def get_bucket_size(actual_size: int) -> int:
     """Round up to the next bucket size for JIT cache reuse.
 
@@ -408,7 +455,7 @@ def _run_sim_kernel(
     is_dynamic_ls: bool = False,
     K_lat_batched: jnp.ndarray = None,
     nu_batched: jnp.ndarray = None,
-    n_cg_steps: int = 1,
+    n_cg_steps: int = 6,
     n_newton_steps: int = 16,
 ):
     """JIT-compiled simulation kernel (unified fixed + dynamic LS).
@@ -628,14 +675,20 @@ def run(
         if isinstance(value, list):
             # Detect list-of-traces: each element is a 1D array of length n_steps
             first = value[0] if value else None
-            if (first is not None
-                    and hasattr(first, '__len__')
-                    and not isinstance(first, (int, float))
-                    and np.asarray(first).ndim == 1
-                    and len(first) == n_steps):
-                # Store stacked traces; use integer indices through meshgrid
+            # List-of-traces: at least one element is a 1D array of length n_steps
+            any_trace = any(
+                not isinstance(v, (int, float))
+                and np.asarray(v).ndim == 1
+                and len(np.asarray(v)) == n_steps
+                for v in value
+            )
+            if first is not None and any_trace:
+                # Broadcast scalars to constant traces so np.stack succeeds
+                def _to_trace(v):
+                    a = np.asarray(v)
+                    return np.full(n_steps, float(a)) if a.ndim == 0 else a
                 trace_sweep_stacks[name] = jnp.array(
-                    np.stack([np.asarray(v) for v in value])
+                    np.stack([_to_trace(v) for v in value])
                 )  # (n_cond, n_steps)
                 sweep_axes.append((name, list(range(len(value)))))
             else:
@@ -799,16 +852,13 @@ def run(
     padded_batch = get_bucket_size(total_batch)
     if padded_batch > total_batch:
         pad_n = padded_batch - total_batch
-        z_batched = jnp.concatenate([z_batched, jnp.broadcast_to(z_batched[:1], (pad_n, n_steps))])
-        pCa_batched = jnp.concatenate([pCa_batched, jnp.broadcast_to(pCa_batched[:1], (pad_n, n_steps))])
-        ls_batched = jnp.concatenate([ls_batched, jnp.broadcast_to(ls_batched[:1], (pad_n, n_steps))])
-        K_lat_batched = jnp.concatenate([K_lat_batched, jnp.broadcast_to(K_lat_batched[:1], (pad_n,))])
-        nu_batched = jnp.concatenate([nu_batched, jnp.broadcast_to(nu_batched[:1], (pad_n,))])
+        z_batched = _pad(z_batched, pad_n)
+        pCa_batched = _pad(pCa_batched, pad_n)
+        ls_batched = _pad(ls_batched, pad_n)
+        K_lat_batched = _pad(K_lat_batched, pad_n)
+        nu_batched = _pad(nu_batched, pad_n)
         rng_keys = jnp.concatenate([rng_keys, jax.random.split(jax.random.PRNGKey(rng_seed + 1), pad_n)])
-        pad_kwargs = {}
-        for name in DYNAMIC_FIELDS:
-            val = getattr(batched_params, name)
-            pad_kwargs[name] = jnp.concatenate([val, jnp.broadcast_to(val[:1], (pad_n,))])
+        pad_kwargs = {name: _pad(getattr(batched_params, name), pad_n) for name in DYNAMIC_FIELDS}
         batched_params = DynamicParams(**pad_kwargs)
 
     if verbose:
@@ -882,7 +932,7 @@ def run(
 
     # Post-run solver residual validation
     max_residual = float(jnp.max(reshaped_metrics['solver_residual']))
-    tol = StaticParams().solver_residual_tol
+    tol = static_params.solver_residual_tol
     if max_residual > tol:
         import warnings
         warnings.warn(

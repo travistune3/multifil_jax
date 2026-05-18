@@ -37,6 +37,7 @@ reference_files/
 benchmarking/
 fitting_examples/
 notebooks/
+examples/asymptote_testing/
 
 # Generated output images
 examples/*.png

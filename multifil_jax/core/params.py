@@ -33,25 +33,149 @@ from typing import Dict, Any, List, Tuple
 # Static fields that affect array shapes (changing these triggers recompilation)
 STATIC_FIELDS = frozenset({'n_crowns', 'n_polymers_per_thin', 'solver_max_iter', 'actin_geometry', 'n_newton_steps', 'n_cg_steps', 'solver_residual_tol', 'n_xb_bins'})
 
-# All dynamic field names in order (for tree_flatten/unflatten)
-DYNAMIC_FIELDS = (
-    'thick_k',
-    'thin_k',
-    'xb_c_rest_weak', 'xb_c_rest_strong', 'xb_c_k_weak', 'xb_c_k_strong',
-    'xb_g_rest_weak', 'xb_g_rest_strong', 'xb_g_k_weak', 'xb_g_k_strong',
-    'titin_a', 'titin_b', 'titin_rest',
-    'tm_k_12', 'tm_k_23', 'tm_k_34', 'tm_k_41',
-    'tm_K1', 'tm_K2', 'tm_K3', 'tm_K4',
-    'tm_coop_magnitude', 'tm_span_base', 'tm_span_force50', 'tm_span_steep',
-    'xb_r12_coeff', 'xb_r23_coeff', 'xb_r34_coeff', 'xb_r45_coeff',
-    'xb_delta_34', 'xb_delta_45',
-    'xb_r51', 'xb_r15', 'xb_r16',
-    'xb_U_DRX', 'xb_U_loose', 'xb_U_tight_1', 'xb_U_tight_2',
-    'xb_srx_k0', 'xb_srx_kmax', 'xb_srx_b', 'xb_srx_ca50',
-    'temp_celsius', 'solver_tol',
-    # Tiered architecture: drivers stored as constants when not time-varying
-    'pCa', 'z_line', 'lattice_spacing',
-)
+# Single-source-of-truth: all DynamicParams fields with skeletal defaults.
+# Citations live inline against each entry. Insertion order is preserved
+# (Python 3.7+), so DYNAMIC_FIELDS below matches tree_flatten/unflatten order.
+# To add a new field: add ONE entry here. __slots__, DYNAMIC_FIELDS, and
+# __init__ all derive from this dict.
+_DYNAMIC_DEFAULTS = {
+    # ==========================================================================
+    # MECHANICAL PARAMETERS
+    # ==========================================================================
+
+    # Thick filament — per-segment spring constant (between adjacent crowns)
+    # Whole-filament axial stiffness = thick_k / n_segments. Model has 52 crowns
+    # → 52 segments (M-line + 51 inter-crown) over ~730 nm.
+    #
+    # Brunello et al. 2014 J Physiol 593:3525 (PMC4192709, skeletal X-ray interferometry):
+    #     specific compliance c_M = 17.5 nm·MPa⁻¹·µm⁻¹, half-sarc thick length l_M = 0.8 µm.
+    #     Per-thick cross-section area A_M = (√3/2)·d_{thick-thick}² ≈ 1754 nm² (d_{TT}≈45.9 nm).
+    #     k_whole = A_M / (c_M · l_M) = 1754 / (17.5 × 0.8) = 125 pN/nm.
+    # Mijailovich et al. 2020 PMC7852458 Table 1 (cardiac MUSICO model):
+    #     AE_m = 132 nN, l_m = 0.8 µm → k_whole = AE_m / l_m = 165 pN/nm.
+    # Lit consensus midpoint ≈ 145 pN/nm whole-filament.
+    # Conversion to per-segment: thick_k = k_whole × n_segments = 145 × 52 ≈ 7540 → round to 7500.
+    'thick_k': 7500.0,  # pN/nm per segment (whole-filament ≈ 144 pN/nm)
+
+    # Thin filament — per-segment spring constant (between adjacent binding-site nodes)
+    # Whole-filament axial stiffness = thin_k / n_segments. Model has 90 nodes per
+    # thin filament + z-line anchor → 90 segments over ~1077 nm.
+    #
+    # Brunello et al. 2014 J Physiol 593:3525:
+    #     specific compliance c_A = 14.3 nm·MPa⁻¹·µm⁻¹, half-sarc thin length l_A = 0.975 µm.
+    #     Per-thin area A_A = A_M / 2 = 877 nm² (1:2 thick:thin stoichiometry, vertebrate).
+    #     k_whole = A_A / (c_A · l_A) = 877 / (14.3 × 0.975) = 63 pN/nm.
+    #   (Note: do NOT use Brunello's overlap-corrected C_A = 6.9 — that removes the
+    #    non-overlap segment from the load path; our uniform model spring of length l_A
+    #    represents the whole filament, so use c × L without the correction.)
+    # Mijailovich et al. 2020 Table 1: AE_a = 65 nN, l_a = 1.1 µm → k_whole = 59 pN/nm.
+    # Lit consensus ≈ 60 pN/nm whole-filament (Brunello and Mij agree).
+    # Conversion: thin_k = k_whole × n_segments = 60 × 90 = 5400 → round to 5500.
+    # Thin is ~2× more compliant per length than thick (consistent with smaller cross-
+    # section: actin double helix ~7 nm Ø vs myosin backbone ~15 nm Ø).
+    'thin_k': 5500.0,   # pN/nm per segment (whole-filament ≈ 61 pN/nm)
+
+    # Crossbridge springs - converter domain (angular spring)
+    # c_k_strong: Daniel/Chase/Regnier group lineage (Chase 2004 Ann Biomed Eng;
+    #   Tanner 2007 Biophys J; Williams 2010 Biophys J). κ = 40 pN·nm/rad is at the low
+    #   end but consistent with the model's published parameterization.
+    # c_k_weak: Kaya & Bhatt 2020 (eLife 9:e55368) show pre-stroke head stiffness is
+    #   ~5-10× lower than post-stroke. Partition between linear/angular springs unknown;
+    #   reduce both weak stiffnesses proportionally (~5× here).
+    'xb_c_rest_weak':   0.82309,   # radians
+    'xb_c_rest_strong': 1.27758,   # radians
+    'xb_c_k_weak':      8.0,       # pN·nm/rad — pre-stroke compliant
+    'xb_c_k_strong':    40.0,      # pN·nm/rad — Daniel group lineage
+
+    # Crossbridge springs - globular domain (linear spring)
+    # g_k_strong: ~5 pN/nm for globular domain alone in the two-spring model; the angular
+    #   spring in series brings effective total stiffness down (Daniel group calibration).
+    # g_k_weak: Kaya & Bhatt 2020 measured ~0.2–0.4 pN/nm total pre-stroke vs
+    #   ~2.5–3.5 pN/nm post-stroke. Use 0.4 pN/nm for compliant pre-stroke globular domain.
+    'xb_g_rest_weak':   19.93,     # nm
+    'xb_g_rest_strong': 16.47,     # nm
+    'xb_g_k_weak':      0.4,       # pN/nm — pre-stroke compliant
+    'xb_g_k_strong':    5.0,       # pN/nm — Daniel group lineage
+
+    # Titin exponential spring: F = titin_a * exp(titin_b * (L - titin_rest)), clamped >= 0
+    # L = sqrt(axial_dist² + lattice_spacing²), axial_dist = z_line - last_crown_pos (~787.3 nm)
+    # Skeletal defaults (N2A isoform); cardiac overrides in get_cardiac_params()
+    # titin_a: Powers, Williams, Regnier & Daniel 2018 Integr.Comp.Biol. 58:186
+    #          (compliant N2A: 260 pN / 6 titins per thick = 43 pN per molecule)
+    # titin_b: Powers 2018 psoas calibration (4 µm⁻¹ = 0.004 nm⁻¹)
+    # titin_rest: slack at SL 2.0 µm (z_line=1000 nm → L≈213 nm); Linke 1998 PNAS 95:8052
+    'titin_a':    43.0,    # pN/molecule
+    'titin_b':    0.004,   # nm⁻¹
+    'titin_rest': 215.0,   # nm
+
+    # ==========================================================================
+    # TROPOMYOSIN KINETICS (absolute rates)
+    # ==========================================================================
+    'tm_k_12': 100000.0,   # Robertson 1981: 5e7–2e8 M⁻¹s⁻¹
+    'tm_k_23': 1.0,        # Fraser & Bhatt 2019; Geeves & Lehrer 1994: 20–1000 s⁻¹
+    'tm_k_34': 0.1,        # center of 50–200 s⁻¹
+    'tm_k_41': 0.2,        # Robertson 1981: 100–500 s⁻¹
+
+    # Equilibrium constants (absolute values)
+    'tm_K1': 500000.0,     # skeletal TnC Kd ~2 µM; Potter & Gergely 1975
+    'tm_K2': 130.0,        # dimensionless
+    'tm_K3': 0.1,          # McKillop & Geeves 1993: K_T=0.09 (no Ca²⁺); close to measured
+    'tm_K4': 0.0,          # unused
+
+    # Cooperativity (binary any-neighbor boost on forward TM rates)
+    'tm_coop_magnitude': 100.0,
+    'tm_span_base':      62.0,   # nm
+    'tm_span_force50':   -8.0,   # pN
+    'tm_span_steep':     1.0,
+
+    # ==========================================================================
+    # CROSSBRIDGE KINETICS (absolute/consolidated values)
+    # ==========================================================================
+    'xb_r12_coeff': 305.99,
+    'xb_r23_coeff': 0.6,    # Fitting parameter targeting process B apparent rate (2πb ~ 20–60 s⁻¹ skeletal; Kawai & Zhao 1993 Biophys J 65:638)
+    'xb_r34_coeff': 0.15,   # Millar & Homsher 1990: 70–100 s⁻¹
+    'xb_r45_coeff': 0.6,    # Siemankowski & White 1984: ≥500 s⁻¹ (skeletal)
+    'xb_delta_34': 1.0,     # nm, Bell distance for power stroke; Pate & Cooke 1989; Huxley & Simmons 1971: 1–2 nm
+    'xb_delta_45': 0.5,     # nm, Bell distance for detachment
+    'xb_r51': 0.1,
+    'xb_r15': 0.01,         # Mijailovich 2020 (k−H=10 s⁻¹); detailed balance r51/r15=10
+    'xb_r16': 0.007,        # 50% SRX at rest; Stewart 2010 PNAS 107:430
+
+    # Free energies (kT units). Total cycle = ΔG_ATP ≈ -22 to -24 kT at 37°C.
+    # Partitioning per Howard 2001 Fig 14.6; Pate & Cooke 1989 JMRCM 10:181;
+    # Månsson 2016 JMRCM 37:181; Offer & Ranatunga 2013 Biophys J 105:1767:
+    #   ATP binding + dissociation:  -8 to -10 kT
+    #   Hydrolysis on myosin:        ~0 to -2 kT
+    #   Weak actin binding:          -1 to -3 kT
+    #   Pi release + power stroke:   -8 to -13 kT  (ΔG loose→tight_1 = -10 to -12 kT)
+    #   ADP release:                 -2 to -4 kT   (ΔG tight_1→tight_2 = -4 to -6 kT)
+    'xb_U_DRX':     -2.3,    # M.ATP / M.ADP.Pi (detached)
+    'xb_U_loose':   -4.3,    # AM.ADP.Pi (weakly bound); hydrolysis + weak binding
+    'xb_U_tight_1': -15.0,   # AM.ADP pre-lever-arm; Pi release ΔG ≈ -10.7 kT
+    'xb_U_tight_2': -21.0,   # AM.ADP post-lever-arm; lever arm ΔG ≈ -6 kT
+
+    # SRX -> DRX transition (r61) params
+    'xb_srx_k0':   0.007,    # r16/k0=1 → 50% SRX at rest
+    'xb_srx_kmax': 0.4,      # Mijailovich 2020 (kPSmax=400 s⁻¹)
+    'xb_srx_b':    5.0,      # Mijailovich 2020; Linari 2015 Nature 528:276
+    'xb_srx_ca50': 1e-6,     # Ca50 (M)
+
+    # ==========================================================================
+    # SIMULATION PARAMETERS
+    # ==========================================================================
+    'temp_celsius': 26.15,
+    'solver_tol':   0.3,
+
+    # ==========================================================================
+    # TIERED ARCHITECTURE: Drivers stored as constants when not time-varying
+    # ==========================================================================
+    'pCa':             4.5,
+    'z_line':          900.0,
+    'lattice_spacing': 14.0,
+}
+
+# Field order for tree_flatten/unflatten (Python 3.7+ preserves dict order)
+DYNAMIC_FIELDS = tuple(_DYNAMIC_DEFAULTS)
 
 
 # =============================================================================
@@ -80,7 +204,10 @@ class StaticParams:
     actin_geometry: str = "vertebrate"
     n_newton_steps: int = 4    # Hard cap on Newton while_loop iterations (exits early at convergence)
     n_cg_steps: int = 6        # CG steps per Newton iter; 0=Richardson (no JVP)
-    solver_residual_tol: float = 0.5  # pN — post-run residual warning threshold
+    solver_residual_tol: float = 1.5  # pN — post-run residual warning threshold
+    # Calibrated to the float32 precision floor at the lit-consistent thick_k=7500.
+    # Empirical floor scales as ~thick_k × 2e-4 pN; raising thick_k or thin_k from defaults
+    # may push the floor above this tol and trigger warnings — adjust accordingly.
     n_xb_bins: int = 200       # bins per AP level; total expm = 2 × n_xb_bins per step
     xb_bin_lo: float = -8.0    # nm — lower edge of axial distance range (baked into SarcTopology)
     xb_bin_hi: float = 35.0    # nm — upper edge; measured range at z=1100 is [-5, 31]nm
@@ -102,27 +229,6 @@ class StaticParams:
                 f"actin_geometry='{self.actin_geometry}')")
 
 
-def validate_sweep_params(sweep_params: Dict[str, list]) -> None:
-    """Raise ValueError if sweeping over structural parameters.
-
-    Structural parameters (n_crowns, n_polymers_per_thin, solver_max_iter)
-    affect array shapes and cannot be swept without recompilation.
-
-    Args:
-        sweep_params: Dictionary mapping parameter names to lists of values
-
-    Raises:
-        ValueError: If any key is in STATIC_FIELDS
-    """
-    invalid = set(sweep_params.keys()) & STATIC_FIELDS
-    if invalid:
-        raise ValueError(
-            f"Cannot sweep over structural parameters: {sorted(invalid)}. "
-            f"These affect array shapes and require recompilation. "
-            f"Run separate simulations for different structural configurations."
-        )
-
-
 @jax.tree_util.register_pytree_node_class
 class DynamicParams:
     """Dynamic parameters with ABSOLUTE values (not multipliers) - JAX PyTree.
@@ -139,141 +245,19 @@ class DynamicParams:
         # Pass to run() via SarcTopology.create() and dynamic_params=
     """
 
-    __slots__ = (
-        # All dynamic fields stored as JAX arrays
-        'thick_k',
-        'thin_k',
-        'xb_c_rest_weak', 'xb_c_rest_strong', 'xb_c_k_weak', 'xb_c_k_strong',
-        'xb_g_rest_weak', 'xb_g_rest_strong', 'xb_g_k_weak', 'xb_g_k_strong',
-        'titin_a', 'titin_b', 'titin_rest',
-        'tm_k_12', 'tm_k_23', 'tm_k_34', 'tm_k_41',
-        'tm_K1', 'tm_K2', 'tm_K3', 'tm_K4',
-        'tm_coop_magnitude', 'tm_span_base', 'tm_span_force50', 'tm_span_steep',
-        'xb_r12_coeff', 'xb_r23_coeff', 'xb_r34_coeff', 'xb_r45_coeff',
-        'xb_delta_34', 'xb_delta_45',
-        'xb_r51', 'xb_r15', 'xb_r16',
-        'xb_U_DRX', 'xb_U_loose', 'xb_U_tight_1', 'xb_U_tight_2',
-        'xb_srx_k0', 'xb_srx_kmax', 'xb_srx_b', 'xb_srx_ca50',
-        'temp_celsius', 'solver_tol',
-        # Tiered architecture: drivers stored as constants when not time-varying
-        'pCa', 'z_line', 'lattice_spacing',
-    )
+    __slots__ = DYNAMIC_FIELDS
 
     def __init__(self, **kwargs):
         """Initialize DynamicParams with optional keyword arguments.
 
         All parameters are stored as JAX arrays for PyTree compatibility.
-        Defaults are skeletal fast-twitch values (~26°C). Use get_cardiac_params()
-        for cardiac-specific defaults.
+        Defaults are skeletal fast-twitch values (~26°C); see
+        ``_DYNAMIC_DEFAULTS`` at module level for values + citations.
+        Use get_cardiac_params() for cardiac-specific defaults.
         """
-
-        # ==========================================================================
-        # MECHANICAL PARAMETERS (all as JAX arrays)
-        # ==========================================================================
-
-        # Thick filament
-        self.thick_k = jnp.asarray(kwargs.get('thick_k', 2020.0))  # pN/nm
-
-        # Thin filament
-        self.thin_k = jnp.asarray(kwargs.get('thin_k', 1743.0))  # pN/nm
-
-        # Crossbridge springs - converter domain (angular spring)
-        # c_k_strong: Daniel/Chase/Regnier group lineage (Chase 2004 Ann Biomed Eng;
-        #   Tanner 2007 Biophys J; Williams 2010 Biophys J). κ = 40 pN·nm/rad is at the low
-        #   end but consistent with the model's published parameterization.
-        # c_k_weak: Kaya & Bhatt 2020 (eLife 9:e55368) show pre-stroke head stiffness is
-        #   ~5-10× lower than post-stroke. Partition between linear/angular springs unknown;
-        #   reduce both weak stiffnesses proportionally (~5× here).
-        self.xb_c_rest_weak = jnp.asarray(kwargs.get('xb_c_rest_weak', 0.82309))  # radians
-        self.xb_c_rest_strong = jnp.asarray(kwargs.get('xb_c_rest_strong', 1.27758))  # radians
-        self.xb_c_k_weak = jnp.asarray(kwargs.get('xb_c_k_weak', 8.0))    # pN·nm/rad — pre-stroke compliant
-        self.xb_c_k_strong = jnp.asarray(kwargs.get('xb_c_k_strong', 40.0))  # pN·nm/rad — Daniel group lineage
-
-        # Crossbridge springs - globular domain (linear spring)
-        # g_k_strong: ~5 pN/nm for globular domain alone in the two-spring model; the angular
-        #   spring in series brings effective total stiffness down (Daniel group calibration).
-        # g_k_weak: Kaya & Bhatt 2020 measured ~0.2–0.4 pN/nm total pre-stroke vs
-        #   ~2.5–3.5 pN/nm post-stroke. Use 0.4 pN/nm for compliant pre-stroke globular domain.
-        self.xb_g_rest_weak = jnp.asarray(kwargs.get('xb_g_rest_weak', 19.93))  # nm
-        self.xb_g_rest_strong = jnp.asarray(kwargs.get('xb_g_rest_strong', 16.47))  # nm
-        self.xb_g_k_weak = jnp.asarray(kwargs.get('xb_g_k_weak', 0.4))   # pN/nm — pre-stroke compliant
-        self.xb_g_k_strong = jnp.asarray(kwargs.get('xb_g_k_strong', 5.0))  # pN/nm — Daniel group lineage
-
-        # Titin exponential spring: F = titin_a * exp(titin_b * (L - titin_rest)), clamped >= 0
-        # L = sqrt(axial_dist² + lattice_spacing²), axial_dist = z_line - last_crown_pos (~787.3 nm)
-        # Skeletal defaults (N2A isoform); cardiac overrides in get_cardiac_params()
-        # titin_a: Powers, Williams, Regnier & Daniel 2018 Integr.Comp.Biol. 58:186
-        #          (compliant N2A: 260 pN / 6 titins per thick = 43 pN per molecule)
-        # titin_b: Powers 2018 psoas calibration (4 µm⁻¹ = 0.004 nm⁻¹)
-        # titin_rest: slack at SL 2.0 µm (z_line=1000 nm → L≈213 nm); Linke 1998 PNAS 95:8052
-        self.titin_a = jnp.asarray(kwargs.get('titin_a', 43.0))     # pN/molecule
-        self.titin_b = jnp.asarray(kwargs.get('titin_b', 0.004))    # nm⁻¹
-        self.titin_rest = jnp.asarray(kwargs.get('titin_rest', 215.0))  # nm
-
-        # ==========================================================================
-        # TROPOMYOSIN KINETICS (absolute rates)
-        # ==========================================================================
-        self.tm_k_12 = jnp.asarray(kwargs.get('tm_k_12', 100000.0))   # Robertson 1981: 5e7–2e8 M⁻¹s⁻¹
-        self.tm_k_23 = jnp.asarray(kwargs.get('tm_k_23', 1.0))        # Fraser & Bhatt 2019; Geeves & Lehrer 1994: 20–1000 s⁻¹
-        self.tm_k_34 = jnp.asarray(kwargs.get('tm_k_34', 0.1))        # center of 50–200 s⁻¹
-        self.tm_k_41 = jnp.asarray(kwargs.get('tm_k_41', 0.2))        # Robertson 1981: 100–500 s⁻¹
-
-        # Equilibrium constants (absolute values)
-        self.tm_K1 = jnp.asarray(kwargs.get('tm_K1', 500000.0))   # skeletal TnC Kd ~2 µM; Potter & Gergely 1975
-        self.tm_K2 = jnp.asarray(kwargs.get('tm_K2', 130.0))      # dimensionless
-        self.tm_K3 = jnp.asarray(kwargs.get('tm_K3', 0.1))        # McKillop & Geeves 1993: K_T=0.09 (no Ca²⁺); close to measured
-        self.tm_K4 = jnp.asarray(kwargs.get('tm_K4', 0.0))        # unused
-
-        # Cooperativity
-        self.tm_coop_magnitude = jnp.asarray(kwargs.get('tm_coop_magnitude', 100.0))
-        self.tm_span_base = jnp.asarray(kwargs.get('tm_span_base', 62.0))  # nm
-        self.tm_span_force50 = jnp.asarray(kwargs.get('tm_span_force50', -8.0))  # pN
-        self.tm_span_steep = jnp.asarray(kwargs.get('tm_span_steep', 1.0))
-
-        # ==========================================================================
-        # CROSSBRIDGE KINETICS (absolute/consolidated values)
-        # ==========================================================================
-        self.xb_r12_coeff = jnp.asarray(kwargs.get('xb_r12_coeff', 305.99))
-        self.xb_r23_coeff = jnp.asarray(kwargs.get('xb_r23_coeff', 0.6))    # Fitting parameter targeting process B apparent rate (2πb ~ 20–60 s⁻¹ skeletal; Kawai & Zhao 1993 Biophys J 65:638)
-        self.xb_r34_coeff = jnp.asarray(kwargs.get('xb_r34_coeff', 0.15))   # Millar & Homsher 1990: 70–100 s⁻¹
-        self.xb_r45_coeff = jnp.asarray(kwargs.get('xb_r45_coeff', 0.6))    # Siemankowski & White 1984: ≥500 s⁻¹ (skeletal)
-        self.xb_delta_34 = jnp.asarray(kwargs.get('xb_delta_34', 1.0))      # nm, Bell distance for power stroke; Pate & Cooke 1989; Huxley & Simmons 1971: 1–2 nm
-        self.xb_delta_45 = jnp.asarray(kwargs.get('xb_delta_45', 0.5))      # nm, Bell distance for detachment
-        self.xb_r51 = jnp.asarray(kwargs.get('xb_r51', 0.1))
-        self.xb_r15 = jnp.asarray(kwargs.get('xb_r15', 0.01))               # Mijailovich 2020 (k−H=10 s⁻¹); detailed balance r51/r15=10
-        self.xb_r16 = jnp.asarray(kwargs.get('xb_r16', 0.007))              # 50% SRX at rest; Stewart 2010 PNAS 107:430
-
-        # Free energies (kT units). Total cycle = ΔG_ATP ≈ -22 to -24 kT at 37°C.
-        # Partitioning per Howard 2001 Fig 14.6; Pate & Cooke 1989 JMRCM 10:181;
-        # Månsson 2016 JMRCM 37:181; Offer & Ranatunga 2013 Biophys J 105:1767:
-        #   ATP binding + dissociation:  -8 to -10 kT
-        #   Hydrolysis on myosin:        ~0 to -2 kT
-        #   Weak actin binding:          -1 to -3 kT
-        #   Pi release + power stroke:   -8 to -13 kT  (ΔG loose→tight_1 = -10 to -12 kT)
-        #   ADP release:                 -2 to -4 kT   (ΔG tight_1→tight_2 = -4 to -6 kT)
-        self.xb_U_DRX = jnp.asarray(kwargs.get('xb_U_DRX', -2.3))      # M.ATP / M.ADP.Pi (detached)
-        self.xb_U_loose = jnp.asarray(kwargs.get('xb_U_loose', -4.3))   # AM.ADP.Pi (weakly bound); hydrolysis + weak binding
-        self.xb_U_tight_1 = jnp.asarray(kwargs.get('xb_U_tight_1', -15.0))  # AM.ADP pre-lever-arm; Pi release ΔG ≈ -10.7 kT
-        self.xb_U_tight_2 = jnp.asarray(kwargs.get('xb_U_tight_2', -21.0))  # AM.ADP post-lever-arm; lever arm ΔG ≈ -6 kT
-
-        # SRX -> DRX transition (r61) params
-        self.xb_srx_k0 = jnp.asarray(kwargs.get('xb_srx_k0', 0.007))    # r16/k0=1 → 50% SRX at rest
-        self.xb_srx_kmax = jnp.asarray(kwargs.get('xb_srx_kmax', 0.4))  # Mijailovich 2020 (kPSmax=400 s⁻¹)
-        self.xb_srx_b = jnp.asarray(kwargs.get('xb_srx_b', 5.0))        # Mijailovich 2020; Linari 2015 Nature 528:276
-        self.xb_srx_ca50 = jnp.asarray(kwargs.get('xb_srx_ca50', 1e-6)) # Ca50 (M)
-
-        # ==========================================================================
-        # SIMULATION PARAMETERS
-        # ==========================================================================
-        self.temp_celsius = jnp.asarray(kwargs.get('temp_celsius', 26.15))
-        self.solver_tol = jnp.asarray(kwargs.get('solver_tol', 0.3))
-
-        # ==========================================================================
-        # TIERED ARCHITECTURE: Drivers stored as constants when not time-varying
-        # ==========================================================================
-        self.pCa = jnp.asarray(kwargs.get('pCa', 4.5))
-        self.z_line = jnp.asarray(kwargs.get('z_line', 900.0))
-        self.lattice_spacing = jnp.asarray(kwargs.get('lattice_spacing', 14.0))
+        for name, default in _DYNAMIC_DEFAULTS.items():
+            object.__setattr__(self, name,
+                jnp.asarray(kwargs.get(name, default)))
 
     def tree_flatten(self):
         """Flatten for JAX tree operations.
@@ -402,13 +386,19 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams]:
         tm_k_12  = 80000 M⁻¹ms⁻¹ — Robertson 1981: 4–8×10⁷ M⁻¹s⁻¹
         tm_K1    = 750000 M⁻¹    — Cardiac TnC Kd ~1.3 µM; Pinto 2011 JBC 286:2007 (1–2 µM)
         tm_k_41  = 0.04 ms⁻¹     — Cardiac Ca²⁺ off-rate ~40 s⁻¹; Davis 2007 Biophys J 92:20
-        tm_coop_magnitude = 40.0  — Hill coeff ~2–4 (cardiac); de Tombe & Stienen 1995 Circ Res 76:734
+        tm_coop_magnitude = 1.0   — no rate-coop boost. Cardiac Hill steepness arises
+                                    from SRX gate (Hill b=5) per Mijailovich 2020 (PMC7852458);
+                                    rate-coop > 1 causes low-Ca cascade and flattens force-pCa.
         xb_r23_coeff = 0.175 ms⁻¹ — Process B 3–4× slower (2πb ~ 5–15 s⁻¹);
                                      Kawai et al. 1993 Circ Res 73:35
         xb_r34_coeff = 0.065 ms⁻¹ — Lever arm rate ~2× slower (cardiac beta-MHC);
                                      Deacon et al. 2012 J Mol Biol 421:173
         xb_r45_coeff = 0.065 ms⁻¹ — Cardiac ADP release ~65 s⁻¹; Siemankowski & White 1984 JBC
-        xb_r16   = 0.012 ms⁻¹    — 70% SRX at rest; Linari 2015 Nature 528:276
+        xb_r16   = 0.2 ms⁻¹     — DRX→SRX (k−PS in Mijailovich 2020 PMC7852458 Table 1).
+                                   200 s⁻¹ matches Mijailovich cardiac canonical model;
+                                   with kPSmax=400, k0=5, Hill b=5, gives 97.5% SRX at
+                                   rest (Ca→0) and ~33% SRX at pCa 4.5 — close to Linari
+                                   2015 saturating myosin recruitment data.
         xb_srx_k0 = 0.005 ms⁻¹   — Empirically calibrated (kPS0=5 s⁻¹)
         titin_a  = 55.0 pN        — N2B isoform stiffer than N2A;
                                    Granzier & Labeit 2004 Circ Res 94:284
@@ -430,11 +420,11 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams]:
         'tm_k_12': 80000.0,       # Robertson 1981: 4–8×10⁷ M⁻¹s⁻¹
         'tm_K1': 750000.0,        # Cardiac TnC Kd ~1.3 µM; Pinto 2011 JBC 286:2007
         'tm_k_41': 0.04,          # Cardiac Ca²⁺ off-rate ~40 s⁻¹; Davis 2007 Biophys J 92:20
-        'tm_coop_magnitude': 40.0, # Hill coeff ~2–4; de Tombe & Stienen 1995 Circ Res 76:734
+        'tm_coop_magnitude': 1.0,  # no rate-coop; SRX gate provides Hill (Mijailovich 2020)
         'xb_r23_coeff': 0.175,    # Process B 3–4× slower; Kawai et al. 1993 Circ Res 73:35
         'xb_r34_coeff': 0.065,    # Lever arm ~2× slower; Deacon et al. 2012 J Mol Biol 421:173
         'xb_r45_coeff': 0.065,    # ADP release ~65 s⁻¹; Siemankowski & White 1984 JBC
-        'xb_r16': 0.012,          # 12/(12+5)=70% SRX at rest; Linari 2015
+        'xb_r16': 0.2,            # DRX→SRX; Mijailovich 2020 (PMC7852458 Table 1) k−PS=200 s⁻¹
         'xb_srx_k0': 0.005,       # Empirically calibrated (kPS0=5 s⁻¹)
         'titin_a': 55.0,          # N2B stiffer than N2A; Granzier & Labeit 2004 Circ Res 94:284
         'titin_b': 0.008,         # Powers 2018 cardiac-like stiffness (8 µm⁻¹)
@@ -445,120 +435,3 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams]:
 
 # Alias for tiered architecture
 Constants = DynamicParams
-
-
-def print_params(static: StaticParams = None, dynamic: DynamicParams = None):
-    """Print parameters in organized format.
-
-    Args:
-        static: StaticParams object (optional)
-        dynamic: DynamicParams object (optional)
-    """
-    print("=" * 70)
-    print("JAX MULTIFIL PARAMETERS")
-    print("=" * 70)
-
-    if static is not None:
-        print("\nStatic Parameters (affect array shapes):")
-        print("-" * 70)
-        print(f"  {'n_crowns':30s} = {static.n_crowns}")
-        print(f"  {'n_polymers_per_thin':30s} = {static.n_polymers_per_thin}")
-        print(f"  {'solver_max_iter':30s} = {static.solver_max_iter}")
-        print(f"  {'actin_geometry':30s} = {static.actin_geometry}")
-
-    if dynamic is not None:
-        d = dynamic.to_dict()
-
-        # Group by prefix
-        groups = {
-            'Thick Filament': ['thick_k'],
-            'Thin Filament': ['thin_k'],
-            'XB Springs': [k for k in d if k.startswith('xb_c_') or k.startswith('xb_g_')],
-            'Titin': ['titin_a', 'titin_b', 'titin_rest'],
-            'TM Kinetics': [k for k in d if k.startswith('tm_')],
-            'XB Kinetics': [k for k in d if k.startswith('xb_') and not (
-                k.startswith('xb_c_') or k.startswith('xb_g_'))],
-            'Simulation': ['temp_celsius', 'solver_tol'],
-        }
-
-        for group_name, keys in groups.items():
-            print(f"\n{group_name}:")
-            print("-" * 70)
-            for key in keys:
-                if key in d:
-                    print(f"  {key:30s} = {d[key]}")
-
-    print("=" * 70)
-
-
-if __name__ == "__main__":
-    print("Testing StaticParams and DynamicParams...")
-    print()
-
-    # Test 1: Skeletal parameters
-    print("Test 1: Get skeletal parameters")
-    static, dynamic = get_skeletal_params()
-    print(f"Static: {static}")
-    print(f"Dynamic: {dynamic}")
-    print_params(static, dynamic)
-
-    # Test 2: Copy with updates (DynamicParams)
-    print("\n\nTest 2: DynamicParams.copy() with updates")
-    print("=" * 70)
-    new_dynamic = dynamic.copy(
-        xb_r12_coeff=400.0,
-        tm_k_12=60000.0
-    )
-    print(f"Original xb_r12_coeff: {float(dynamic.xb_r12_coeff)}")
-    print(f"New xb_r12_coeff: {float(new_dynamic.xb_r12_coeff)}")
-    print(f"Original tm_k_12: {float(dynamic.tm_k_12)}")
-    print(f"New tm_k_12: {float(new_dynamic.tm_k_12)}")
-
-    # Test 3: Replace static params
-    print("\n\nTest 3: StaticParams.replace()")
-    print("=" * 70)
-    new_static = static.replace(actin_geometry='invertebrate', n_crowns=60)
-    print(f"Original: {static}")
-    print(f"Modified: {new_static}")
-
-    # Test 4: To dict
-    print("\n\nTest 4: Convert DynamicParams to dictionary")
-    print("=" * 70)
-    param_dict = dynamic.to_dict()
-    print(f"Total parameters: {len(param_dict)}")
-    print("Sample entries:")
-    for i, (key, value) in enumerate(list(param_dict.items())[:5]):
-        print(f"  {key}: {value}")
-    print("  ...")
-
-    # Test 5: Invalid parameter
-    print("\n\nTest 5: Invalid parameter (should raise error)")
-    print("=" * 70)
-    try:
-        dynamic.copy(invalid_param=123)
-    except ValueError as e:
-        print(f"Caught expected error: {e}")
-
-    # Test 6: PyTree roundtrip (DynamicParams only)
-    print("\n\nTest 6: JAX PyTree roundtrip (DynamicParams)")
-    print("=" * 70)
-    leaves, treedef = jax.tree_util.tree_flatten(dynamic)
-    print(f"Number of leaves (dynamic params): {len(leaves)}")
-    reconstructed = jax.tree_util.tree_unflatten(treedef, leaves)
-    print(f"Reconstructed thick_k: {float(reconstructed.thick_k)}")
-    print(f"Original thick_k: {float(dynamic.thick_k)}")
-    print(f"Match: {float(reconstructed.thick_k) == float(dynamic.thick_k)}")
-
-    # Test 7: Validate sweep params
-    print("\n\nTest 7: Validate sweep params")
-    print("=" * 70)
-    try:
-        validate_sweep_params({'n_crowns': [52, 100]})
-    except ValueError as e:
-        print(f"Correctly blocked structural sweep: {e}")
-
-    # Valid sweep should pass
-    validate_sweep_params({'thick_k': [1000, 2000, 3000]})
-    print("Dynamic sweep (thick_k) allowed - OK")
-
-    print("\nAll tests passed!")

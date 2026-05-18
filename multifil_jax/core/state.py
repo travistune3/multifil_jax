@@ -292,49 +292,6 @@ def build_preconditioner_params(
     )
 
 
-def get_state_summary(state: State) -> str:
-    """Get human-readable summary of state structure.
-
-    Args:
-        state: State NamedTuple
-
-    Returns:
-        summary: String describing the state
-    """
-    thick = state.thick
-    thin = state.thin
-    n_thick = thick.axial.shape[0]
-    n_crowns = thick.axial.shape[1]
-    n_thin = thin.axial.shape[0]
-    n_sites = thin.axial.shape[1]
-    thick_axial_shape = thick.axial.shape
-    thick_xb_shape = thick.xb_states.shape
-    thin_axial_shape = thin.axial.shape
-    thin_tm_shape = thin.tm_states.shape
-
-    total_xbs = n_thick * n_crowns * 3
-
-    summary = f"""
-Half-Sarcomere State Summary
-{'='*60}
-Thick Filaments: {n_thick}
-  Crowns per filament: {n_crowns}
-  Total crossbridges: {total_xbs}
-
-Thin Filaments: {n_thin}
-  Binding sites per filament: {n_sites}
-  Total binding sites: {n_thin * n_sites}
-
-State Arrays:
-  thick.axial: {thick_axial_shape}
-  thick.xb_states: {thick_xb_shape}
-  thin.axial: {thin_axial_shape}
-  thin.tm_states: {thin_tm_shape}
-{'='*60}
-"""
-    return summary
-
-
 def get_ca_concentration(pCa: float) -> float:
     """Calculate calcium concentration from pCa.
 
@@ -361,35 +318,4 @@ def resolve_value(driver_val: jnp.ndarray, constant_val: jnp.ndarray) -> jnp.nda
     """
     return jnp.where(jnp.isnan(driver_val), constant_val, driver_val)
 
-
-def encode_xb_address(thick_idx: int, crown_idx: int, xb_idx: int) -> int:
-    """Encode crossbridge address as single integer.
-
-    Used for thin filament 'bound_to' array.
-
-    Args:
-        thick_idx: Thick filament index
-        crown_idx: Crown index within thick filament
-        xb_idx: Crossbridge index within crown (0-2)
-
-    Returns:
-        encoded: Single integer encoding all three indices
-    """
-    # Pack into single int: thick_idx*1000000 + crown_idx*100 + xb_idx
-    return thick_idx * 1000000 + crown_idx * 100 + xb_idx
-
-
-def decode_xb_address(encoded: int) -> Tuple[int, int, int]:
-    """Decode crossbridge address from single integer.
-
-    Args:
-        encoded: Encoded address from encode_xb_address()
-
-    Returns:
-        thick_idx, crown_idx, xb_idx: The three indices
-    """
-    xb_idx = encoded % 100
-    crown_idx = (encoded // 100) % 10000
-    thick_idx = encoded // 1000000
-    return thick_idx, crown_idx, xb_idx
 

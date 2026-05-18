@@ -118,11 +118,13 @@ def _find_cooperative_sites_single_chain(chain_states: jnp.ndarray,
     # Within span matrix: within[i,j] = True if site j is within span of site i
     within_span = distances < chain_spans[:, None]
 
-    # State 2 activators in this chain
-    is_state_2 = (chain_states == 2)
+    # State 2 (Ca²⁺-activated, no XB) and state 3 (XB-bound) both activate neighbors.
+    # State 3 units are physically held open by the XB and propagate cooperativity at
+    # least as strongly as Ca²⁺-only units (McKillop & Geeves 1993; Mijailovich 2020).
+    is_activator = (chain_states == 2) | (chain_states == 3)
 
-    # Cooperative if any state-2 site in this chain is within span
-    is_cooperative = jnp.any(within_span & is_state_2[None, :], axis=1)
+    # Cooperative if any activator site in this chain is within span
+    is_cooperative = jnp.any(within_span & is_activator[None, :], axis=1)
 
     return is_cooperative
 
@@ -154,14 +156,17 @@ def find_cooperative_sites_with_chains(tm_states: jnp.ndarray,
     """
     n_sites = tm_states.shape[0]
 
-    # Windowed approach: check only nearby sites
-    # Max span ~62nm, site spacing ~24.8nm, so max window of ~5 sites each direction
-    max_window = 6
+    # Windowed approach: max_window is a JAX static-shape ceiling; the physical
+    # filter is `span` (set per-site by tension). Sized so the window never bites
+    # for spans up to ~500 nm (well past TM persistence length ~50–100 nm).
+    max_window = 20
 
-    # Precompute state-2 mask for each chain
+    # State 2 (Ca²⁺-activated, no XB) and state 3 (XB-bound) both activate neighbors.
+    # State 3 units are physically held open by the XB and propagate cooperativity at
+    # least as strongly as Ca²⁺-only units (McKillop & Geeves 1993; Mijailovich 2020).
     is_chain_0 = (tm_chains == 0)
     is_chain_1 = (tm_chains == 1)
-    is_state_2 = (tm_states == 2)
+    is_activator = (tm_states == 2) | (tm_states == 3)
 
     def check_site_cooperative(i):
         """Check if site i is subject to cooperativity."""
@@ -174,17 +179,16 @@ def find_cooperative_sites_with_chains(tm_states: jnp.ndarray,
         neighbor_indices = jnp.clip(i + neighbor_offsets, 0, n_sites - 1)
 
         # Get neighbor properties
-        neighbor_states = tm_states[neighbor_indices]
+        neighbor_activators = is_activator[neighbor_indices]
         neighbor_positions = tm_positions[neighbor_indices]
         neighbor_chains = tm_chains[neighbor_indices]
 
-        # Check conditions: state 2, same chain, within span
-        is_neighbor_state_2 = (neighbor_states == 2)
+        # Check conditions: activator state, same chain, within span
         same_chain = (neighbor_chains == my_chain)
         within_span = jnp.abs(neighbor_positions - my_pos) < my_span
 
         # Any neighbor that meets all conditions activates this site
-        return jnp.any(is_neighbor_state_2 & same_chain & within_span)
+        return jnp.any(neighbor_activators & same_chain & within_span)
 
     # Vectorize over all sites
     is_cooperative = jax.vmap(check_site_cooperative)(jnp.arange(n_sites))
