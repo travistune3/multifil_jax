@@ -111,16 +111,16 @@ _DYNAMIC_DEFAULTS = {
     # ==========================================================================
     # TROPOMYOSIN KINETICS (absolute rates)
     # ==========================================================================
-    'tm_k_12': 100000.0,   # Robertson 1981: 5e7–2e8 M⁻¹s⁻¹
-    'tm_k_23': 1.0,        # Fraser & Bhatt 2019; Geeves & Lehrer 1994: 20–1000 s⁻¹
-    'tm_k_34': 0.1,        # center of 50–200 s⁻¹
-    'tm_k_41': 0.2,        # Robertson 1981: 100–500 s⁻¹
+    'tm_k_01': 100000.0,   # Robertson 1981: 5e7–2e8 M⁻¹s⁻¹
+    'tm_k_12': 1.0,        # Fraser & Bhatt 2019; Geeves & Lehrer 1994: 20–1000 s⁻¹
+    'tm_k_23': 0.1,        # center of 50–200 s⁻¹
+    'tm_k_30': 0.2,        # Robertson 1981: 100–500 s⁻¹
 
     # Equilibrium constants (absolute values)
-    'tm_K1': 500000.0,     # skeletal TnC Kd ~2 µM; Potter & Gergely 1975
-    'tm_K2': 130.0,        # dimensionless
-    'tm_K3': 0.1,          # McKillop & Geeves 1993: K_T=0.09 (no Ca²⁺); close to measured
-    'tm_K4': 0.0,          # unused
+    'tm_Keq_01': 500000.0,     # skeletal TnC Kd ~2 µM; Potter & Gergely 1975
+    'tm_Keq_12': 130.0,        # dimensionless
+    'tm_Keq_23': 0.1,          # McKillop & Geeves 1993: K_T=0.09 (no Ca²⁺); close to measured
+    'tm_Keq_30': 0.0,          # unused
 
     # Cooperativity (binary any-neighbor boost on forward TM rates)
     'tm_coop_magnitude': 100.0,
@@ -128,18 +128,27 @@ _DYNAMIC_DEFAULTS = {
     'tm_span_force50':   -8.0,   # pN
     'tm_span_steep':     1.0,
 
+    # Symmetric Ising cooperativity (alternative path, activated by ising_coop=True
+    # in run()). Coupling energies in kT units; field on site i is
+    #   h(i) = J_C * n_2 + J_M * n_3 - 0.5*(J_C+J_M)*n_closed
+    # where n_2, n_3 are same-chain neighbor counts of states 2, 3 within fixed span
+    # (28 nm); n_closed is inferred. Forward rates × exp(+h/2), backward × exp(-h/2)
+    # (Glauber-symmetric, detailed balance preserved). Defaults 0 ⇒ no boost.
+    'tm_J_C': 0.0,   # kT, Ca-open neighbor coupling (RU-RU)
+    'tm_J_M': 0.0,   # kT, XB-bound neighbor coupling (XB-RU; lit suggests J_M>J_C)
+
     # ==========================================================================
     # CROSSBRIDGE KINETICS (absolute/consolidated values)
     # ==========================================================================
-    'xb_r12_coeff': 305.99,
-    'xb_r23_coeff': 0.6,    # Fitting parameter targeting process B apparent rate (2πb ~ 20–60 s⁻¹ skeletal; Kawai & Zhao 1993 Biophys J 65:638)
-    'xb_r34_coeff': 0.15,   # Millar & Homsher 1990: 70–100 s⁻¹
-    'xb_r45_coeff': 0.6,    # Siemankowski & White 1984: ≥500 s⁻¹ (skeletal)
-    'xb_delta_34': 1.0,     # nm, Bell distance for power stroke; Pate & Cooke 1989; Huxley & Simmons 1971: 1–2 nm
-    'xb_delta_45': 0.5,     # nm, Bell distance for detachment
-    'xb_r51': 0.1,
-    'xb_r15': 0.01,         # Mijailovich 2020 (k−H=10 s⁻¹); detailed balance r51/r15=10
-    'xb_r16': 0.007,        # 50% SRX at rest; Stewart 2010 PNAS 107:430
+    'xb_r01_coeff': 305.99,
+    'xb_r12_coeff': 0.6,    # Fitting parameter targeting process B apparent rate (2πb ~ 20–60 s⁻¹ skeletal; Kawai & Zhao 1993 Biophys J 65:638)
+    'xb_r23_coeff': 0.15,   # Millar & Homsher 1990: 70–100 s⁻¹
+    'xb_r34_coeff': 0.6,    # Siemankowski & White 1984: ≥500 s⁻¹ (skeletal)
+    'xb_delta_23': 1.0,     # nm, Bell distance for power stroke; Pate & Cooke 1989; Huxley & Simmons 1971: 1–2 nm
+    'xb_delta_34': 0.5,     # nm, Bell distance for detachment
+    'xb_r40': 0.1,
+    'xb_r04': 0.01,         # Mijailovich 2020 (k−H=10 s⁻¹); detailed balance r40/r04=10
+    'xb_r05': 0.007,        # 50% SRX at rest; Stewart 2010 PNAS 107:430
 
     # Free energies (kT units). Total cycle = ΔG_ATP ≈ -22 to -24 kT at 37°C.
     # Partitioning per Howard 2001 Fig 14.6; Pate & Cooke 1989 JMRCM 10:181;
@@ -154,8 +163,8 @@ _DYNAMIC_DEFAULTS = {
     'xb_U_tight_1': -15.0,   # AM.ADP pre-lever-arm; Pi release ΔG ≈ -10.7 kT
     'xb_U_tight_2': -21.0,   # AM.ADP post-lever-arm; lever arm ΔG ≈ -6 kT
 
-    # SRX -> DRX transition (r61) params
-    'xb_srx_k0':   0.007,    # r16/k0=1 → 50% SRX at rest
+    # SRX -> DRX transition (r50) params
+    'xb_srx_k0':   0.007,    # r05/k0=1 → 50% SRX at rest
     'xb_srx_kmax': 0.4,      # Mijailovich 2020 (kPSmax=400 s⁻¹)
     'xb_srx_b':    5.0,      # Mijailovich 2020; Linari 2015 Nature 528:276
     'xb_srx_ca50': 1e-6,     # Ca50 (M)
@@ -241,7 +250,7 @@ class DynamicParams:
 
     Usage:
         static, dynamic = get_skeletal_params()
-        dynamic = dynamic.copy(xb_r12_coeff=350.0)  # Modify binding rate
+        dynamic = dynamic.copy(xb_r01_coeff=350.0)  # Modify binding rate
         # Pass to run() via SarcTopology.create() and dynamic_params=
     """
 
@@ -295,7 +304,7 @@ class DynamicParams:
 
         Example:
             _, dynamic = get_skeletal_params()
-            modified = dynamic.copy(xb_r12_coeff=400.0, tm_k_12=60000.0)
+            modified = dynamic.copy(xb_r01_coeff=400.0, tm_k_01=60000.0)
         """
         # Validate keys before constructing (Python-level, not traced)
         invalid = set(updates.keys()) - set(DYNAMIC_FIELDS)
@@ -351,11 +360,11 @@ def get_skeletal_params() -> Tuple[StaticParams, DynamicParams]:
         xb_c_k_strong = 40 pN·nm/rad — Daniel group lineage (Chase 2004, Williams 2010)
         xb_U_tight_1 = -15.0 kT      — Pi release ΔG ≈ -10.7 kT; Howard 2001; Månsson 2016
         xb_U_tight_2 = -21.0 kT      — lever arm ΔG ≈ -6 kT; Offer & Ranatunga 2013
-        xb_r23_coeff = 0.6 ms⁻¹      — fitting parameter targeting process B (2πb ~ 20–60 s⁻¹)
-        xb_delta_34  = 1.0 nm         — Pate & Cooke 1989 JMRCM 10:181; Huxley & Simmons 1971
-        xb_delta_45  = 0.5 nm         — Duke 1999 PNAS 96:2770
-        xb_r16       = 0.007 ms⁻¹    — 50% SRX at rest; Stewart 2010 PNAS 107:430
-        tm_K3        = 0.1            — McKillop & Geeves 1993 Biophys J 65:693 (K_T=0.09 no Ca²⁺)
+        xb_r12_coeff = 0.6 ms⁻¹      — fitting parameter targeting process B (2πb ~ 20–60 s⁻¹)
+        xb_delta_23  = 1.0 nm         — Pate & Cooke 1989 JMRCM 10:181; Huxley & Simmons 1971
+        xb_delta_34  = 0.5 nm         — Duke 1999 PNAS 96:2770
+        xb_r05       = 0.007 ms⁻¹    — 50% SRX at rest; Stewart 2010 PNAS 107:430
+        tm_Keq_23        = 0.1            — McKillop & Geeves 1993 Biophys J 65:693 (K_T=0.09 no Ca²⁺)
         titin_a      = 43.0 pN        — Powers, Williams, Regnier & Daniel 2018 Integr.Comp.Biol. 58:186
         titin_b      = 0.004 nm⁻¹    — Powers 2018 psoas calibration (4 µm⁻¹)
         titin_rest   = 215.0 nm       — slack at SL 2.0 µm; Linke 1998 PNAS 95:8052
@@ -382,19 +391,19 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams]:
     baseline and applying cardiac-specific overrides.
 
     Cardiac overrides and citations:
-        tm_k_23  = 0.5 ms⁻¹      — Cardiac TM dynamics slower; Lehrer & Morris 1982
-        tm_k_12  = 80000 M⁻¹ms⁻¹ — Robertson 1981: 4–8×10⁷ M⁻¹s⁻¹
-        tm_K1    = 750000 M⁻¹    — Cardiac TnC Kd ~1.3 µM; Pinto 2011 JBC 286:2007 (1–2 µM)
-        tm_k_41  = 0.04 ms⁻¹     — Cardiac Ca²⁺ off-rate ~40 s⁻¹; Davis 2007 Biophys J 92:20
+        tm_k_12  = 0.5 ms⁻¹      — Cardiac TM dynamics slower; Lehrer & Morris 1982
+        tm_k_01  = 80000 M⁻¹ms⁻¹ — Robertson 1981: 4–8×10⁷ M⁻¹s⁻¹
+        tm_Keq_01    = 750000 M⁻¹    — Cardiac TnC Kd ~1.3 µM; Pinto 2011 JBC 286:2007 (1–2 µM)
+        tm_k_30  = 0.04 ms⁻¹     — Cardiac Ca²⁺ off-rate ~40 s⁻¹; Davis 2007 Biophys J 92:20
         tm_coop_magnitude = 1.0   — no rate-coop boost. Cardiac Hill steepness arises
                                     from SRX gate (Hill b=5) per Mijailovich 2020 (PMC7852458);
                                     rate-coop > 1 causes low-Ca cascade and flattens force-pCa.
-        xb_r23_coeff = 0.175 ms⁻¹ — Process B 3–4× slower (2πb ~ 5–15 s⁻¹);
+        xb_r12_coeff = 0.175 ms⁻¹ — Process B 3–4× slower (2πb ~ 5–15 s⁻¹);
                                      Kawai et al. 1993 Circ Res 73:35
-        xb_r34_coeff = 0.065 ms⁻¹ — Lever arm rate ~2× slower (cardiac beta-MHC);
+        xb_r23_coeff = 0.065 ms⁻¹ — Lever arm rate ~2× slower (cardiac beta-MHC);
                                      Deacon et al. 2012 J Mol Biol 421:173
-        xb_r45_coeff = 0.065 ms⁻¹ — Cardiac ADP release ~65 s⁻¹; Siemankowski & White 1984 JBC
-        xb_r16   = 0.2 ms⁻¹     — DRX→SRX (k−PS in Mijailovich 2020 PMC7852458 Table 1).
+        xb_r34_coeff = 0.065 ms⁻¹ — Cardiac ADP release ~65 s⁻¹; Siemankowski & White 1984 JBC
+        xb_r05   = 0.2 ms⁻¹     — DRX→SRX (k−PS in Mijailovich 2020 PMC7852458 Table 1).
                                    200 s⁻¹ matches Mijailovich cardiac canonical model;
                                    with kPSmax=400, k0=5, Hill b=5, gives 97.5% SRX at
                                    rest (Ca→0) and ~33% SRX at pCa 4.5 — close to Linari
@@ -413,18 +422,18 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams]:
 
     Example:
         static, dynamic = get_cardiac_params()
-        dynamic = dynamic.copy(tm_K1=1e6)
+        dynamic = dynamic.copy(tm_Keq_01=1e6)
     """
     cardiac_overrides = {
-        'tm_k_23': 0.5,           # Cardiac TM dynamics slower; Lehrer & Morris 1982
-        'tm_k_12': 80000.0,       # Robertson 1981: 4–8×10⁷ M⁻¹s⁻¹
-        'tm_K1': 750000.0,        # Cardiac TnC Kd ~1.3 µM; Pinto 2011 JBC 286:2007
-        'tm_k_41': 0.04,          # Cardiac Ca²⁺ off-rate ~40 s⁻¹; Davis 2007 Biophys J 92:20
+        'tm_k_12': 0.5,           # Cardiac TM dynamics slower; Lehrer & Morris 1982
+        'tm_k_01': 80000.0,       # Robertson 1981: 4–8×10⁷ M⁻¹s⁻¹
+        'tm_Keq_01': 750000.0,        # Cardiac TnC Kd ~1.3 µM; Pinto 2011 JBC 286:2007
+        'tm_k_30': 0.04,          # Cardiac Ca²⁺ off-rate ~40 s⁻¹; Davis 2007 Biophys J 92:20
         'tm_coop_magnitude': 1.0,  # no rate-coop; SRX gate provides Hill (Mijailovich 2020)
-        'xb_r23_coeff': 0.175,    # Process B 3–4× slower; Kawai et al. 1993 Circ Res 73:35
-        'xb_r34_coeff': 0.065,    # Lever arm ~2× slower; Deacon et al. 2012 J Mol Biol 421:173
-        'xb_r45_coeff': 0.065,    # ADP release ~65 s⁻¹; Siemankowski & White 1984 JBC
-        'xb_r16': 0.2,            # DRX→SRX; Mijailovich 2020 (PMC7852458 Table 1) k−PS=200 s⁻¹
+        'xb_r12_coeff': 0.175,    # Process B 3–4× slower; Kawai et al. 1993 Circ Res 73:35
+        'xb_r23_coeff': 0.065,    # Lever arm ~2× slower; Deacon et al. 2012 J Mol Biol 421:173
+        'xb_r34_coeff': 0.065,    # ADP release ~65 s⁻¹; Siemankowski & White 1984 JBC
+        'xb_r05': 0.2,            # DRX→SRX; Mijailovich 2020 (PMC7852458 Table 1) k−PS=200 s⁻¹
         'xb_srx_k0': 0.005,       # Empirically calibrated (kPS0=5 s⁻¹)
         'titin_a': 55.0,          # N2B stiffer than N2A; Granzier & Labeit 2004 Circ Res 94:284
         'titin_b': 0.008,         # Powers 2018 cardiac-like stiffness (8 µm⁻¹)

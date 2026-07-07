@@ -39,6 +39,9 @@ from multifil_jax.kernels.forces import axial_force_at_mline
 # Top-level simulation API
 from multifil_jax.simulation import run, SimulationResult
 
+# Subpopulation feature (modified-kinetics subsets of XB / TM units)
+from multifil_jax.core.subpopulation import Subpopulation
+
 # Helper functions
 from multifil_jax.helper import count_transitions
 
@@ -46,6 +49,7 @@ __all__ = [
     # Top-level simulation
     'run',
     'SimulationResult',
+    'Subpopulation',
 
     # Core simulation
     'timestep',

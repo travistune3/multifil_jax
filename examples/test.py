@@ -103,7 +103,7 @@ topo = jax.device_put(topo)
 xb_srx_kmax_sweep = [float(dynamic.xb_srx_kmax) * (i * 0.5) for i in range(1, 30)]
 # xb_srx_ca50_sweep = [float(dynamic.xb_srx_ca50) * (i * 0.5) for i in range(1, 10)]
 
-xb_r45_coeff_sweep = [float(dynamic.xb_r45_coeff) * (i * 0.5) for i in range(1, 30)]
+xb_r34_coeff_sweep = [float(dynamic.xb_r34_coeff) * (i * 0.5) for i in range(1, 30)]
 
 
 print("Compiling + executing sweep...")
@@ -118,8 +118,8 @@ results = run(
     dynamic_params={
         # 'xb_srx_b': xb_srx_b_sweep,
         # 'xb_srx_kmax': xb_srx_kmax_sweep,
-        # 'xb_r45_coeff': xb_r45_coeff_sweep,
-        # 'xb_r51': xb_r51_sweep,
+        # 'xb_r34_coeff': xb_r34_coeff_sweep,
+        # 'xb_r40': xb_r51_sweep,
         # 'xb_srx_ca50': xb_srx_b_sweep,
         # 'thick_k': thick_sweep,
         # 'thin_k': thin_sweep,

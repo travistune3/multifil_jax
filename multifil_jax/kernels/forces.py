@@ -331,7 +331,7 @@ def compute_xb_forces_vectorized(
     Args:
         positions_thick: (n_thick, n_crowns) crown positions
         positions_thin: (n_thin, n_sites) binding site positions
-        xb_states: (n_thick, n_crowns, n_xb_per_crown) XB states (1-6)
+        xb_states: (n_thick, n_crowns, n_xb_per_crown) XB states (0-5)
         xb_bound_to: (n_thick, n_crowns, n_xb_per_crown) site indices
             Just site_idx (-1 if unbound), thin from geometry
         lattice_spacing: Lattice spacing (nm)
@@ -362,7 +362,7 @@ def compute_xb_forces_vectorized(
     positions_thin_flat = positions_thin.reshape(-1)
 
     # Check bound status
-    is_bound = (xb_states_flat >= 2) & (xb_states_flat <= 4) & (xb_bound_flat >= 0)
+    is_bound = (xb_states_flat >= 1) & (xb_states_flat <= 3) & (xb_bound_flat >= 0)
 
     # Use geometry for thin lookup - NO DIVISION
     thin_idx = geometry.xb_to_thin_id  # Static from topology
@@ -389,7 +389,7 @@ def compute_xb_forces_vectorized(
     theta = jnp.arctan2(lattice_spacing, x_dist)
 
     # Get spring parameters based on state
-    is_strong = (xb_states_flat == 3) | (xb_states_flat == 4)
+    is_strong = (xb_states_flat == 2) | (xb_states_flat == 3)
 
     # Extract scalar params (attribute access)
     c_rest_strong = params.xb_c_rest_strong
@@ -656,7 +656,7 @@ def _xb_radial_force_total(
     for JVP in the bordered Newton solver.
 
     Args:
-        xb_states: (n_thick, n_crowns, n_xb_per_crown) XB states (1-6)
+        xb_states: (n_thick, n_crowns, n_xb_per_crown) XB states (0-5)
         xb_bound_to: (n_thick, n_crowns, n_xb_per_crown) site indices (-1 unbound)
         positions_thick: (n_thick, n_crowns) crown axial positions
         positions_thin: (n_thin, n_sites) binding site axial positions
@@ -676,7 +676,7 @@ def _xb_radial_force_total(
     xb_positions_flat = jnp.repeat(positions_thick.reshape(-1), n_xb_per_crown)
     positions_thin_flat = positions_thin.reshape(-1)
 
-    is_bound = (xb_states_flat >= 2) & (xb_states_flat <= 4) & (xb_bound_flat >= 0)
+    is_bound = (xb_states_flat >= 1) & (xb_states_flat <= 3) & (xb_bound_flat >= 0)
 
     thin_idx = topology.xb_to_thin_id
     site_idx = xb_bound_flat
@@ -693,7 +693,7 @@ def _xb_radial_force_total(
     sin_theta = lattice_spacing / r_safe
     theta = jnp.arctan2(lattice_spacing, x_dist)
 
-    is_strong = (xb_states_flat == 3) | (xb_states_flat == 4)
+    is_strong = (xb_states_flat == 2) | (xb_states_flat == 3)
     c_rest = jnp.where(is_strong, params.xb_c_rest_strong, params.xb_c_rest_weak)
     c_k = jnp.where(is_strong, params.xb_c_k_strong, params.xb_c_k_weak)
     g_rest = jnp.where(is_strong, params.xb_g_rest_strong, params.xb_g_rest_weak)

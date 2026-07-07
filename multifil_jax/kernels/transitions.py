@@ -53,11 +53,11 @@ if TYPE_CHECKING:
 
 # Import rate functions and energy calculations
 from .rate_functions import (
-    tm_rate_12, tm_rate_21, tm_rate_23, tm_rate_32,
-    tm_rate_34, tm_rate_43, tm_rate_41,
-    xb_rate_12, xb_rate_21, xb_rate_23, xb_rate_32,
-    xb_rate_34, xb_rate_43, xb_rate_45, xb_rate_54,
-    xb_rate_51, xb_rate_15, xb_rate_61, xb_rate_16,
+    tm_rate_01, tm_rate_10, tm_rate_12, tm_rate_21,
+    tm_rate_23, tm_rate_32, tm_rate_30,
+    xb_rate_01, xb_rate_10, xb_rate_12, xb_rate_21,
+    xb_rate_23, xb_rate_32, xb_rate_34, xb_rate_43,
+    xb_rate_40, xb_rate_04, xb_rate_50, xb_rate_05,
     compute_xb_energies,
 )
 
@@ -154,8 +154,8 @@ def expm_pade6_batch(
 # OPTIMIZED RATE MATRIX CONSTRUCTION
 # ============================================================================
 
-def _build_tm_Q_matrix_optimized(k_11, k_12, k_21, k_22, k_23,
-                                  k_32, k_33, k_34, k_41, k_43, k_44):
+def _build_tm_Q_matrix_optimized(k_00, k_01, k_10, k_11, k_12,
+                                  k_21, k_22, k_23, k_30, k_32, k_33):
     """Build TM rate matrices efficiently using jnp.stack.
 
     The TM cycle is 0↔1↔2↔3↔0; there is no direct 0→3 transition,
@@ -167,14 +167,14 @@ def _build_tm_Q_matrix_optimized(k_11, k_12, k_21, k_22, k_23,
     Returns:
         Q: (n_configs, 4, 4) rate matrices
     """
-    n = k_11.shape[0]
+    n = k_00.shape[0]
     zeros = jnp.zeros(n)
 
     # Build each row as (n, 4)
-    row0 = jnp.stack([k_11, k_12, zeros, zeros], axis=1)
-    row1 = jnp.stack([k_21, k_22, k_23, zeros], axis=1)
-    row2 = jnp.stack([zeros, k_32, k_33, k_34], axis=1)
-    row3 = jnp.stack([k_41, zeros, k_43, k_44], axis=1)
+    row0 = jnp.stack([k_00, k_01, zeros, zeros], axis=1)
+    row1 = jnp.stack([k_10, k_11, k_12, zeros], axis=1)
+    row2 = jnp.stack([zeros, k_21, k_22, k_23], axis=1)
+    row3 = jnp.stack([k_30, zeros, k_32, k_33], axis=1)
 
     # Stack rows to form (n, 4, 4)
     Q = jnp.stack([row0, row1, row2, row3], axis=1)
@@ -182,9 +182,9 @@ def _build_tm_Q_matrix_optimized(k_11, k_12, k_21, k_22, k_23,
     return Q
 
 
-def _build_xb_Q_matrix_optimized(r11, r12, r15, r16, r21, r22, r23,
-                                  r32, r33, r34, r43, r44, r45,
-                                  r51, r54, r55, r61, r66):
+def _build_xb_Q_matrix_optimized(r00, r01, r04, r05, r10, r11, r12,
+                                  r21, r22, r23, r32, r33, r34,
+                                  r40, r43, r44, r50, r55):
     """Build XB rate matrices efficiently using jnp.stack.
 
     This replaces the chain of .at[].set() calls with a single construction.
@@ -195,27 +195,27 @@ def _build_xb_Q_matrix_optimized(r11, r12, r15, r16, r21, r22, r23,
     Returns:
         Q: (n_xb, 6, 6) rate matrices
     """
-    n_xb = r11.shape[0]
+    n_xb = r00.shape[0]
     zeros = jnp.zeros(n_xb)
 
     # Build each row as (n_xb, 6)
-    # Row 0 (state 1 = DRX): can go to states 2, 5, 6
-    row0 = jnp.stack([r11, r12, zeros, zeros, r15, r16], axis=1)
+    # Row 0 (state 0 = DRX): can go to states 1, 4, 5
+    row0 = jnp.stack([r00, r01, zeros, zeros, r04, r05], axis=1)
 
-    # Row 1 (state 2 = loose): can go to states 1, 3
-    row1 = jnp.stack([r21, r22, r23, zeros, zeros, zeros], axis=1)
+    # Row 1 (state 1 = loose): can go to states 0, 2
+    row1 = jnp.stack([r10, r11, r12, zeros, zeros, zeros], axis=1)
 
-    # Row 2 (state 3 = tight_1): can go to states 2, 4
-    row2 = jnp.stack([zeros, r32, r33, r34, zeros, zeros], axis=1)
+    # Row 2 (state 2 = tight_1): can go to states 1, 3
+    row2 = jnp.stack([zeros, r21, r22, r23, zeros, zeros], axis=1)
 
-    # Row 3 (state 4 = tight_2): can go to states 3, 5
-    row3 = jnp.stack([zeros, zeros, r43, r44, r45, zeros], axis=1)
+    # Row 3 (state 3 = tight_2): can go to states 2, 4
+    row3 = jnp.stack([zeros, zeros, r32, r33, r34, zeros], axis=1)
 
-    # Row 4 (state 5 = free_2): can go to states 1, 4
-    row4 = jnp.stack([r51, zeros, zeros, r54, r55, zeros], axis=1)
+    # Row 4 (state 4 = free_2): can go to states 0, 3
+    row4 = jnp.stack([r40, zeros, zeros, r43, r44, zeros], axis=1)
 
-    # Row 5 (state 6 = SRX): can go to state 1
-    row5 = jnp.stack([r61, zeros, zeros, zeros, zeros, r66], axis=1)
+    # Row 5 (state 5 = SRX): can go to state 0
+    row5 = jnp.stack([r50, zeros, zeros, zeros, zeros, r55], axis=1)
 
     # Stack rows to form (n_xb, 6, 6)
     Q = jnp.stack([row0, row1, row2, row3, row4, row5], axis=1)
@@ -280,37 +280,37 @@ def _compute_unique_tm_Q_matrices(ca_concentration: float,
             Q_unique[1] = cooperative Q matrix
     """
     # Get rate constants from params (attribute access)
-    K1 = params.tm_K1
-    K2 = params.tm_K2
-    K3 = params.tm_K3
+    Keq_01 = params.tm_Keq_01
+    Keq_12 = params.tm_Keq_12
+    Keq_23 = params.tm_Keq_23
+    k_01_base = params.tm_k_01
     k_12_base = params.tm_k_12
     k_23_base = params.tm_k_23
-    k_34_base = params.tm_k_34
-    k_41_base = params.tm_k_41
+    k_30_base = params.tm_k_30
 
     # Per-config cooperativity factors (index 0 = non-coop, 1 = coop)
     coop = jnp.array([1.0, coop_magnitude], dtype=jnp.float32)
 
     # Forward rates (per-config)
-    k_12 = k_12_base * ca_concentration * coop
+    k_01 = k_01_base * ca_concentration * coop
+    k_12 = k_12_base * coop
     k_23 = k_23_base * coop
-    k_34 = k_34_base * coop
-    k_41 = jnp.broadcast_to(k_41_base, (2,))  # not coop-modulated
+    k_30 = jnp.broadcast_to(k_30_base, (2,))  # not coop-modulated
 
     # Backward rates (detailed balance, identical across configs)
-    k_21 = jnp.broadcast_to(k_12_base / K1, (2,))
-    k_32 = jnp.broadcast_to(k_23_base / K2, (2,))
-    k_43 = jnp.broadcast_to(k_34_base / K3, (2,))
+    k_10 = jnp.broadcast_to(k_01_base / Keq_01, (2,))
+    k_21 = jnp.broadcast_to(k_12_base / Keq_12, (2,))
+    k_32 = jnp.broadcast_to(k_23_base / Keq_23, (2,))
 
     # Diagonal rates
-    k_11 = -k_12
+    k_00 = -k_01
+    k_11 = -(k_10 + k_12)
     k_22 = -(k_21 + k_23)
-    k_33 = -(k_32 + k_34)
-    k_44 = -(k_41 + k_43)
+    k_33 = -(k_30 + k_32)
 
     return _build_tm_Q_matrix_optimized(
-        k_11, k_12, k_21, k_22, k_23,
-        k_32, k_33, k_34, k_41, k_43, k_44,
+        k_00, k_01, k_10, k_11, k_12,
+        k_21, k_22, k_23, k_30, k_32, k_33,
     )
 
 
@@ -319,7 +319,8 @@ def thin_transitions(state: 'State',
                     topology: 'SarcTopology',
                     rng_key: jax.random.PRNGKey,
                     dt: float,
-                    random_values: Optional[jnp.ndarray] = None) -> Tuple['State', jnp.ndarray]:
+                    random_values: Optional[jnp.ndarray] = None,
+                    tm_subpop=None) -> Tuple['State', jnp.ndarray]:
     """Perform tropomyosin state transitions for all binding sites.
 
     OPTIMIZED: Instead of computing N matrix exponentials (one per site),
@@ -335,10 +336,14 @@ def thin_transitions(state: 'State',
         rng_key: JAX random key
         dt: Timestep length (ms)
         random_values: Optional pre-generated random values (for testing)
+        tm_subpop: Optional (mode, constants_k, extra) subpopulation pair; None
+            runs the standard single-population path verbatim. mean_field
+            weight-sums the per-population unique-Q matrices before one exp;
+            explicit exponentiates each and selects per-site by INT label.
 
     Returns:
         new_state: Updated state with new tm_states
-        P_unique: (2, 4, 4) the unique P matrices used (for validation)
+        P_unique: the unique P matrices used (for validation)
     """
     tm_states = state.thin.tm_states
     is_cooperative = state.thin.subject_to_coop
@@ -356,19 +361,33 @@ def thin_transitions(state: 'State',
 
     # Calculate ca_concentration from pCa (pCa is the user-facing variable)
     ca_conc = 10.0 ** (-constants.pCa)
-    coop_magnitude = constants.tm_coop_magnitude
 
-    # OPTIMIZATION: Compute only 2 unique Q matrices
-    Q_unique = _compute_unique_tm_Q_matrices(ca_conc, coop_magnitude, constants)
-
-    # Compute P = exp(Q * dt) for both configurations
-    P_unique = expm_pade6_batch(Q_unique * dt, identity=eye_4)  # (2, 4, 4)
-
-    # Map each site to its P matrix (0 = non-coop, 1 = coop)
+    # Map each site to its config (0 = non-coop, 1 = coop)
     config_idx = is_coop_flat.astype(jnp.int32)  # (n_sites_total,)
 
-    # Get P matrix for each site via indexing
-    P_indexed = P_unique[config_idx]  # (n_sites_total, 4, 4)
+    if tm_subpop is None:
+        # OPTIMIZATION: Compute only 2 unique Q matrices, then P = exp(Q*dt)
+        Q_unique = _compute_unique_tm_Q_matrices(ca_conc, constants.tm_coop_magnitude, constants)
+        P_unique = expm_pade6_batch(Q_unique * dt, identity=eye_4)  # (2, 4, 4)
+        P_indexed = P_unique[config_idx]  # (n_sites_total, 4, 4)
+    else:
+        mode, constants_k, extra = tm_subpop
+        # Per-population unique-Q matrices (each (2, 4, 4)); coop magnitude is
+        # per-population so a subpop may scale tm_coop_magnitude too.
+        Q_k = [_compute_unique_tm_Q_matrices(ca_conc, ck.tm_coop_magnitude, ck)
+               for ck in constants_k]
+        if mode == 'mean_field':
+            fractions = extra  # (K,)
+            Q_eff = sum(fractions[k] * Q_k[k] for k in range(len(constants_k)))
+            P_unique = expm_pade6_batch(Q_eff * dt, identity=eye_4)  # (2, 4, 4)
+            P_indexed = P_unique[config_idx]
+        else:  # explicit mixture: per-site label select
+            labels = extra  # (n_sites_total,) INT in [0, K)
+            Q_stack = jnp.stack(Q_k)  # (K, 2, 4, 4)
+            Kp = Q_stack.shape[0]
+            P_unique = expm_pade6_batch(
+                Q_stack.reshape(Kp * 2, 4, 4) * dt, identity=eye_4).reshape(Kp, 2, 4, 4)
+            P_indexed = P_unique[labels, config_idx]  # (n_sites_total, 4, 4)
 
     # Get probability vectors for current states
     current_states = tm_states_flat.astype(jnp.int32)
@@ -401,6 +420,155 @@ def thin_transitions(state: 'State',
     new_state = state._replace(thin=new_thin)
 
     return new_state, P_unique
+
+
+# ============================================================================
+# SYMMETRIC ISING TM TRANSITIONS (alternative coop path; ising_coop=True)
+# ============================================================================
+#
+# Math: per-site local field in kT units, counted from same-chain neighbors
+# within fixed span SPAN_ISING_NM (28 nm radius, Tanner 2012 9-actin RUspan):
+#     h(i) = J_C * n_2(i) + J_M * n_3(i) - 0.5*(J_C+J_M) * n_closed(i)
+# where n_2, n_3, n_closed are direct counts (each capped at 2 for indexing).
+# Glauber-symmetric: forward rates × exp(+h/2), backward × exp(-h/2). Defaults
+# J_C = J_M = 0 ⇒ h = 0 ⇒ no boost ⇒ matches the non-coop baseline.
+#
+# Reduces correctly to standard 1D Ising at J_C = J_M = J:
+#   h = J * (n_open - n_closed)
+#
+# Indexing: 27 unique Q matrices for (n_2, n_3, n_closed) ∈ {0,1,2}³.
+
+SPAN_ISING_NM = 28.0      # nm radius — Tanner 2012 9-actin RUspan (50 nm total)
+
+
+def _compute_unique_tm_Q_matrices_ising(ca_concentration: float,
+                                         J_C: float,
+                                         J_M: float,
+                                         params) -> jnp.ndarray:
+    """Compute 27 unique TM Q matrices for (n_2, n_3, n_closed) ∈ {0,1,2}³.
+
+    Returns:
+        Q_unique: (3, 3, 3, 4, 4) — Q_unique[n_2, n_3, n_closed]
+        is the Q matrix for a site with that neighbor composition (each capped at 2).
+    """
+    Keq_01 = params.tm_Keq_01
+    Keq_12 = params.tm_Keq_12
+    Keq_23 = params.tm_Keq_23
+    k_01_base = params.tm_k_01
+    k_12_base = params.tm_k_12
+    k_23_base = params.tm_k_23
+    k_30_base = params.tm_k_30
+
+    # 27 configurations as flat arrays (index = n_2*9 + n_3*3 + n_closed)
+    levels = jnp.array([0, 1, 2], dtype=jnp.float32)
+    n2g, n3g, ncg = jnp.meshgrid(levels, levels, levels, indexing='ij')
+    n_2_flat = n2g.reshape(-1)
+    n_3_flat = n3g.reshape(-1)
+    n_c_flat = ncg.reshape(-1)
+
+    h = J_C * n_2_flat + J_M * n_3_flat - 0.5 * (J_C + J_M) * n_c_flat
+    forward_boost = jnp.exp(0.5 * h)    # (27,)
+    backward_boost = jnp.exp(-0.5 * h)  # (27,)
+
+    # Boost ALL three forward TM transitions (0→1 Ca-bind, 1→2 intermediate shift,
+    # 2→3 TM-to-M-position) and their backwards symmetrically. State 3 = M-position
+    # (TM open, available for XB binding). The cycle-close step k_30 stays at base
+    # — slowing it produces anti-cooperative cascade behavior (verified empirically).
+    # This is the original Tanner 2012 prescription (Ψ on r_{t,12} and r_{t,23}),
+    # plus the Ca-binding step, applied Glauber-symmetrically.
+    k_01 = (k_01_base * ca_concentration) * forward_boost
+    k_12 = k_12_base * forward_boost
+    k_23 = k_23_base * forward_boost
+    k_30 = jnp.broadcast_to(k_30_base, (27,))
+
+    k_10 = (k_01_base / Keq_01) * backward_boost
+    k_21 = (k_12_base / Keq_12) * backward_boost
+    k_32 = (k_23_base / Keq_23) * backward_boost
+
+    # Diagonals
+    k_00 = -k_01
+    k_11 = -(k_10 + k_12)
+    k_22 = -(k_21 + k_23)
+    k_33 = -(k_30 + k_32)
+
+    Q_flat = _build_tm_Q_matrix_optimized(
+        k_00, k_01, k_10, k_11, k_12,
+        k_21, k_22, k_23, k_30, k_32, k_33,
+    )  # (27, 4, 4)
+
+    return Q_flat.reshape(3, 3, 3, 4, 4)
+
+
+def thin_transitions_ising(state: 'State',
+                           constants: 'DynamicParams',
+                           topology: 'SarcTopology',
+                           rng_key: jax.random.PRNGKey,
+                           dt: float,
+                           random_values: Optional[jnp.ndarray] = None) -> Tuple['State', jnp.ndarray]:
+    """TM transitions with symmetric Ising cooperativity (J_C, J_M).
+
+    Parallel to thin_transitions(); does NOT consume state.thin.subject_to_coop
+    (computes its own neighbor indices). Uses 9 unique Q matrices indexed by
+    (n_2, n_3) where each is capped at 2.
+
+    Returns:
+        new_state: state with updated tm_states
+        P_unique: (9, 4, 4) the unique P matrices used (for validation)
+    """
+    # Local import to avoid circular ref at module load
+    from multifil_jax.kernels.cooperativity import count_neighbor_states_split
+
+    tm_states = state.thin.tm_states     # (n_thin, n_sites) int8
+    thin_axial = state.thin.axial        # (n_thin, n_sites)
+    tm_chains = topology.tm_chains       # (n_thin, n_sites)
+    bound_to = state.thin.bound_to
+    eye_4 = topology.eye_4
+
+    is_bound = bound_to >= 0
+    n_thin, n_sites = tm_states.shape
+    n_sites_total = n_thin * n_sites
+
+    ca_conc = 10.0 ** (-constants.pCa)
+    J_C = constants.tm_J_C
+    J_M = constants.tm_J_M
+
+    # Build 27 unique Q matrices, then expm in one batch
+    Q_unique = _compute_unique_tm_Q_matrices_ising(ca_conc, J_C, J_M, constants)
+    Q_flat = Q_unique.reshape(27, 4, 4)
+    P_flat = expm_pade6_batch(Q_flat * dt, identity=eye_4)  # (27, 4, 4)
+
+    # Per-filament neighbor counts (each function call processes one strand)
+    def _counts_for_strand(states_row, pos_row, chains_row):
+        return count_neighbor_states_split(states_row, pos_row, SPAN_ISING_NM, chains_row)
+
+    n_2, n_3, n_c = jax.vmap(_counts_for_strand)(tm_states, thin_axial, tm_chains)
+    # all shape (n_thin, n_sites), int32 capped at 2
+
+    config_idx = (n_2 * 9 + n_3 * 3 + n_c).reshape(-1)  # (n_sites_total,) int32
+    P_indexed = P_flat[config_idx]                       # (n_sites_total, 4, 4)
+
+    tm_states_flat = tm_states.reshape(-1).astype(jnp.int32)
+    is_bound_flat = is_bound.reshape(-1)
+
+    prob_vectors = jax.vmap(lambda P, s: P[s])(P_indexed, tm_states_flat)
+
+    # Locked: in state 3 AND bound to XB → stay in state 3
+    locked_mask = (tm_states_flat == 3) & is_bound_flat
+    locked_prob = jnp.array([0.0, 0.0, 0.0, 1.0])
+    prob_vectors = jnp.where(locked_mask[:, None], locked_prob, prob_vectors)
+
+    if random_values is None:
+        rng_key, subkey = jax.random.split(rng_key)
+        random_values = jax.random.uniform(subkey, shape=(n_sites_total,))
+
+    cum_probs = jnp.cumsum(prob_vectors, axis=1)
+    new_states = jnp.argmax(random_values[:, None] < cum_probs, axis=1)
+
+    new_tm_states = new_states.reshape(n_thin, n_sites).astype(jnp.int8)
+    new_thin = state.thin._replace(tm_states=new_tm_states)
+    new_state = state._replace(thin=new_thin)
+
+    return new_state, P_flat
 
 
 # ============================================================================
@@ -485,7 +653,7 @@ def xb_rate_matrix(xb_distances: jnp.ndarray,
     U_tight_2 = U_tight_2_base + E_strong
 
     # Calculate forces for force-dependent rates
-    f_3_4 = g_k_strong * (r - g_r_strong) + (1.0/r) * c_k_strong * (theta - c_r_strong)
+    f_strong = g_k_strong * (r - g_r_strong) + (1.0/r) * c_k_strong * (theta - c_r_strong)
 
     # ========================================================================
     # RATE DEFINITIONS using consolidated params and imported rate functions
@@ -494,14 +662,14 @@ def xb_rate_matrix(xb_distances: jnp.ndarray,
     ones = jnp.ones(n_xb)
 
     # Get consolidated rate coefficients from params (attribute access)
-    # These already include the multipliers (e.g., xb_r12_coeff = mh_br * tau)
+    # These already include the multipliers (e.g., xb_r01_coeff = mh_br * tau)
+    r01_coeff = params.xb_r01_coeff
     r12_coeff = params.xb_r12_coeff
     r23_coeff = params.xb_r23_coeff
     r34_coeff = params.xb_r34_coeff
-    r45_coeff = params.xb_r45_coeff
-    r51_rate = params.xb_r51
-    r15_rate = params.xb_r15
-    r16_rate = params.xb_r16
+    r40_rate = params.xb_r40
+    r04_rate = params.xb_r04
+    r05_rate = params.xb_r05
 
     # SRX parameters
     srx_k0 = params.xb_srx_k0
@@ -510,74 +678,65 @@ def xb_rate_matrix(xb_distances: jnp.ndarray,
     srx_ca50 = params.xb_srx_ca50
 
     # DRX (1) <-> loose (2) using imported rate functions
-    r12 = xb_rate_12(permissiveness, r12_coeff, E_weak)
-    r21 = xb_rate_21(r12, U_DRX, U_loose)
+    r01 = xb_rate_01(permissiveness, r01_coeff, E_weak)
+    r10 = xb_rate_10(r01, U_DRX, U_loose)
 
     # loose (2) <-> tight_1 (3)
-    r23 = xb_rate_23(r23_coeff, E_diff)
-    r32 = xb_rate_32(r23, U_loose, U_tight_1)
+    r12 = xb_rate_12(r12_coeff, E_diff)
+    r21 = xb_rate_21(r12, U_loose, U_tight_1)
 
     # tight_1 (3) <-> tight_2 (4)
-    r34 = xb_rate_34(r34_coeff, f_3_4, params.xb_delta_34, k_t)
-    r43 = xb_rate_43(r34, U_tight_1, U_tight_2)
+    r23 = xb_rate_23(r23_coeff, f_strong, params.xb_delta_23, k_t)
+    r32 = xb_rate_32(r23, U_tight_1, U_tight_2)
 
     # tight_2 (4) <-> free_2 (5)
-    r45 = xb_rate_45(r45_coeff, f_3_4, params.xb_delta_45, k_t)
-    r54 = xb_rate_54() * ones  # Always 0
+    r34 = xb_rate_34(r34_coeff, f_strong, params.xb_delta_34, k_t)
+    r43 = xb_rate_43() * ones  # Always 0
 
     # free_2 (5) <-> DRX (1)
-    r51 = xb_rate_51(r51_rate) * ones
-    r15 = xb_rate_15(r15_rate) * ones
+    r40 = xb_rate_40(r40_rate) * ones
+    r04 = xb_rate_04(r04_rate) * ones
 
     # SRX (6) <-> DRX (1)
-    r61 = xb_rate_61(ca_concentration, srx_k0, srx_kmax, srx_b, srx_ca50) * ones
-    r16 = xb_rate_16(r16_rate) * ones
+    r50 = xb_rate_50(ca_concentration, srx_k0, srx_kmax, srx_b, srx_ca50) * ones
+    r05 = xb_rate_05(r05_rate) * ones
 
     # Diagonal rates: row sums must be zero for valid rate matrices
     # Direct arithmetic — avoids vmap+stack overhead (ordered_sum was just jnp.sum)
-    r11 = -(r12 + r15 + r16)
+    r00 = -(r01 + r04 + r05)
+    r11 = -(r10 + r12)
     r22 = -(r21 + r23)
     r33 = -(r32 + r34)
-    r44 = -(r43 + r45)
-    r55 = -(r54 + r51)
-    r66 = -r61
+    r44 = -(r43 + r40)
+    r55 = -r50
 
     # ========================================================================
     # CONSTRUCT Q MATRICES (optimized - single construction instead of .at[].set())
     # ========================================================================
 
-    Q = _build_xb_Q_matrix_optimized(r11, r12, r15, r16, r21, r22, r23,
-                                      r32, r33, r34, r43, r44, r45,
-                                      r51, r54, r55, r61, r66)
+    Q = _build_xb_Q_matrix_optimized(r00, r01, r04, r05, r10, r11, r12,
+                                      r21, r22, r23, r32, r33, r34,
+                                      r40, r43, r44, r50, r55)
 
     return Q
 
 
-def compute_xb_transition_matrices(
+def _build_xb_Q_bins(
     state: 'State',
     constants: 'DynamicParams',
     topology: 'SarcTopology',
-    dt: float,
-) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Compute per-XB Q, P, and P_abs matrices via binned expm.
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Build the pre-exponential binned XB rate matrices and per-XB bin key.
 
-    Shared by thick_transitions() (for state sampling) and
-    compute_all_metrics() (for ATP expected metrics).
-
-    Instead of computing one expm per XB (n_xb_total calls), computes expm
-    for 2*n_xb_bins positions (n_bins AP=0 + n_bins AP=1) then gathers per-XB
-    via bin index lookup. Reduces expm calls by ~6× at 4×4, 71% of step time.
-
-    Args:
-        state: Current State NamedTuple
-        constants: DynamicParams with physics values
-        topology: SarcTopology with xb_bin_edges, xb_bin_centers, eye_6
-        dt: Timestep length (ms)
+    Q_bins depends on constants (rates + lattice_spacing); the per-XB gather key
+    depends only on state geometry + permissiveness, so it is shared across
+    subpopulations (which differ in rates only). Splitting the exp/gather out of
+    the Q construction lets both subpopulation modes operate on the pre-exp Q_bins
+    (averaged: weight-sum then one exp; explicit: exp each then per-XB select).
 
     Returns:
-        Q_all:    (n_xb_total, 6, 6) rate matrices per crossbridge
-        P_all:    (n_xb_total, 6, 6) transition probability matrices per crossbridge
-        P_abs_all:(n_xb_total, 6, 6) absorbing-state P (row 4 zeroed) for ATP metrics
+        Q_bins: (2*n_bins, 6, 6) rate matrices (AP=0 block then AP=1 block)
+        key:    (n_xb_total,) index into Q_bins for each crossbridge
     """
     xb_states = state.thick.xb_states
     n_thick, n_crowns, n_xb_per_crown = xb_states.shape
@@ -633,12 +792,6 @@ def compute_xb_transition_matrices(
     # Layout: [0..n_bins-1] = AP=0, [n_bins..2*n_bins-1] = AP=1
     Q_bins = jnp.concatenate([Q_ap0, Q_ap1], axis=0)         # (2*n_bins, 6, 6)
 
-    P_bins = matrix_exponential_batch(Q_bins, dt, identity=topology.eye_6)
-
-    # Absorbing-state version: zero row 4 so state 5 cannot exit (ATP metric)
-    Q_abs_bins = Q_bins.at[:, 4, :].set(0.0)
-    P_abs_bins = matrix_exponential_batch(Q_abs_bins, dt, identity=topology.eye_6)
-
     # Assign each XB to a bin via digitize + clip
     x_axial = xb_distances_flat[:, 0]                              # (n_xb_total,)
     bin_idx = jnp.digitize(x_axial, topology.xb_bin_edges) - 1    # in [-1, n_bins]
@@ -647,11 +800,85 @@ def compute_xb_transition_matrices(
     ap  = permissiveness.astype(jnp.int32)                         # 0 or 1
     key = ap * n_bins + bin_idx                                    # in [0, 2*n_bins)
 
-    Q_all     = Q_bins[key]      # (n_xb_total, 6, 6)
-    P_all     = P_bins[key]      # (n_xb_total, 6, 6)
-    P_abs_all = P_abs_bins[key]  # (n_xb_total, 6, 6)
+    return Q_bins, key
 
-    return Q_all, P_all, P_abs_all
+
+def _xb_P_from_Q_bins(
+    Q_bins: jnp.ndarray,
+    key: jnp.ndarray,
+    dt: float,
+    eye_6: jnp.ndarray,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """exp the binned Q matrices and gather per-XB (Q, P, absorbing-P)."""
+    P_bins = matrix_exponential_batch(Q_bins, dt, identity=eye_6)
+
+    # Absorbing-state version: zero row 4 so state 5 cannot exit (ATP metric)
+    Q_abs_bins = Q_bins.at[:, 4, :].set(0.0)
+    P_abs_bins = matrix_exponential_batch(Q_abs_bins, dt, identity=eye_6)
+
+    return Q_bins[key], P_bins[key], P_abs_bins[key]
+
+
+def compute_xb_transition_matrices(
+    state: 'State',
+    constants: 'DynamicParams',
+    topology: 'SarcTopology',
+    dt: float,
+    xb_subpop=None,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Compute per-XB Q, P, and P_abs matrices via binned expm.
+
+    Shared by thick_transitions() (for state sampling) and
+    compute_all_metrics() (for ATP expected metrics).
+
+    Instead of computing one expm per XB (n_xb_total calls), computes expm
+    for 2*n_xb_bins positions (n_bins AP=0 + n_bins AP=1) then gathers per-XB
+    via bin index lookup. Reduces expm calls by ~6× at 4×4, 71% of step time.
+
+    Args:
+        state: Current State NamedTuple
+        constants: DynamicParams with physics values
+        topology: SarcTopology with xb_bin_edges, xb_bin_centers, eye_6
+        dt: Timestep length (ms)
+        xb_subpop: None for the standard single-population path, or a tuple
+            (mode, constants_k, extra) for subpopulations. constants_k is a
+            length-K list of DynamicParams (population 0 = WT). For
+            mode=='mean_field', extra is a (K,) fractions vector and the K
+            binned generators are weight-summed before a single exp
+            (Q_eff = Σ f_k Q_k). For mode=='explicit', extra is a (n_xb_total,)
+            INT label array and each population is exponentiated then selected
+            per-XB by (label, bin). The gather key is shared across populations
+            (it depends on geometry/permissiveness, not rates).
+
+    Returns:
+        Q_all:    (n_xb_total, 6, 6) rate matrices per crossbridge
+        P_all:    (n_xb_total, 6, 6) transition probability matrices per crossbridge
+        P_abs_all:(n_xb_total, 6, 6) absorbing-state P (row 4 zeroed) for ATP metrics
+    """
+    if xb_subpop is None:
+        Q_bins, key = _build_xb_Q_bins(state, constants, topology)
+        return _xb_P_from_Q_bins(Q_bins, key, dt, topology.eye_6)
+
+    mode, constants_k, extra = xb_subpop
+    eye_6 = topology.eye_6
+    built = [_build_xb_Q_bins(state, ck, topology) for ck in constants_k]
+    key = built[0][1]  # shared across populations (geometry/permissiveness only)
+
+    if mode == 'mean_field':
+        fractions = extra  # (K,)
+        Q_eff = sum(fractions[k] * built[k][0] for k in range(len(constants_k)))
+        return _xb_P_from_Q_bins(Q_eff, key, dt, eye_6)
+
+    # explicit mixture: exponentiate each population, select per-XB by label
+    labels = extra  # (n_xb_total,) INT in [0, K)
+    Q_stack = jnp.stack([b[0] for b in built])          # (K, 2*n_bins, 6, 6)
+    K, nb2 = Q_stack.shape[0], Q_stack.shape[1]
+    P_stack = matrix_exponential_batch(
+        Q_stack.reshape(K * nb2, 6, 6), dt, identity=eye_6).reshape(K, nb2, 6, 6)
+    Q_abs = Q_stack.at[:, :, 4, :].set(0.0)
+    P_abs_stack = matrix_exponential_batch(
+        Q_abs.reshape(K * nb2, 6, 6), dt, identity=eye_6).reshape(K, nb2, 6, 6)
+    return Q_stack[labels, key], P_stack[labels, key], P_abs_stack[labels, key]
 
 
 def thick_transitions(state: 'State',
@@ -659,7 +886,8 @@ def thick_transitions(state: 'State',
                      topology: 'SarcTopology',
                      rng_key: jax.random.PRNGKey,
                      dt: float,
-                     random_values: Optional[jnp.ndarray] = None):
+                     random_values: Optional[jnp.ndarray] = None,
+                     xb_subpop=None):
     """Perform crossbridge state transitions for all crossbridges.
 
     Computes one Q→P matrix per crossbridge using exact distances.
@@ -672,6 +900,9 @@ def thick_transitions(state: 'State',
         rng_key: JAX random key
         dt: Timestep length (ms)
         random_values: Optional pre-generated random values (for testing)
+        xb_subpop: Optional (mode, constants_k, extra) subpopulation pair; None
+            runs the standard single-population path verbatim (zero overhead).
+            See compute_xb_transition_matrices for the tuple contract.
 
     Returns:
         new_state: Updated State with new crossbridge states and binding
@@ -684,11 +915,12 @@ def thick_transitions(state: 'State',
     xb_states_flat = xb_states.reshape(-1)  # (n_thick * n_crowns * 3,)
     n_xb_total = xb_states_flat.shape[0]
 
-    # Compute per-XB Q/P matrices via shared helper
-    _Q_all, P_all, _P_abs = compute_xb_transition_matrices(state, constants, topology, dt)
+    # Compute per-XB Q/P matrices via shared helper (subpop-aware)
+    _Q_all, P_all, _P_abs = compute_xb_transition_matrices(
+        state, constants, topology, dt, xb_subpop=xb_subpop)
 
     # Sample new states (same logic as thin_transitions)
-    current_states = (xb_states_flat - 1).astype(jnp.int32)  # States are 1-6, indices are 0-5
+    current_states = xb_states_flat.astype(jnp.int32)
 
     # Get probability vectors — index directly into P_all using current state
     prob_vectors = jax.vmap(lambda P, s: P[s])(P_all, current_states)  # (n_xb_total, 6)
@@ -717,7 +949,7 @@ def thick_transitions(state: 'State',
 
     cum_probs = jnp.cumsum(prob_vectors, axis=1)
     new_states_indices = jnp.argmax(random_values[:, None] < cum_probs, axis=1)
-    new_states = new_states_indices + 1  # Convert back to 1-6
+    new_states = new_states_indices
 
     # Reshape back — cast to int8 to match ThickState.xb_states dtype
     new_xb_states = new_states.reshape(n_thick, n_crowns, n_xb_per_crown).astype(jnp.int8)
@@ -728,8 +960,8 @@ def thick_transitions(state: 'State',
     old_states_flat = xb_states_flat
     new_states_flat = new_states
 
-    old_is_bound = (old_states_flat >= 2) & (old_states_flat <= 4)
-    new_is_bound = (new_states_flat >= 2) & (new_states_flat <= 4)
+    old_is_bound = (old_states_flat >= 1) & (old_states_flat <= 3)
+    new_is_bound = (new_states_flat >= 1) & (new_states_flat <= 3)
 
     is_binding = (~old_is_bound) & new_is_bound
     is_unbinding = old_is_bound & (~new_is_bound)
@@ -776,10 +1008,10 @@ def thick_transitions(state: 'State',
         new_xb_bound_to = new_xb_bound_to_flat.reshape(n_thick, n_crowns, n_xb_per_crown)
         new_thin_bound_to = new_thin_bound_to_flat.reshape(n_thin, n_sites)
 
-        # If binding failed (site occupied), revert to DRX state (state 1)
+        # If binding failed (site occupied), revert to DRX state (state 0)
         new_states_flat = jnp.where(
             is_binding & (~can_bind),
-            1,
+            0,
             new_states_flat
         )
         new_xb_states = new_states_flat.reshape(n_thick, n_crowns, n_xb_per_crown).astype(jnp.int8)

@@ -34,10 +34,7 @@ Thumbs.db
 reference_files/
 
 # Exploration / development folders (local only, not part of repo)
-benchmarking/
-fitting_examples/
-notebooks/
-examples/asymptote_testing/
+local_projects/
 
 # Generated output images
 examples/*.png

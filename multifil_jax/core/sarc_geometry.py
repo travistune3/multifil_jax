@@ -309,8 +309,12 @@ class SarcTopology:
             dynamic_params: DynamicParams with physical parameters
             periodic: Whether to use periodic boundary conditions
             lattice_spacing: Lattice spacing in nm (for adaptive binning)
-            thin_starts: Optional list of helical twist start offsets (0-25)
-            thick_starts: Optional list of crown level start offsets (1-3)
+            thin_starts: Optional list of helical twist start offsets (0-25).
+                Omit (None) for the default deterministic unbiased spread; pass a
+                list of length n_thin to override (must match n_thin or ValueError).
+            thick_starts: Optional list of crown level start offsets (1-3).
+                Omit (None) for the default deterministic unbiased spread; pass a
+                list of length n_thick to override (must match n_thick or ValueError).
 
         Returns:
             SarcTopology ready for device_put
@@ -327,10 +331,12 @@ class SarcTopology:
         thick_positions, box_x, box_y = _generate_hexagonal_thick_positions(nrows, ncols)
         n_thick = len(thick_positions)
 
-        # Generate thick_starts if not provided
+        # thick_starts: default deterministic unbiased spread, else validated override
         if thick_starts is None:
-            thick_starts_arr = np.random.randint(1, 4, size=n_thick)
+            thick_starts_arr = _spread_starts(n_thick, 1, 4)
         else:
+            if len(thick_starts) != n_thick:
+                raise ValueError(f"thick_starts must have length n_thick={n_thick}, got {len(thick_starts)}")
             thick_starts_arr = np.array(thick_starts, dtype=np.int32)
 
         # 2. Find thin positions based on actin geometry
@@ -345,14 +351,13 @@ class SarcTopology:
             )
         n_thin = len(thin_positions)
 
-        # Generate thin_starts if not provided
+        # thin_starts: default deterministic unbiased spread, else validated override
         if thin_starts is None:
-            thin_starts_arr = np.random.randint(0, 26, size=n_thin)
+            thin_starts_arr = _spread_starts(n_thin, 0, 26)
         else:
             if len(thin_starts) != n_thin:
-                thin_starts_arr = np.random.randint(0, 26, size=n_thin)
-            else:
-                thin_starts_arr = np.array(thin_starts, dtype=np.int32)
+                raise ValueError(f"thin_starts must have length n_thin={n_thin}, got {len(thin_starts)}")
+            thin_starts_arr = np.array(thin_starts, dtype=np.int32)
 
         # 3. Compute connectivity
         thick_to_thin_list, thin_to_thick_list = _compute_connectivity(
@@ -926,6 +931,29 @@ def _compute_connectivity(
 # OFFSET CALCULATION FUNCTIONS
 # =============================================================================
 
+def _spread_step(nv):
+    """Low-discrepancy step coprime to nv, nearest to nv/golden-ratio.
+
+    Stepping through 0..nv-1 by this amount spreads consecutive filaments evenly
+    over the value space (a 1-D low-discrepancy sequence), decorrelating the
+    registrations of spatially-adjacent filaments.
+    """
+    target = max(1, round(nv / 1.6180339887))
+    for d in range(nv):
+        for s in (target - d, target + d):
+            if 1 <= s < nv and np.gcd(s, nv) == 1:
+                return s
+    return 1
+
+
+def _spread_starts(n, low, high):
+    """Deterministic low-discrepancy spread of starts on [low, high).
+    Single-lattice-unbiased: the lattice's connections sample the full
+    registration space, so its mean ~= the phase-ensemble mean."""
+    nv = high - low
+    return (low + (np.arange(n) * _spread_step(nv)) % nv).astype(np.int32)
+
+
 def _calculate_crown_offsets(n_crowns: int, bare_zone: float, crown_spacing: float) -> Tuple[np.ndarray, np.ndarray]:
     """Calculate crown axial offsets relative to M-line."""
     bare_zone = np.float32(bare_zone)
@@ -1122,7 +1150,6 @@ if __name__ == "__main__":
     print("\nTest 1: Generate geometry with skeletal parameters")
     print("-" * 60)
     static, dynamic = get_skeletal_params()
-    np.random.seed(42)
     geometry = SarcTopology.create(nrows=2, ncols=2, static_params=static, dynamic_params=dynamic)
     print(f"Geometry: {geometry}")
     print(f"  thick_to_thin shape: {geometry.thick_to_thin.shape}")

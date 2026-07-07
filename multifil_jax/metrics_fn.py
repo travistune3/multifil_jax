@@ -34,6 +34,7 @@ def compute_all_metrics(
     solver_residual: jnp.ndarray,
     newton_iters,
     dt: float,
+    xb_subpop=None,
 ) -> 'MetricsDict':
     """Compute all metrics for a single timestep.
 
@@ -71,13 +72,13 @@ def compute_all_metrics(
     # ========================================================================
     # CROSSBRIDGE STATE COUNTS
     # ========================================================================
-    n_drx = jnp.sum(new_xb == 1).astype(jnp.float32)
-    n_loose = jnp.sum(new_xb == 2).astype(jnp.float32)
-    n_tight_1 = jnp.sum(new_xb == 3).astype(jnp.float32)
-    n_tight_2 = jnp.sum(new_xb == 4).astype(jnp.float32)
-    n_free_2 = jnp.sum(new_xb == 5).astype(jnp.float32)
-    n_srx = jnp.sum(new_xb == 6).astype(jnp.float32)
-    n_bound = jnp.sum((new_xb >= 2) & (new_xb <= 4)).astype(jnp.float32)
+    n_drx = jnp.sum(new_xb == 0).astype(jnp.float32)
+    n_loose = jnp.sum(new_xb == 1).astype(jnp.float32)
+    n_tight_1 = jnp.sum(new_xb == 2).astype(jnp.float32)
+    n_tight_2 = jnp.sum(new_xb == 3).astype(jnp.float32)
+    n_free_2 = jnp.sum(new_xb == 4).astype(jnp.float32)
+    n_srx = jnp.sum(new_xb == 5).astype(jnp.float32)
+    n_bound = jnp.sum((new_xb >= 1) & (new_xb <= 3)).astype(jnp.float32)
 
     # ========================================================================
     # TROPOMYOSIN STATE COUNTS
@@ -91,11 +92,11 @@ def compute_all_metrics(
     # ========================================================================
     # TRANSITION EVENT COUNTS
     # ========================================================================
-    # Count XBs that visited state 5 this timestep, including those that continued
-    # to state 1 (4→5→1) within the same timestep. State 4→3→2→1 reversal also
-    # lands in state 1 but is negligibly rare compared to the 4→5→1 path.
-    atp_consumed = jnp.sum((old_xb == 4) & ((new_xb == 5) | (new_xb == 1))).astype(jnp.float32)
-    newly_bound = jnp.sum((old_xb == 1) & (new_xb == 2)).astype(jnp.float32)
+    # Count XBs that visited state 4 (Free_2) this timestep, including those that continued
+    # to state 0 (4→4→0) within the same timestep. State 3→2→1→0 reversal also
+    # lands in state 0 but is negligibly rare compared to the 3→4→0 path.
+    atp_consumed = jnp.sum((old_xb == 3) & ((new_xb == 4) | (new_xb == 0))).astype(jnp.float32)
+    newly_bound = jnp.sum((old_xb == 0) & (new_xb == 1)).astype(jnp.float32)
 
     # ========================================================================
     # DISPLACEMENT STATISTICS
@@ -157,26 +158,33 @@ def compute_all_metrics(
     # Use resolved constants (same as timestep.py passed to thick_transitions)
     # so Q/P matrices match what actually drove the transitions this step.
     resolved_constants = constants.with_drivers(pCa_val, z_line, lattice_spacing)
+    if xb_subpop is None:
+        xb_subpop_r = None
+    else:
+        _mode, _constants_k, _extra = xb_subpop
+        xb_subpop_r = (_mode,
+                       [ck.with_drivers(pCa_val, z_line, lattice_spacing) for ck in _constants_k],
+                       _extra)
     Q_all, P_all, P_abs_all = compute_xb_transition_matrices(
-        old_state, resolved_constants, topology, dt
+        old_state, resolved_constants, topology, dt, xb_subpop=xb_subpop_r
     )
 
     old_xb_flat = old_xb.reshape(-1)
-    mask_state4 = (old_xb_flat == 4).astype(jnp.float32)
+    mask_state3 = (old_xb_flat == 3).astype(jnp.float32)
 
-    # Absorbing-state trick: P_abs_all has row 4 zeroed so state 5 cannot exit.
-    # P_abs_all[:,3,4] gives the probability of visiting state 5 at any point in
-    # [0, dt], correctly counting 4→5→1 paths. Pre-computed in compute_xb_transition_matrices.
-    atp_expected_p = jnp.sum(mask_state4 * P_abs_all[:, 3, 4])
+    # Absorbing-state trick: P_abs_all has row 4 zeroed so state 4 (Free_2) cannot exit.
+    # P_abs_all[:,3,4] gives the probability of visiting state 4 at any point in
+    # [0, dt], correctly counting 3→4→0 paths. Pre-computed in compute_xb_transition_matrices.
+    atp_expected_p = jnp.sum(mask_state3 * P_abs_all[:, 3, 4])
 
     # Q-matrix branching ratio method
-    k_total = Q_all[:, 3, 4]  # rate 4->5 per XB
-    # Minimum r45 rate at rest geometry: f_3_4=0 → Bell exp(0)=1 → r45_min = A45.
+    k_total = Q_all[:, 3, 4]  # rate 3->4 per XB (Tight_2 -> Free_2)
+    # Minimum r34 rate at rest geometry: f_strong=0 → Bell exp(0)=1 → r34_min = A34.
     # Pure function of constants — recalculated each call, trivially fast.
-    k_min = constants.xb_r45_coeff
+    k_min = constants.xb_r34_coeff
     ratio = jnp.where(k_total > 1e-10, k_min / k_total, 1.0)
     ratio = jnp.clip(ratio, 0.0, 1.0)  # clip handles XBs doing positive work (k_total < k_min possible)
-    atp_expected_q = jnp.sum(mask_state4 * k_total * dt * ratio)
+    atp_expected_q = jnp.sum(mask_state3 * k_total * dt * ratio)
 
     # Work per ATP
     work_per_atp = jnp.where(atp_expected_p > 0.01, work_thick / atp_expected_p, 0.0)

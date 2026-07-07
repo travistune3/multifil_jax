@@ -36,7 +36,7 @@ def calculate_cooperative_span(tension: jnp.ndarray,
                                span_steep: float = 1.0) -> jnp.ndarray:
     """Calculate cooperative span based on local tension.
 
-    The span decreases with increasing force (tension opposes cooperativity).
+    The span increases with increasing force.
 
     Args:
         tension: (n_sites,) local force/tension at each site (pN)
@@ -261,4 +261,69 @@ def update_cooperativity(state: 'State',
     return new_state
 
 
+# ============================================================================
+# SYMMETRIC ISING COOPERATIVITY — neighbor-state count helper
+# ============================================================================
+#
+# For each TM site, count same-chain neighbors within a fixed span that are in
+# state 2 (Ca-open) and state 3 (XB-bound) separately. Counts are capped at 2
+# per channel so the index space stays (3, 3) for Q-matrix gather.
+# The closed-neighbor count is derived in the transitions kernel as
+# n_closed = max(0, N_TYPICAL - n_2 - n_3), so this helper only returns the two
+# open-channel counts.
+#
+# Used by transitions.thin_transitions_ising when ising_coop=True is passed to run().
+# No state field is written — counts are consumed inline.
 
+def count_neighbor_states_split(tm_states: jnp.ndarray,
+                                 tm_positions: jnp.ndarray,
+                                 span: float,
+                                 tm_chains: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Count same-chain neighbors in state 2, state 3, and closed (state 0/1)
+    within a fixed span. Each count is capped at 2 for tractable Q-matrix indexing.
+
+    Args:
+        tm_states:    (n_sites,) TM states (0-3)
+        tm_positions: (n_sites,) axial positions of TM sites (nm)
+        span:         scalar nm, fixed cooperative reach (radius)
+        tm_chains:    (n_sites,) chain assignment (0 or 1) for each site
+
+    Returns:
+        n_2:      (n_sites,) int32 same-chain state-2 neighbors, capped at 2
+        n_3:      (n_sites,) int32 same-chain state-3 neighbors, capped at 2
+        n_closed: (n_sites,) int32 same-chain state-{0,1} neighbors, capped at 2
+    """
+    n_sites = tm_states.shape[0]
+    max_window = 20  # JAX static-shape ceiling; physical filter is `span`
+
+    is_2 = (tm_states == 2)
+    is_3 = (tm_states == 3)
+    is_closed = (tm_states == 0) | (tm_states == 1)
+
+    def count_site(i):
+        my_chain = tm_chains[i]
+        my_pos = tm_positions[i]
+
+        offsets = jnp.arange(-max_window, max_window + 1)
+        idx = jnp.clip(i + offsets, 0, n_sites - 1)
+        not_self = (offsets != 0)
+
+        nb_pos = tm_positions[idx]
+        nb_chain = tm_chains[idx]
+        nb_is_2 = is_2[idx]
+        nb_is_3 = is_3[idx]
+        nb_is_closed = is_closed[idx]
+
+        same_chain = (nb_chain == my_chain)
+        within = jnp.abs(nb_pos - my_pos) < span
+        mask = same_chain & within & not_self
+
+        n2 = jnp.sum(jnp.where(mask & nb_is_2, 1, 0))
+        n3 = jnp.sum(jnp.where(mask & nb_is_3, 1, 0))
+        nc = jnp.sum(jnp.where(mask & nb_is_closed, 1, 0))
+        return (jnp.minimum(n2, 2).astype(jnp.int32),
+                jnp.minimum(n3, 2).astype(jnp.int32),
+                jnp.minimum(nc, 2).astype(jnp.int32))
+
+    n_2_arr, n_3_arr, n_c_arr = jax.vmap(count_site)(jnp.arange(n_sites))
+    return n_2_arr, n_3_arr, n_c_arr

@@ -46,6 +46,7 @@ from multifil_jax.kernels.solver import solve_equilibrium
 from multifil_jax.kernels.forces import axial_force_at_mline
 from multifil_jax.timestep import timestep
 from multifil_jax.metrics_fn import compute_all_metrics
+from multifil_jax.core.subpopulation import Subpopulation, generate_random_masks_batch
 
 
 # =============================================================================
@@ -182,54 +183,41 @@ class SimulationResult:
         n_avg = max(1, self.n_steps // 5)
         return float(jnp.mean(self.metrics['axial_force'][..., -n_avg:]))
 
-    def mean(self) -> 'SimulationResult':
-        """Reduce across replicate axis (axis -2)."""
-        if self.replicate_axis is None:
-            raise ValueError("No replicate axis to reduce.")
+    def _reduce_replicates(self, reduce_fn, suffix: str) -> 'SimulationResult':
+        """Collapse the replicate axis (axis -2) with reduce_fn on metrics.
 
-        new_metrics = MetricsDict({k: jnp.mean(v, axis=-2) for k, v in self.metrics.items()})
-        new_z = jnp.mean(self.z_line, axis=-2)
-        new_pCa = jnp.mean(self.pCa, axis=-2)
-        new_ls = jnp.mean(self.lattice_spacing, axis=-2)
-
-        new_coords = {k: v for k, v in self.coords.items() if k != 'replicates'}
-        new_axis_names = [n for n in self._axis_names if n != 'replicates']
-        new_force_shape = new_metrics['axial_force'].shape
-
-        return SimulationResult(
-            metrics=new_metrics, rng_key=self.rng_key,
-            z_line=new_z, pCa=new_pCa, lattice_spacing=new_ls,
-            final_state=None, metadata=self.metadata, dt=self.dt,
-            name=self.name + "_mean",
-            grid_shape=new_force_shape[:-1] if new_metrics['axial_force'].ndim > 1 else None,
-            axis_names=new_axis_names, coords=new_coords,
-        )
-
-    def std(self) -> 'SimulationResult':
-        """Standard deviation across replicate axis (axis -2).
-
-        Drivers (pCa, z_line, lattice_spacing) are identical across replicates
-        by construction, so std would be 0. We broadcast their mean instead.
+        Drivers (pCa, z_line, lattice_spacing) are identical across replicates by
+        construction, so they are always averaged regardless of reduce_fn (their
+        std would be 0).
         """
         if self.replicate_axis is None:
             raise ValueError("No replicate axis to reduce.")
 
-        new_metrics = MetricsDict({k: jnp.std(v, axis=-2) for k, v in self.metrics.items()})
+        new_metrics = MetricsDict({k: reduce_fn(v, axis=-2) for k, v in self.metrics.items()})
         new_z = jnp.mean(self.z_line, axis=-2)
         new_pCa = jnp.mean(self.pCa, axis=-2)
         new_ls = jnp.mean(self.lattice_spacing, axis=-2)
 
         new_coords = {k: v for k, v in self.coords.items() if k != 'replicates'}
         new_axis_names = [n for n in self._axis_names if n != 'replicates']
+        force = new_metrics['axial_force']
 
         return SimulationResult(
             metrics=new_metrics, rng_key=self.rng_key,
             z_line=new_z, pCa=new_pCa, lattice_spacing=new_ls,
             final_state=None, metadata=self.metadata, dt=self.dt,
-            name=self.name + "_std",
-            grid_shape=new_metrics['axial_force'].shape[:-1] if new_metrics['axial_force'].ndim > 1 else None,
+            name=self.name + suffix,
+            grid_shape=force.shape[:-1] if force.ndim > 1 else None,
             axis_names=new_axis_names, coords=new_coords,
         )
+
+    def mean(self) -> 'SimulationResult':
+        """Mean across the replicate axis (axis -2)."""
+        return self._reduce_replicates(jnp.mean, "_mean")
+
+    def std(self) -> 'SimulationResult':
+        """Standard deviation across the replicate axis (axis -2)."""
+        return self._reduce_replicates(jnp.std, "_std")
 
     def __getitem__(self, key) -> 'SimulationResult':
         """Slice all tensors identically, return new SimulationResult.
@@ -439,10 +427,117 @@ def _auto_minibatch_size(padded_batch: int) -> Optional[int]:
 
 
 # =============================================================================
+# SUBPOPULATION RESOLUTION (host-side, before the kernel)
+# =============================================================================
+
+def _resolve_explicit_masks(subpops, topology, total_batch, idx, fractions_b):
+    """Per-sim INT-label masks for explicit modes (random / c_zone).
+
+    ``idx`` is the (total_batch,) gather index into ``subpops`` when swept as a
+    list axis, or None for a single (unswept) object broadcast to every sim.
+    """
+    mode = subpops[0].mode
+    if mode == 'c_zone':
+        xb_variants = jnp.stack([jnp.asarray(sp.xb_mask) for sp in subpops])  # (V, total_xbs)
+        tm_variants = jnp.stack([jnp.asarray(sp.tm_mask) for sp in subpops])  # (V, n_sites_total)
+        if idx is not None:
+            xb_mask_b = xb_variants[idx]
+            tm_mask_b = tm_variants[idx]
+        else:
+            xb_mask_b = jnp.broadcast_to(xb_variants[0], (total_batch,) + xb_variants.shape[1:])
+            tm_mask_b = jnp.broadcast_to(tm_variants[0], (total_batch,) + tm_variants.shape[1:])
+    elif mode == 'random':
+        seeds = {int(sp.seed or 0) for sp in subpops}
+        if len(seeds) > 1:
+            raise ValueError(
+                f"All swept 'random' subpopulations must share one seed; got {sorted(seeds)}"
+            )
+        xb_mask_b, tm_mask_b = generate_random_masks_batch(
+            subpops[0].seed or 0, fractions_b[:, 1], topology, total_batch)
+    else:
+        raise ValueError(f"Unknown explicit subpopulation mode '{mode}'")
+    return xb_mask_b, tm_mask_b
+
+
+def _resolve_subpopulation(subpopulation, topology, total_batch, flat_idx,
+                           is_list_axis, ising_coop):
+    """Resolve a Subpopulation (single object or list) into static flags and
+    per-sim batched arrays for the kernel.
+
+    Returns:
+        (is_subpop_active, is_mean_field, subpop_has_xb, subpop_has_tm,
+         scaled_field_names, n_pops, subpop_arrays)
+
+    subpop_arrays is None when inactive, else a dict of (total_batch, ...)
+    arrays: {'scale_matrix' (·,K,F), 'fractions' (·,K)} for mean-field, or
+    {'scale_matrix', 'xb_mask' (·,total_xbs), 'tm_mask' (·,n_sites_total)} for
+    explicit modes.
+    """
+    if subpopulation is None:
+        return (False, False, False, False, (), 1, None)
+
+    subpops = subpopulation if is_list_axis else [subpopulation]
+
+    modes = {sp.mode for sp in subpops}
+    if len(modes) > 1:
+        raise ValueError(f"All swept subpopulations must share one mode; got {sorted(modes)}")
+    n_pops_set = {sp.K for sp in subpops}
+    if len(n_pops_set) > 1:
+        raise ValueError(f"All swept subpopulations must have the same K; got {sorted(n_pops_set)}")
+    mode = subpops[0].mode
+    n_pops = subpops[0].K
+    is_mean_field = (mode == 'mean_field')
+
+    # Union of scaled fields (must all be xb_* or tm_* — mechanics use the WT base).
+    field_set = set()
+    for sp in subpops:
+        field_set |= set(sp.scaled_fields())
+    bad = [f for f in field_set if not (f.startswith('xb_') or f.startswith('tm_'))]
+    if bad:
+        raise ValueError(
+            f"Subpopulation scales must be xb_* or tm_* fields; got {sorted(bad)}"
+        )
+    scaled_field_names = tuple(sorted(field_set))
+    subpop_has_xb = any(f.startswith('xb_') for f in scaled_field_names)
+    subpop_has_tm = any(f.startswith('tm_') for f in scaled_field_names)
+
+    if ising_coop and subpop_has_tm:
+        raise NotImplementedError(
+            "TM subpopulation scales are not supported with ising_coop=True"
+        )
+
+    # Per-variant scale/fraction tables → gather (or broadcast) per sim.
+    scale_variants = jnp.stack([sp.scale_array(scaled_field_names) for sp in subpops])  # (V,K,F)
+    frac_variants = jnp.stack([sp.fractions for sp in subpops])                          # (V,K)
+    idx = flat_idx['subpopulation'] if is_list_axis else None
+    if idx is not None:
+        scale_matrix_b = scale_variants[idx]                       # (total_batch, K, F)
+        fractions_b = frac_variants[idx]                           # (total_batch, K)
+    else:
+        scale_matrix_b = jnp.broadcast_to(
+            scale_variants[0], (total_batch,) + scale_variants.shape[1:])
+        fractions_b = jnp.broadcast_to(frac_variants[0], (total_batch, n_pops))
+
+    if is_mean_field:
+        subpop_arrays = {'scale_matrix': scale_matrix_b, 'fractions': fractions_b}
+    else:
+        xb_mask_b, tm_mask_b = _resolve_explicit_masks(
+            subpops, topology, total_batch, idx, fractions_b)
+        subpop_arrays = {'scale_matrix': scale_matrix_b,
+                         'xb_mask': xb_mask_b, 'tm_mask': tm_mask_b}
+
+    return (True, is_mean_field, subpop_has_xb, subpop_has_tm,
+            scaled_field_names, n_pops, subpop_arrays)
+
+
+# =============================================================================
 # MODULE-LEVEL SIMULATION KERNEL
 # =============================================================================
 
-@partial(jax.jit, static_argnames=['dt', 'unroll', 'is_dynamic_ls', 'n_cg_steps', 'n_newton_steps'])
+@partial(jax.jit, static_argnames=[
+    'dt', 'unroll', 'is_dynamic_ls', 'n_cg_steps', 'n_newton_steps', 'ising_coop',
+    'is_subpop_active', 'is_mean_field', 'subpop_has_xb', 'subpop_has_tm',
+    'scaled_field_names', 'n_pops'])
 def _run_sim_kernel(
     topology: SarcTopology,
     batched_params: DynamicParams,
@@ -457,6 +552,14 @@ def _run_sim_kernel(
     nu_batched: jnp.ndarray = None,
     n_cg_steps: int = 6,
     n_newton_steps: int = 16,
+    ising_coop: bool = False,
+    subpop_arrays=None,
+    is_subpop_active: bool = False,
+    is_mean_field: bool = False,
+    subpop_has_xb: bool = False,
+    subpop_has_tm: bool = False,
+    scaled_field_names: tuple = (),
+    n_pops: int = 1,
 ):
     """JIT-compiled simulation kernel (unified fixed + dynamic LS).
 
@@ -492,7 +595,8 @@ def _run_sim_kernel(
         )
         return state
 
-    def run_single_sim(state, constants, key, z_trace, pCa_trace, ls_trace, K_lat_val, nu_val):
+    def run_single_sim(state, constants, key, z_trace, pCa_trace, ls_trace,
+                       K_lat_val, nu_val, subpop=None):
         """Run simulation with scan inside vmap."""
         n_thick, n_crowns = state.thick.axial.shape
         n_thin, n_sites = state.thin.axial.shape
@@ -504,6 +608,27 @@ def _run_sim_kernel(
 
         delta_z = jnp.concatenate([jnp.zeros(1), jnp.diff(z_trace)])
         l0 = z_trace[0]  # reference z for Poisson scaling
+
+        # Subpopulation: build the K unscaled population constants once per sim
+        # (rate scales are per-sim; drivers are resolved per step inside timestep).
+        if is_subpop_active:
+            scale_matrix = subpop['scale_matrix']  # (K, F)
+            constants_k = [
+                constants.copy(**{
+                    name: getattr(constants, name) * scale_matrix[k, j]
+                    for j, name in enumerate(scaled_field_names)
+                })
+                for k in range(n_pops)
+            ]
+            if is_mean_field:
+                fractions = subpop['fractions']  # (K,)
+                xb_subpop = ('mean_field', constants_k, fractions) if subpop_has_xb else None
+                tm_subpop = ('mean_field', constants_k, fractions) if subpop_has_tm else None
+            else:
+                xb_subpop = ('explicit', constants_k, subpop['xb_mask']) if subpop_has_xb else None
+                tm_subpop = ('explicit', constants_k, subpop['tm_mask']) if subpop_has_tm else None
+        else:
+            xb_subpop = tm_subpop = None
 
         def scan_fn(carry, inputs):
             old_state, k, current_ls = carry
@@ -532,6 +657,9 @@ def _run_sim_kernel(
                 n_newton_steps=n_newton_steps,
                 precond_params=precond_params,
                 prefactored_precond=prefactored_precond,
+                ising_coop=ising_coop,
+                xb_subpop=xb_subpop,
+                tm_subpop=tm_subpop,
             )
 
             # Build metrics with emergent new_ls for correct force computation
@@ -542,6 +670,7 @@ def _run_sim_kernel(
             all_metrics = compute_all_metrics(
                 old_state, new_state, constants_for_metrics, drivers_for_metrics,
                 topology, pre_solve_thick_pos, force, solver_residual, n_iters, dt,
+                xb_subpop=xb_subpop,
             )
 
             return (new_state, new_k, new_ls), all_metrics
@@ -559,12 +688,16 @@ def _run_sim_kernel(
         z_batched[:, 0], pCa_batched[:, 0], ls_batched[:, 0],
     )
 
-    batched_metrics = jax.vmap(
-        run_single_sim, in_axes=(0, 0, 0, 0, 0, 0, 0, 0)
-    )(
-        batched_states, batched_params, rng_keys,
-        z_batched, pCa_batched, ls_batched, K_lat_batched, nu_batched,
-    )
+    # Subpopulation batched arrays ride the vmap as one extra (dict) axis when
+    # active; when inactive the signature is unchanged (byte-identical trace).
+    vmap_in_axes = (0, 0, 0, 0, 0, 0, 0, 0)
+    vmap_args = [batched_states, batched_params, rng_keys,
+                 z_batched, pCa_batched, ls_batched, K_lat_batched, nu_batched]
+    if is_subpop_active:
+        vmap_in_axes = vmap_in_axes + (0,)
+        vmap_args.append(subpop_arrays)
+
+    batched_metrics = jax.vmap(run_single_sim, in_axes=vmap_in_axes)(*vmap_args)
 
     return batched_metrics
 
@@ -589,6 +722,8 @@ def run(
     unroll: int = 1,
     minibatch_size: Optional[int] = "auto",
     verbose: bool = False,
+    ising_coop: bool = False,
+    subpopulation=None,
 ) -> SimulationResult:
     """Run a muscle simulation with the given topology.
 
@@ -628,6 +763,15 @@ def run(
             minibatch_size × n_steps × 45 × 4 bytes × 2 / 1e9. For a 4060 at
             1000 steps, minibatch_size=4096 uses ~3 GB; 8192 uses ~6 GB.
         verbose: Print progress info
+        subpopulation: Optional Subpopulation (or list of them) modelling a
+            fraction of XB motors / TM units with scaled kinetics. mean_field
+            blends the K population rate matrices (Q_eff = Σ f_k Q_k); random /
+            c_zone assign per-XB / per-site integer labels and select per unit.
+            A list is a sweep axis (mutually exclusive with a dynamic_params
+            candidate list), supported for all three modes — mean_field,
+            random, and c_zone. A swept 'random' list must share one seed
+            across every entry (severity/fraction may still vary).
+            subpopulation=None leaves every path unchanged.
 
     Returns:
         SimulationResult with shape (sweep_1, ..., replicates, time)
@@ -649,106 +793,120 @@ def run(
         from multifil_jax.core.params import StaticParams as _StaticParams
         static_params = _StaticParams()
 
-    # Resolve base dynamic params
-    if dynamic_params is None:
+    # =========================================================================
+    # Build batched kernel inputs via integer row-number lookup.
+    #
+    # Every sweepable input keeps a small "variant table" of its possible values.
+    # The sweep grid is a Cartesian product of plain integer row-numbers (one axis
+    # per swept input); each simulation looks up its row in every table. This one
+    # idea unifies scalars, time-traces, list-of-trace sweeps, K_lat/nu sweeps,
+    # DynamicParams field sweeps, and candidate lists.
+    # =========================================================================
+
+    # Base DynamicParams supplies scalar values for un-swept fields; dict/list
+    # forms carry their own per-field overrides below.
+    if dynamic_params is None or isinstance(dynamic_params, (dict, list)):
         base_dynamic = DynamicParams()
     elif isinstance(dynamic_params, DynamicParams):
         base_dynamic = dynamic_params
-    elif isinstance(dynamic_params, dict):
-        base_dynamic = DynamicParams()
-    elif isinstance(dynamic_params, list):
-        base_dynamic = DynamicParams()
     else:
-        raise ValueError(f"dynamic_params must be DynamicParams, dict, or list of DynamicParams, got {type(dynamic_params)}")
+        raise ValueError(
+            f"dynamic_params must be DynamicParams, dict, or list, got {type(dynamic_params)}"
+        )
 
-    # Mode selection
     is_dynamic_ls = K_lat is not None
 
-    # Build sweep grid
-    sweep_axes = []
-    scalar_values = {}
-    trace_values = {}
-    trace_sweep_stacks = {}  # name -> (n_cond, n_steps) for list-of-trace sweeps
-    param_sweep_names = set()
+    def _as_trace(v):
+        """Normalize one waveform variant to a length-n_steps trace."""
+        a = np.asarray(v, dtype=float)
+        return np.full(n_steps, float(a)) if a.ndim == 0 else a
 
+    sweep_axes = []        # (name, coords) in Cartesian-product / axis order
+    waveform_tables = {}   # name -> (n_variants, n_steps)
+    wf_sweeps = set()      # waveform names that are sweep axes
+    param_tables = {}      # DYNAMIC_FIELDS name -> (n_variants,) lookup table
+    param_axis = {}        # field name -> axis name to index it with
+
+    # 1. Waveform inputs (z_line, pCa, lattice_spacing) — one table each.
     for name, value in [('z_line', z_line), ('pCa', pCa), ('lattice_spacing', lattice_spacing)]:
         if isinstance(value, list):
-            # Detect list-of-traces: each element is a 1D array of length n_steps
-            first = value[0] if value else None
-            # List-of-traces: at least one element is a 1D array of length n_steps
-            any_trace = any(
-                not isinstance(v, (int, float))
-                and np.asarray(v).ndim == 1
-                and len(np.asarray(v)) == n_steps
-                for v in value
+            if not value:
+                raise ValueError(f"{name} sweep list is empty")
+            waveform_tables[name] = jnp.asarray(np.stack([_as_trace(v) for v in value]))
+            is_trace_sweep = any(
+                not isinstance(v, (int, float)) and np.asarray(v).ndim == 1
+                and len(np.asarray(v)) == n_steps for v in value
             )
-            if first is not None and any_trace:
-                # Broadcast scalars to constant traces so np.stack succeeds
-                def _to_trace(v):
-                    a = np.asarray(v)
-                    return np.full(n_steps, float(a)) if a.ndim == 0 else a
-                trace_sweep_stacks[name] = jnp.array(
-                    np.stack([_to_trace(v) for v in value])
-                )  # (n_cond, n_steps)
-                sweep_axes.append((name, list(range(len(value)))))
-            else:
-                sweep_axes.append((name, value))
-        elif hasattr(value, 'shape') and hasattr(value, 'ndim') and value.ndim > 0:
-            if value.shape[0] != n_steps:
-                raise ValueError(f"{name} array length {value.shape[0]} != n_steps {n_steps}")
-            trace_values[name] = jnp.asarray(value)
+            coords = ([np.asarray(waveform_tables[name][i]) for i in range(len(value))]
+                      if is_trace_sweep else list(value))
+            sweep_axes.append((name, coords))
+            wf_sweeps.add(name)
         else:
-            scalar_values[name] = float(value)
+            arr = np.asarray(value)
+            if arr.ndim > 0 and arr.shape[0] != n_steps:
+                raise ValueError(f"{name} array length {arr.shape[0]} != n_steps {n_steps}")
+            waveform_tables[name] = jnp.asarray(_as_trace(value))[None, :]  # (1, n_steps)
 
-    # K_lat and nu sweep classification (scalars or lists, never time-series)
-    K_lat_sweep_values = None
-    nu_sweep_values = None
+    # 2. K_lat / nu — per-sim scalars (never traces).
     if isinstance(K_lat, list):
-        sweep_axes.append(('K_lat', K_lat))
-        K_lat_sweep_values = K_lat
+        sweep_axes.append(('K_lat', list(K_lat)))
     if isinstance(nu, list):
-        sweep_axes.append(('nu', nu))
-        nu_sweep_values = nu
+        sweep_axes.append(('nu', list(nu)))
 
-    if isinstance(dynamic_params, dict):
-        for param_name, param_values in dynamic_params.items():
-            if isinstance(param_values, list):
-                sweep_axes.append((param_name, param_values))
-                param_sweep_names.add(param_name)
+    # 3. DynamicParams sweeps / overrides — one (n_variants,) table per swept field.
+    if isinstance(dynamic_params, list):
+        if not dynamic_params:
+            raise ValueError("dynamic_params candidate list is empty")
+        sweep_axes.append(('candidates', list(range(len(dynamic_params)))))
+        for name in DYNAMIC_FIELDS:
+            param_tables[name] = jnp.stack(
+                [jnp.asarray(getattr(dp, name), jnp.float32) for dp in dynamic_params]
+            )
+            param_axis[name] = 'candidates'
+    elif isinstance(dynamic_params, dict):
+        for pname, pval in dynamic_params.items():
+            if pname not in DYNAMIC_FIELDS:
+                raise ValueError(
+                    f"Unknown dynamic_params field '{pname}'. Valid: {list(DYNAMIC_FIELDS)}"
+                )
+            if isinstance(pval, list):
+                sweep_axes.append((pname, list(pval)))
+                param_tables[pname] = jnp.asarray(pval, jnp.float32)
+                param_axis[pname] = pname
     elif isinstance(dynamic_params, DynamicParams):
         for name in DYNAMIC_FIELDS:
-            val = getattr(dynamic_params, name)
-            arr = jnp.asarray(val)
+            arr = jnp.asarray(getattr(dynamic_params, name))
             if arr.ndim > 0 and arr.shape[0] > 1:
                 sweep_axes.append((name, list(arr.tolist())))
-                param_sweep_names.add(name)
-    elif isinstance(dynamic_params, list):
-        # List of DynamicParams = one coupled candidate per element.
-        # Creates a single 'candidates' axis; Cartesian-producted with any other
-        # sweep axes (e.g. z_line frequency traces) to give candidate × freq grid.
-        sweep_axes.append(('candidates', list(range(len(dynamic_params)))))
+                param_tables[name] = arr.astype(jnp.float32)
+                param_axis[name] = name
 
-    # Build Cartesian product
+    # 4. Subpopulation list = a candidate-style sweep axis. At most one
+    #    candidate-style axis is allowed (each element is a whole config).
+    if isinstance(subpopulation, list):
+        if isinstance(dynamic_params, list):
+            raise ValueError(
+                "Cannot sweep a dynamic_params list and a subpopulation list "
+                "simultaneously (both are candidate-style axes)."
+            )
+        if not subpopulation:
+            raise ValueError("subpopulation list is empty")
+        sweep_axes.append(('subpopulation', list(range(len(subpopulation)))))
+
+    # Cartesian product over integer row-numbers; tile for replicates.
     if sweep_axes:
-        param_arrays = [jnp.array(vals) for _, vals in sweep_axes]
-        grids = jnp.meshgrid(*param_arrays, indexing='ij')
+        grids = jnp.meshgrid(*[jnp.arange(len(c)) for _, c in sweep_axes], indexing='ij')
         batch_size = grids[0].size
-        flat_grids = {name: g.flatten() for (name, _), g in zip(sweep_axes, grids)}
+        flat_idx = {name: jnp.repeat(g.reshape(-1), replicates)
+                    for (name, _), g in zip(sweep_axes, grids)}
     else:
         batch_size = 1
-        flat_grids = {}
+        flat_idx = {}
 
     total_batch = batch_size * replicates
-    grid_shape = tuple(len(vals) for _, vals in sweep_axes)
-
+    grid_shape = tuple(len(c) for _, c in sweep_axes)
     axis_names = [name for name, _ in sweep_axes] + ['replicates', 'time']
-    coords = {}
-    for name, vals in sweep_axes:
-        if name in trace_sweep_stacks:
-            # Store actual traces, not the integer indices used internally
-            coords[name] = [np.array(trace_sweep_stacks[name][i]) for i in range(len(vals))]
-        else:
-            coords[name] = list(vals)
+    coords = {name: c for name, c in sweep_axes}
     coords['replicates'] = list(range(replicates))
     coords['time'] = (jnp.arange(n_steps) * dt).tolist()
 
@@ -758,92 +916,59 @@ def run(
         if is_dynamic_ls:
             print(f"Dynamic LS: K_lat={K_lat}, nu={nu}")
 
-    # Tile for replicates
-    flat_grids_tiled = {name: jnp.repeat(arr, replicates) for name, arr in flat_grids.items()}
+    # Materialize waveforms → (total_batch, n_steps).
+    def _waveform(name):
+        table = waveform_tables[name]
+        if name in wf_sweeps:
+            return table[flat_idx[name]]
+        return jnp.broadcast_to(table[0], (total_batch, n_steps))
 
-    # Broadcast waveforms to (total_batch, n_steps)
-    def broadcast_waveform(name, default_val):
-        if name in flat_grids_tiled:
-            if name in trace_sweep_stacks:
-                # Integer indices into stacked traces → (total_batch, n_steps)
-                indices = flat_grids_tiled[name].astype(int)
-                return trace_sweep_stacks[name][indices]
-            return jnp.broadcast_to(flat_grids_tiled[name][:, None], (total_batch, n_steps))
-        elif name in trace_values:
-            return jnp.broadcast_to(trace_values[name][None, :], (total_batch, n_steps))
-        elif name in scalar_values:
-            return jnp.full((total_batch, n_steps), scalar_values[name])
-        else:
-            return jnp.full((total_batch, n_steps), default_val)
+    z_batched = _waveform('z_line')
+    pCa_batched = _waveform('pCa')
+    ls_batched = _waveform('lattice_spacing')
 
-    z_batched = broadcast_waveform('z_line', 900.0)
-    pCa_batched = broadcast_waveform('pCa', 4.5)
-    ls_batched = broadcast_waveform('lattice_spacing', 14.0)
-
-    # Build K_lat_batched and nu_batched (shape: (total_batch,))
-    if K_lat_sweep_values is not None:
-        K_lat_batched = flat_grids_tiled['K_lat']
+    # K_lat / nu batched scalars (total_batch,).
+    if isinstance(K_lat, list):
+        K_lat_batched = jnp.asarray(K_lat, jnp.float32)[flat_idx['K_lat']]
     elif is_dynamic_ls:
         K_lat_batched = jnp.full(total_batch, float(K_lat))
     else:
-        K_lat_batched = jnp.zeros(total_batch)  # dummy, ignored at trace time
+        K_lat_batched = jnp.zeros(total_batch)
 
-    if nu_sweep_values is not None:
-        nu_batched = flat_grids_tiled['nu']
-    elif isinstance(nu, (int, float)):
-        nu_batched = jnp.full(total_batch, float(nu))
+    if isinstance(nu, list):
+        nu_batched = jnp.asarray(nu, jnp.float32)[flat_idx['nu']]
     else:
-        nu_batched = jnp.zeros(total_batch)
+        nu_batched = jnp.full(total_batch, float(nu))
 
-    # K_lat × n_thick scaling: per-filament → effective lattice stiffness
     if is_dynamic_ls:
         K_lat_batched = K_lat_batched * topology.n_thick
 
-    # Poisson pre-computation (K_lat=None, nu>0): convert to LS time-series
-    if not is_dynamic_ls and 'lattice_spacing' not in trace_values:
-        # Check if any nu value is non-zero
-        has_nonzero_nu = False
-        if isinstance(nu, list):
-            has_nonzero_nu = any(v != 0.0 for v in nu)
-        elif isinstance(nu, (int, float)):
-            has_nonzero_nu = nu != 0.0
+    # Poisson pre-computation (K_lat=None, nu>0): scale LS from its own d0.
+    ls_is_trace = (not isinstance(lattice_spacing, list)
+                   and np.asarray(lattice_spacing).ndim > 0)
+    has_nonzero_nu = (any(v != 0.0 for v in nu) if isinstance(nu, list)
+                      else float(nu) != 0.0)
+    if not is_dynamic_ls and not ls_is_trace and has_nonzero_nu:
+        d0 = ls_batched[:, 0:1]                            # (total_batch, 1)
+        ls_batched = d0 * (z_batched[:, 0:1] / z_batched) ** nu_batched[:, None]
 
-        if has_nonzero_nu:
-            # d0 is the per-sim reference lattice spacing
-            if 'lattice_spacing' in flat_grids_tiled:
-                d0_batched = flat_grids_tiled['lattice_spacing'][:, None]  # (batch, 1)
-            else:
-                d0_val = scalar_values.get('lattice_spacing', 14.0)
-                d0_batched = jnp.full((total_batch, 1), d0_val)
+    # Batched DynamicParams — one lookup per field.
+    def _param(name):
+        if name in param_axis:
+            return param_tables[name][flat_idx[param_axis[name]]]
+        if isinstance(dynamic_params, dict) and name in dynamic_params:
+            return jnp.full(total_batch, float(dynamic_params[name]))
+        return jnp.full(total_batch, float(getattr(base_dynamic, name)))
 
-            l0 = z_batched[:, 0:1]  # (batch, 1) - reference z
-            nu_col = nu_batched[:, None]  # (batch, 1)
-            ls_batched = d0_batched * (l0 / z_batched) ** nu_col  # (batch, n_steps)
+    batched_params = DynamicParams(**{name: _param(name) for name in DYNAMIC_FIELDS})
 
-    # Build batched DynamicParams
-    batched_param_kwargs = {}
-    if isinstance(dynamic_params, list):
-        # Index into the candidate list using the 'candidates' flat grid.
-        # .tolist() does ONE device-to-host transfer (vs 49 fields × 48 elements
-        # = 2352 syncs if we iterate over a JAX array element-by-element).
-        cand_idx_list = flat_grids_tiled['candidates'].astype(int).tolist()
-        for name in DYNAMIC_FIELDS:
-            batched_param_kwargs[name] = jnp.array([
-                float(getattr(dynamic_params[i], name)) for i in cand_idx_list
-            ])
-    else:
-        for name in DYNAMIC_FIELDS:
-            if name in param_sweep_names and name in flat_grids_tiled:
-                batched_param_kwargs[name] = flat_grids_tiled[name]
-            elif isinstance(dynamic_params, dict) and name in dynamic_params:
-                val = dynamic_params[name]
-                if not isinstance(val, list):
-                    batched_param_kwargs[name] = jnp.full(total_batch, float(val))
-                else:
-                    batched_param_kwargs[name] = flat_grids_tiled[name]
-            else:
-                batched_param_kwargs[name] = jnp.full(total_batch, float(getattr(base_dynamic, name)))
-    batched_params = DynamicParams(**batched_param_kwargs)
+    # Subpopulation resolution → static flags + per-sim batched arrays.
+    (is_subpop_active, is_mean_field, subpop_has_xb, subpop_has_tm,
+     scaled_field_names, n_pops, subpop_arrays) = _resolve_subpopulation(
+        subpopulation, topology, total_batch, flat_idx,
+        is_list_axis=isinstance(subpopulation, list),
+        ising_coop=ising_coop,
+    )
 
     # Generate unique RNG keys
     rng_keys = jax.random.split(jax.random.PRNGKey(rng_seed), total_batch)
@@ -860,6 +985,8 @@ def run(
         rng_keys = jnp.concatenate([rng_keys, jax.random.split(jax.random.PRNGKey(rng_seed + 1), pad_n)])
         pad_kwargs = {name: _pad(getattr(batched_params, name), pad_n) for name in DYNAMIC_FIELDS}
         batched_params = DynamicParams(**pad_kwargs)
+        if is_subpop_active:
+            subpop_arrays = jax.tree_util.tree_map(lambda x: _pad(x, pad_n), subpop_arrays)
 
     if verbose:
         print(f"Running simulation kernel (batch={total_batch}, padded={padded_batch})...")
@@ -880,37 +1007,39 @@ def run(
         is_dynamic_ls=is_dynamic_ls,
         n_cg_steps=static_params.n_cg_steps,
         n_newton_steps=static_params.n_newton_steps,
+        ising_coop=ising_coop,
+        is_subpop_active=is_subpop_active,
+        is_mean_field=is_mean_field,
+        subpop_has_xb=subpop_has_xb,
+        subpop_has_tm=subpop_has_tm,
+        scaled_field_names=scaled_field_names,
+        n_pops=n_pops,
     )
 
-    if not use_minibatch:
-        batched_metrics = _run_sim_kernel(
+    # One chunk = the whole padded batch when not minibatching.
+    chunk_size = resolved_minibatch if use_minibatch else padded_batch
+    if use_minibatch and verbose:
+        print(f"Minibatching: {padded_batch // chunk_size} chunks of {chunk_size}")
+    chunks = []
+    for start in range(0, padded_batch, chunk_size):
+        end = start + chunk_size
+        chunk_subpop = (None if not is_subpop_active
+                        else jax.tree_util.tree_map(lambda x, s=start, e=end: x[s:e], subpop_arrays))
+        chunks.append(_run_sim_kernel(
             topology=topology,
-            batched_params=batched_params,
-            z_batched=z_batched,
-            pCa_batched=pCa_batched,
-            ls_batched=ls_batched,
-            rng_keys=rng_keys,
-            K_lat_batched=K_lat_batched,
-            nu_batched=nu_batched,
+            batched_params=jax.tree_util.tree_map(lambda x, s=start, e=end: x[s:e], batched_params),
+            z_batched=z_batched[start:end],
+            pCa_batched=pCa_batched[start:end],
+            ls_batched=ls_batched[start:end],
+            rng_keys=rng_keys[start:end],
+            K_lat_batched=K_lat_batched[start:end],
+            nu_batched=nu_batched[start:end],
+            subpop_arrays=chunk_subpop,
             **kernel_kwargs,
-        )
+        ))
+    if len(chunks) == 1:
+        batched_metrics = chunks[0]
     else:
-        if verbose:
-            print(f"Minibatching: {padded_batch // resolved_minibatch} chunks of {resolved_minibatch}")
-        chunks = []
-        for start in range(0, padded_batch, resolved_minibatch):
-            end = start + resolved_minibatch
-            chunks.append(_run_sim_kernel(
-                topology=topology,
-                batched_params=jax.tree_util.tree_map(lambda x: x[start:end], batched_params),
-                z_batched=z_batched[start:end],
-                pCa_batched=pCa_batched[start:end],
-                ls_batched=ls_batched[start:end],
-                rng_keys=rng_keys[start:end],
-                K_lat_batched=K_lat_batched[start:end],
-                nu_batched=nu_batched[start:end],
-                **kernel_kwargs,
-            ))
         batched_metrics = MetricsDict({
             k: jnp.concatenate([c[k] for c in chunks], axis=0)
             for k in chunks[0]
@@ -958,14 +1087,9 @@ def run(
         topology_config['K_lat_eff'] = float(K_lat * topology.n_thick) if not isinstance(K_lat, list) else [float(k * topology.n_thick) for k in K_lat]
         topology_config['nu'] = nu
 
-    metadata = {
-        'grid_shape': grid_shape,
-        'axis_names': axis_names,
-        'master_seed': rng_seed,
-    }
-    if is_dynamic_ls:
-        metadata['K_lat'] = K_lat
-        metadata['nu'] = nu
+    # grid_shape / axis_names are first-class SimulationResult fields and K_lat /
+    # nu live in topology_config; metadata keeps only what nothing else stores.
+    metadata = {'master_seed': rng_seed}
 
     return SimulationResult(
         metrics=reshaped_metrics,

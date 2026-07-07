@@ -25,7 +25,9 @@ from typing import Tuple, Optional, TYPE_CHECKING
 
 from multifil_jax.kernels.cooperativity import update_cooperativity
 from multifil_jax.kernels.geometry import update_nearest_neighbors
-from multifil_jax.kernels.transitions import thin_transitions, thick_transitions
+from multifil_jax.kernels.transitions import (
+    thin_transitions, thick_transitions, thin_transitions_ising,
+)
 from multifil_jax.kernels.solver import solve_equilibrium
 from multifil_jax.kernels.forces import (
     calculate_thin_forces_for_cooperativity,
@@ -48,7 +50,10 @@ def kinetics_step(state: 'State',
                   topology: 'SarcTopology',
                   rng_key: jnp.ndarray,
                   *,
-                  dt: float) -> Tuple['State', jnp.ndarray, 'DynamicParams']:
+                  dt: float,
+                  ising_coop: bool = False,
+                  xb_subpop=None,
+                  tm_subpop=None) -> Tuple['State', jnp.ndarray, 'DynamicParams']:
     """Execute the stochastic kinetics phase of one timestep.
 
     Performs steps 1-6 of the full timestep workflow: resolves drivers, updates
@@ -80,22 +85,43 @@ def kinetics_step(state: 'State',
     # Build a resolved constants with current driver values
     resolved_constants = constants.with_drivers(pCa, z_line, lattice_spacing)
 
-    # Step 1: Calculate INTERNAL thin filament forces for cooperativity
-    thin_internal_forces = calculate_thin_forces_for_cooperativity(state, resolved_constants, topology)
+    # Resolve subpopulation constants_k with the same drivers (rate scales are
+    # already baked in; with_drivers only sets pCa/z_line/lattice_spacing).
+    def _resolve_subpop(sp):
+        if sp is None:
+            return None
+        mode, constants_k, extra = sp
+        return (mode, [ck.with_drivers(pCa, z_line, lattice_spacing) for ck in constants_k], extra)
+    xb_subpop_r = _resolve_subpop(xb_subpop)
+    tm_subpop_r = _resolve_subpop(tm_subpop)
 
-    # Step 2: Update cooperativity based on INTERNAL filament tension
-    state = update_cooperativity(state, resolved_constants, thin_internal_forces, topology)
+    if ising_coop:
+        # Ising path: skip tension-based subject_to_coop update; neighbors are
+        # computed inside thin_transitions_ising from current tm_states.
+        # Still update nearest binding sites and thin internal forces are unused.
+        state = update_nearest_neighbors(state, resolved_constants, topology)
 
-    # Step 3: Update nearest binding sites using topology
-    state = update_nearest_neighbors(state, resolved_constants, topology)
+        rng_key, thin_key = jax.random.split(rng_key)
+        state, _P_thin = thin_transitions_ising(state, resolved_constants, topology, thin_key, dt)
+    else:
+        # Step 1: Calculate INTERNAL thin filament forces for cooperativity
+        thin_internal_forces = calculate_thin_forces_for_cooperativity(state, resolved_constants, topology)
 
-    # Step 4: Thin filament transitions
-    rng_key, thin_key = jax.random.split(rng_key)
-    state, _P_thin = thin_transitions(state, resolved_constants, topology, thin_key, dt)
+        # Step 2: Update cooperativity based on INTERNAL filament tension
+        state = update_cooperativity(state, resolved_constants, thin_internal_forces, topology)
+
+        # Step 3: Update nearest binding sites using topology
+        state = update_nearest_neighbors(state, resolved_constants, topology)
+
+        # Step 4: Thin filament transitions
+        rng_key, thin_key = jax.random.split(rng_key)
+        state, _P_thin = thin_transitions(state, resolved_constants, topology, thin_key, dt,
+                                          tm_subpop=tm_subpop_r)
 
     # Step 5: Thick filament transitions
     rng_key, thick_key = jax.random.split(rng_key)
-    state = thick_transitions(state, resolved_constants, topology, thick_key, dt)
+    state = thick_transitions(state, resolved_constants, topology, thick_key, dt,
+                              xb_subpop=xb_subpop_r)
 
     return state, rng_key, resolved_constants
 
@@ -117,7 +143,10 @@ def timestep(state: 'State',
              n_cg_steps: int = 6,
              n_newton_steps: int = 16,
              precond_params=None,
-             prefactored_precond=None) -> Tuple['State', jnp.ndarray, jnp.ndarray, float, int]:
+             prefactored_precond=None,
+             ising_coop: bool = False,
+             xb_subpop=None,
+             tm_subpop=None) -> Tuple['State', jnp.ndarray, jnp.ndarray, float, int]:
     """Execute one timestep of the half-sarcomere simulation.
 
     Tiered Architecture:
@@ -143,7 +172,8 @@ def timestep(state: 'State',
         (new_state, new_rng_key, solver_residual, new_ls, n_iters)
     """
     state, rng_key, resolved_constants = kinetics_step(
-        state, constants, drivers, topology, rng_key, dt=dt
+        state, constants, drivers, topology, rng_key, dt=dt, ising_coop=ising_coop,
+        xb_subpop=xb_subpop, tm_subpop=tm_subpop,
     )
 
     new_state, solver_residual, new_ls, n_iters = solve_equilibrium(

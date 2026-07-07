@@ -46,7 +46,7 @@ class ThickState(NamedTuple):
     Structural arrays (crown_starts, connectivity, crown_rests) moved to Topology (Tier 1).
     """
     axial: jnp.ndarray           # (n_thick, n_crowns) crown axial positions
-    xb_states: jnp.ndarray       # (n_thick, n_crowns, 3) crossbridge states (1-6), int8
+    xb_states: jnp.ndarray       # (n_thick, n_crowns, 3) crossbridge states (0-5), int8
     xb_bound_to: jnp.ndarray     # (n_thick, n_crowns, 3) bound site indices (-1 if unbound)
     xb_nearest_bs: jnp.ndarray   # (n_thick, n_crowns, 3) nearest binding site indices
     xb_distances: jnp.ndarray    # (n_thick, n_crowns, 3, 2) distances to nearest BS
@@ -196,7 +196,7 @@ def realize_state(
         (n_thick, n_crowns)
     ).copy()
 
-    xb_states = jnp.ones((n_thick, n_crowns, 3), dtype=jnp.int8)
+    xb_states = jnp.zeros((n_thick, n_crowns, 3), dtype=jnp.int8)
     xb_bound_to = jnp.full((n_thick, n_crowns, 3), -1, dtype=jnp.int32)
     xb_nearest_bs = jnp.zeros((n_thick, n_crowns, 3), dtype=jnp.int32)
     xb_distances = jnp.zeros((n_thick, n_crowns, 3, 2), dtype=jnp.float32)
