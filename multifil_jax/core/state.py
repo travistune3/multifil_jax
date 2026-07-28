@@ -1,22 +1,49 @@
 """
-State Structure for JAX Half-Sarcomere
+Simulation state: what changes from one timestep to the next.
 
-Tiered Architecture:
-    Tier 1 (Topology): Shape-determining data. Changing requires recompile.
-    Tier 2 (Constants): Physics values. Sweepable without recompile.
-    Tier 3 (Drivers): Time-varying inputs (pCa, z_line, lattice_spacing).
-    State: Pure simulation state — no embedded params, geometry, or constants.
+STATE IS DELIBERATELY EMPTY OF EVERYTHING ELSE
+----------------------------------------------
+A State holds node positions and molecular states, and nothing more. No
+parameters, no geometry, no calcium level, no spring constants. Those live in
+DynamicParams (Tier 2), SarcTopology (Tier 1) and Drivers (Tier 3) and are
+passed alongside.
 
-Kernel signature: kernel(state, constants, drivers, topology, rng_key, *, dt)
+The separation is what makes parameter sweeps cheap. If stiffness lived inside
+State, a sweep over stiffness would mean a distinct State per sweep point, and
+vmap would have to carry a copy of everything. Because parameters are separate,
+one State layout serves every sweep point and only the small parameter object is
+batched.
 
-Usage:
-    from multifil_jax.core.sarc_geometry import SarcTopology
-    from multifil_jax.core.state import realize_state
+It also keeps the simulation honest about what is genuinely time-varying. Rest
+lengths, connectivity and crown positions cannot drift during a run, because
+they are not in the object that gets updated.
 
-    topology = SarcTopology.create(nrows, ncols, static_params, constants)
-    topology = jax.device_put(topology)
+NAMEDTUPLES, NOT DATACLASSES
+----------------------------
+NamedTuple is a JAX pytree out of the box, is immutable, and has no __dict__ for
+JAX to trip over. Updates use ._replace(), which builds a new object sharing the
+unchanged arrays:
 
-    state = realize_state(topology, constants, z_line, pCa, lattice_spacing)
+    new_state = state._replace(thick=state.thick._replace(axial=new_positions))
+
+Nesting means a change to thick filament positions leaves the thin filament
+arrays untouched by reference, with no copying.
+
+STATE INDEX CONVENTIONS
+-----------------------
+Crossbridges use 0-5 (0 DRX, 1 Loose, 2 Tight_1, 3 Tight_2, 4 Free_2, 5 SRX)
+and tropomyosin 0-3 (0 Ca-free blocking, 1 Ca-bound blocking, 2 closed, 3 open).
+Both are stored as int8 — with hundreds of thousands of units these arrays are
+large, and 8 bits is ample for six states. Beware that jnp.argmax returns int32,
+so every sampling site must cast back explicitly on assignment or the arrays
+silently widen.
+
+DRIVERS AND THE NaN SENTINEL
+----------------------------
+pCa, z_line and lattice_spacing can be constant for a run or vary per timestep.
+Rather than branching, the per-step value is NaN when there is no override, and
+resolve_value() selects between it and the constant with jnp.where. Branchless,
+so it costs nothing on the GPU and never causes divergence.
 """
 
 import jax
@@ -35,21 +62,23 @@ from .sarc_geometry import SarcTopology
 # compilation by avoiding Python dict overhead. Use ._replace() for updates.
 #
 # State is PURE simulation state: no embedded params, geometry, or constants.
-# Constants (thick_k, thin_k, bare_zone) moved to DynamicParams/Constants.
+# Spring constants (thick_k, thin_k) moved to DynamicParams/Constants.
+# bare_zone (StaticParams) is baked into topology.crown_offsets (Topology, Tier 1).
 # Topology (SarcTopology/SarcTopology) passed as separate argument.
 
 class ThickState(NamedTuple):
     """Thick filament state arrays.
 
     All arrays have leading dimension n_thick (number of thick filaments).
-    Spring constant (k) and bare_zone moved to Constants (Tier 2).
+    Spring constant (k) moved to Constants (Tier 2). bare_zone (StaticParams)
+    is baked into topology.crown_offsets, not stored as a separate value.
     Structural arrays (crown_starts, connectivity, crown_rests) moved to Topology (Tier 1).
     """
     axial: jnp.ndarray           # (n_thick, n_crowns) crown axial positions
-    xb_states: jnp.ndarray       # (n_thick, n_crowns, 3) crossbridge states (0-5), int8
-    xb_bound_to: jnp.ndarray     # (n_thick, n_crowns, 3) bound site indices (-1 if unbound)
-    xb_nearest_bs: jnp.ndarray   # (n_thick, n_crowns, 3) nearest binding site indices
-    xb_distances: jnp.ndarray    # (n_thick, n_crowns, 3, 2) distances to nearest BS
+    xb_states: jnp.ndarray       # (n_thick, n_crowns, n_xb_per_crown) crossbridge states (0-5), int8
+    xb_bound_to: jnp.ndarray     # (n_thick, n_crowns, n_xb_per_crown) bound site indices (-1 if unbound)
+    xb_nearest_bs: jnp.ndarray   # (n_thick, n_crowns, n_xb_per_crown) nearest binding site indices
+    xb_distances: jnp.ndarray    # (n_thick, n_crowns, n_xb_per_crown, 2) distances to nearest BS
 
 
 class ThinState(NamedTuple):
@@ -186,20 +215,18 @@ def realize_state(
     n_crowns = topology.n_crowns
     n_thin = topology.n_thin
     n_sites = topology.n_sites
+    n_xb_per_crown = topology.n_xb_per_crown
 
     # =========================================================================
     # THICK FILAMENT STATE (no k or bare_zone — those are in Constants)
     # Structural arrays (crown_starts, connectivity) are in Topology.
     # =========================================================================
-    thick_axial = jnp.broadcast_to(
-        topology.crown_offsets[None, :],
-        (n_thick, n_crowns)
-    ).copy()
+    thick_axial = topology.crown_offsets.copy()
 
-    xb_states = jnp.zeros((n_thick, n_crowns, 3), dtype=jnp.int8)
-    xb_bound_to = jnp.full((n_thick, n_crowns, 3), -1, dtype=jnp.int32)
-    xb_nearest_bs = jnp.zeros((n_thick, n_crowns, 3), dtype=jnp.int32)
-    xb_distances = jnp.zeros((n_thick, n_crowns, 3, 2), dtype=jnp.float32)
+    xb_states = jnp.zeros((n_thick, n_crowns, n_xb_per_crown), dtype=jnp.int8)
+    xb_bound_to = jnp.full((n_thick, n_crowns, n_xb_per_crown), -1, dtype=jnp.int32)
+    xb_nearest_bs = jnp.zeros((n_thick, n_crowns, n_xb_per_crown), dtype=jnp.int32)
+    xb_distances = jnp.zeros((n_thick, n_crowns, n_xb_per_crown, 2), dtype=jnp.float32)
 
     thick_state = ThickState(
         axial=thick_axial,

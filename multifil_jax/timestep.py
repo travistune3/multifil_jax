@@ -1,22 +1,46 @@
 """
-Single Timestep Module for JAX Half-Sarcomere
+One timestep of the half-sarcomere simulation.
 
-Tiered Architecture:
-    kernel(state, constants, drivers, topology, rng_key, *, dt)
+A timestep has two halves, and they are separated deliberately:
 
-Main functions:
-    kinetics_step() - Execute the stochastic kinetics phase only (steps 1-6)
-    timestep()      - Execute one full timestep (kinetics + equilibrium solve)
+    KINETICS   stochastic — tropomyosin sites and myosin heads draw new states
+    MECHANICS  deterministic — the lattice is solved back to force balance
 
-Workflow:
-    1. Resolve drivers (pCa, z_line, lattice_spacing)
-    2. Calculate INTERNAL thin filament forces (for cooperativity)
-    3. Update cooperativity based on internal filament tension
-    4. Update nearest binding sites for crossbridges
-    5. Thin filament transitions (tropomyosin states)
-    6. Thick filament transitions (crossbridge states + binding)
+That ordering matters. Chemistry is evaluated at the CURRENT geometry, then the
+mechanics catch up to the new chemistry. Doing it the other way would let heads
+bind at positions the lattice has not actually reached.
+
+The split is also why kinetics_step() is a public function rather than an
+implementation detail. In a multi-sarcomere model the chemistry of every
+sarcomere is independent and can be advanced separately, but the mechanics are
+coupled — the sarcomeres share filaments and must be equilibrated together. That
+requires running all the kinetics first, then one joint solve, which this
+structure permits without modification.
+
+STEP ORDER (default, Ising cooperativity)
+
+    1. resolve drivers        merge per-step pCa / z_line / lattice_spacing over
+                              the constant defaults
+    2. update nearest sites   recompute each head's target and its strain, since
+                              the lattice moved during the previous solve
+    3. thin transitions       tropomyosin sites sample new states, coupled to
+                              their chain neighbours
+    4. thick transitions      heads sample new states; binding bookkeeping is
+                              updated on both filaments
     --- kinetics_step() returns here ---
-    7. Solve for new equilibrium positions (Newton solver)
+    5. solve equilibrium      Newton-CG until net force on every node vanishes
+
+With legacy_coop=True two extra steps precede 2: the thin filament's internal
+spring tension is computed, and that tension sets each site's cooperative span.
+The default path needs neither, because Ising coupling reads neighbour states
+directly.
+
+A NOTE ON Z-LINE CHANGES. When z_line moves between steps, the thin filament
+node positions are shifted before this function is called (see simulation.py's
+scan body), not left for the solver to discover. Handing the solver a lattice
+where the boundary has jumped but nothing else has moved would make it resolve
+the entire imposed displacement in one Newton solve, which is both slower and
+less accurate than applying the known rigid-body part analytically first.
 """
 
 import jax
@@ -51,17 +75,15 @@ def kinetics_step(state: 'State',
                   rng_key: jnp.ndarray,
                   *,
                   dt: float,
-                  ising_coop: bool = False,
+                  legacy_coop: bool = False,
                   xb_subpop=None,
                   tm_subpop=None) -> Tuple['State', jnp.ndarray, 'DynamicParams']:
-    """Execute the stochastic kinetics phase of one timestep.
+    """Run the stochastic half of a timestep: everything except the force solve.
 
-    Performs steps 1-6 of the full timestep workflow: resolves drivers, updates
-    cooperativity and nearest neighbors, and runs stochastic thin/thick filament
-    transitions. Does NOT solve for mechanical equilibrium.
-
-    This is separated from timestep() to allow a future FE solver to run kinetics
-    across all coupled sarcomeres before performing a coupled mechanical equilibration.
+    Resolves the drivers, updates crossbridge geometry, then samples new
+    tropomyosin and crossbridge states. Leaves the lattice out of equilibrium —
+    the caller is responsible for solving it, either immediately (timestep()) or
+    after gathering several coupled sarcomeres.
 
     Args:
         state: Current State NamedTuple (pure state, no embedded params)
@@ -73,9 +95,10 @@ def kinetics_step(state: 'State',
 
     Returns:
         (state_after_kinetics, new_rng_key, resolved_constants)
-        resolved_constants is the DynamicParams with driver values (pCa, z_line,
-        lattice_spacing) baked in. The FE solver can replace z_line before passing
-        to solve_equilibrium via constants.with_drivers(...).
+
+        resolved_constants carries the driver values baked in, so callers do not
+        have to redo the NaN-merge. A coupled solver may substitute a different
+        z_line before equilibrating, via constants.with_drivers(...).
     """
     # Step 0: Resolve drivers -- merge time-varying overrides with constants
     pCa = resolve_value(drivers.pCa, constants.pCa)
@@ -95,15 +118,15 @@ def kinetics_step(state: 'State',
     xb_subpop_r = _resolve_subpop(xb_subpop)
     tm_subpop_r = _resolve_subpop(tm_subpop)
 
-    if ising_coop:
-        # Ising path: skip tension-based subject_to_coop update; neighbors are
-        # computed inside thin_transitions_ising from current tm_states.
-        # Still update nearest binding sites and thin internal forces are unused.
-        state = update_nearest_neighbors(state, resolved_constants, topology)
-
-        rng_key, thin_key = jax.random.split(rng_key)
-        state, _P_thin = thin_transitions_ising(state, resolved_constants, topology, thin_key, dt)
-    else:
+    if legacy_coop:
+        # Legacy tension-span cooperativity. Deprecated, kept so parameter sets
+        # fitted under it stay reproducible.
+        #
+        # Note this is the only kinetics path that depends on z_line: the
+        # cooperative span is driven by filament tension, and tension depends on
+        # where the Z-line is. That coupling is what a multi-sarcomere extension
+        # would have to thread through, and its absence on the default path is
+        # one reason the default is preferable going forward.
         # Step 1: Calculate INTERNAL thin filament forces for cooperativity
         thin_internal_forces = calculate_thin_forces_for_cooperativity(state, resolved_constants, topology)
 
@@ -117,6 +140,15 @@ def kinetics_step(state: 'State',
         rng_key, thin_key = jax.random.split(rng_key)
         state, _P_thin = thin_transitions(state, resolved_constants, topology, thin_key, dt,
                                           tm_subpop=tm_subpop_r)
+    else:
+        # Default path: symmetric Ising TM cooperativity. Skip the tension-based
+        # subject_to_coop update; neighbors are computed inside
+        # thin_transitions_ising from current tm_states. Nearest binding sites
+        # are still updated; thin internal forces are unused.
+        state = update_nearest_neighbors(state, resolved_constants, topology)
+
+        rng_key, thin_key = jax.random.split(rng_key)
+        state, _P_thin = thin_transitions_ising(state, resolved_constants, topology, thin_key, dt)
 
     # Step 5: Thick filament transitions
     rng_key, thick_key = jax.random.split(rng_key)
@@ -144,7 +176,7 @@ def timestep(state: 'State',
              n_newton_steps: int = 16,
              precond_params=None,
              prefactored_precond=None,
-             ising_coop: bool = False,
+             legacy_coop: bool = False,
              xb_subpop=None,
              tm_subpop=None) -> Tuple['State', jnp.ndarray, jnp.ndarray, float, int]:
     """Execute one timestep of the half-sarcomere simulation.
@@ -169,10 +201,18 @@ def timestep(state: 'State',
         prefactored_precond: Pre-factored Thomas data (optional)
 
     Returns:
-        (new_state, new_rng_key, solver_residual, new_ls, n_iters)
+        new_state: State after both kinetics and equilibration
+        new_rng_key: Advanced RNG key
+        solver_residual: Largest remaining net force on any node (pN). Worth
+            checking — a large value means the reported force is not an
+            equilibrium force.
+        new_ls: Lattice spacing used. The solved value in dynamic mode, the
+            prescribed one otherwise.
+        n_iters: Newton iterations taken, useful for spotting configurations
+            where the solve is struggling.
     """
     state, rng_key, resolved_constants = kinetics_step(
-        state, constants, drivers, topology, rng_key, dt=dt, ising_coop=ising_coop,
+        state, constants, drivers, topology, rng_key, dt=dt, legacy_coop=legacy_coop,
         xb_subpop=xb_subpop, tm_subpop=tm_subpop,
     )
 

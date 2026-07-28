@@ -1,32 +1,73 @@
 """
-Unified Simulation Engine for JAX Half-Sarcomere
+The simulation engine and the public run() entry point.
 
-This module provides the core simulation engine with proper vmap-outside-scan
-architecture for maximum GPU utilization through XLA kernel fusion.
+ARCHITECTURE: VMAP OUTSIDE, SCAN INSIDE
+---------------------------------------
+The single most important structural decision in this codebase:
 
-Architecture Principle:
-    vmap OUTSIDE, scan INSIDE = single fused XLA kernel per batch
+    run() -> vmap(run_single_sim) -> lax.scan(timestep)
+              over the batch axis      over the time axis
 
-Primary API:
-    run(topology, pCa=..., z_line=..., ...) -> SimulationResult
+Batch outside, time inside. The batch axis is embarrassingly parallel — every
+simulation is independent — while the time axis is inherently sequential, since
+each step depends on the last. Putting vmap outermost lets XLA fuse the entire
+computation into one GPU kernel in which all batch elements advance in lockstep.
+The alternative, looping over simulations and scanning inside each, would launch
+one kernel per simulation and leave the GPU almost idle.
+
+The practical consequence is that a sweep of hundreds of conditions costs barely
+more wall-clock time than a single simulation, up to the point where the GPU
+saturates. Sweeping is close to free; running many separate calls is not.
+
+SWEEPS AS INTEGER LOOKUPS
+-------------------------
+Any input can be a scalar, a list, or a time trace:
+
+    scalar          the same value for every simulation and every step
+    list            a sweep axis, Cartesian-producted with every other list
+    array           a per-timestep trace
+
+Internally each sweepable input keeps a small table of its distinct values, and
+the sweep grid is a Cartesian product of plain integer row numbers. Each
+simulation looks up its row in each table. That one mechanism covers scalar
+sweeps, trace sweeps, lattice-stiffness sweeps, parameter-field sweeps and
+candidate lists uniformly, instead of a special case for each.
+
+Result arrays come back shaped (sweep_1, ..., sweep_N, replicates, time). Sweep
+axes appear in a FIXED order — z_line, pCa, lattice_spacing, K_lat, nu, then
+dynamic_params fields, then subpopulation — NOT the order the caller passed
+them. Select with .sel(name=value) rather than by axis position.
+
+BATCH BUCKETING
+---------------
+XLA compiles for exact array shapes, so a 225-simulation sweep and a
+256-simulation sweep would otherwise be two separate compilations of identical
+code. Batch sizes are therefore padded up to the next power of two before
+dispatch and trimmed afterwards. Compilation is expensive; running a few extra
+padded simulations is not.
+
+WHAT TRIGGERS RECOMPILATION
+---------------------------
+Free: any DynamicParams value, the number of replicates, K_lat and nu, and the
+number of sweep points within a bucket.
+
+Not free: the topology (it defines every array shape), StaticParams solver
+settings, the duration, switching between fixed and dynamic lattice spacing, the
+cooperativity model, and the SHAPE of a subpopulation configuration — though not
+its values.
 
 Usage:
-    from multifil_jax.simulation import run, get_skeletal_params
+    from multifil_jax.simulation import run
     from multifil_jax.core.sarc_geometry import SarcTopology
-    from multifil_jax.core.params import StaticParams
+    from multifil_jax.core.params import get_skeletal_params
 
     static, dynamic = get_skeletal_params()
-    topo = SarcTopology.create(nrows=2, ncols=2, static_params=static, dynamic_params=dynamic)
+    topo = SarcTopology.create(nrows=2, ncols=2, static_params=static,
+                               dynamic_params=dynamic)
 
-    # Simple isometric simulation
-    result = run(topo, pCa=4.5, z_line=900.0, duration_ms=1000)
+    result = run(topo, pCa=4.5, z_line=900.0, duration_ms=1000,
+                 dynamic_params=dynamic, static_params=static)
     print(result.summary())
-
-    # Parameter sweep (list = sweep axis)
-    result = run(topo, pCa=[4.5, 5.0, 6.0], replicates=5)
-
-    # DynamicParams sweep
-    result = run(topo, pCa=4.5, dynamic_params={'thick_k': [1000, 2000, 3000]})
 """
 
 import jax
@@ -392,9 +433,16 @@ def _pad(arr, pad_n):
 
 
 def get_bucket_size(actual_size: int) -> int:
-    """Round up to the next bucket size for JIT cache reuse.
+    """Round a batch size up to the next power-of-two bucket.
 
-    A 15x15 sweep (225) and a 12x12 sweep (144) both compile as 256.
+    XLA compiles per exact shape, so without this every distinct sweep size
+    would pay a fresh compilation for identical code. Padding to buckets means a
+    225-point sweep and a 144-point sweep both compile once, as 256, and the
+    second reuses the first's kernel.
+
+    The cost is running at most twice as many simulations as requested; the
+    padded ones are trimmed off before the result is returned. Compilation takes
+    minutes, so this is overwhelmingly the right trade.
     """
     for bucket in BATCH_BUCKETS:
         if bucket >= actual_size:
@@ -402,17 +450,22 @@ def get_bucket_size(actual_size: int) -> int:
     return actual_size  # Larger than all buckets — use exact size
 
 
-# Minibatch heuristic table: (min_padded_batch, chunk_size)
-# Benchmarked on RTX 3090, 2x2 lattice, 100ms (see benchmarking/benchmark_minibatch.py).
-#   batch=256:   no-minibatch is optimal (monotone degradation as M shrinks)
-#   batch=16384: M=4096 is 2.2% faster than no-minibatch (L2 cache fit)
-# Crossover between 256 and 16384 is not yet benchmarked — update this table
-# after running: python benchmarking/benchmark_minibatch.py --total_runs <N> --min_m 256
+# When to split a padded batch into sequential chunks: (min_batch, chunk_size).
 #
-# Memory note (relevant for 8 GB GPUs, e.g. RTX 4060):
-#   Peak VRAM (GB) ≈ minibatch_size × n_steps × 45 × 4 bytes × 2 / 1e9
-#   Example: minibatch_size=4096, n_steps=1000 → ≈ 1.5 GB for metrics alone; ~3 GB total.
-#   If you hit OOM at large batch, reduce minibatch_size or pass it explicitly.
+# Chunking is primarily a MEMORY control, not a speed one. Every simulation
+# accumulates all 52 metrics at every timestep, so peak GPU memory scales as
+#
+#     peak VRAM (GB) ~ minibatch_size * n_steps * 52 * 4 bytes * 2 / 1e9
+#
+# — roughly 1.5 GB of metrics for 4096 simulations over 1000 steps, and about
+# twice that in total. On an 8 GB card a long simulation at large batch will run
+# out of memory without chunking. Since each chunk calls the same compiled
+# kernel, splitting costs no recompilation.
+#
+# The speed effect is small and only appears at large batch, where a chunk that
+# fits in L2 cache measured a couple of percent faster than the full batch on an
+# RTX 3090. Below ~16384 the full batch was as fast or faster, so no chunking is
+# applied there. The exact crossover has not been measured on other hardware.
 _MINIBATCH_HEURISTIC = (
     (16384, 4096),   # batch ≥ 16384 → chunk to 4096 (benchmarked optimal)
 )
@@ -460,7 +513,7 @@ def _resolve_explicit_masks(subpops, topology, total_batch, idx, fractions_b):
 
 
 def _resolve_subpopulation(subpopulation, topology, total_batch, flat_idx,
-                           is_list_axis, ising_coop):
+                           is_list_axis, legacy_coop):
     """Resolve a Subpopulation (single object or list) into static flags and
     per-sim batched arrays for the kernel.
 
@@ -501,9 +554,10 @@ def _resolve_subpopulation(subpopulation, topology, total_batch, flat_idx,
     subpop_has_xb = any(f.startswith('xb_') for f in scaled_field_names)
     subpop_has_tm = any(f.startswith('tm_') for f in scaled_field_names)
 
-    if ising_coop and subpop_has_tm:
+    if (not legacy_coop) and subpop_has_tm:
         raise NotImplementedError(
-            "TM subpopulation scales are not supported with ising_coop=True"
+            "TM subpopulation scales are not supported on the default Ising path "
+            "(legacy_coop=False)"
         )
 
     # Per-variant scale/fraction tables → gather (or broadcast) per sim.
@@ -535,7 +589,7 @@ def _resolve_subpopulation(subpopulation, topology, total_batch, flat_idx,
 # =============================================================================
 
 @partial(jax.jit, static_argnames=[
-    'dt', 'unroll', 'is_dynamic_ls', 'n_cg_steps', 'n_newton_steps', 'ising_coop',
+    'dt', 'unroll', 'is_dynamic_ls', 'n_cg_steps', 'n_newton_steps', 'legacy_coop',
     'is_subpop_active', 'is_mean_field', 'subpop_has_xb', 'subpop_has_tm',
     'scaled_field_names', 'n_pops'])
 def _run_sim_kernel(
@@ -552,7 +606,7 @@ def _run_sim_kernel(
     nu_batched: jnp.ndarray = None,
     n_cg_steps: int = 6,
     n_newton_steps: int = 16,
-    ising_coop: bool = False,
+    legacy_coop: bool = False,
     subpop_arrays=None,
     is_subpop_active: bool = False,
     is_mean_field: bool = False,
@@ -657,7 +711,7 @@ def _run_sim_kernel(
                 n_newton_steps=n_newton_steps,
                 precond_params=precond_params,
                 prefactored_precond=prefactored_precond,
-                ising_coop=ising_coop,
+                legacy_coop=legacy_coop,
                 xb_subpop=xb_subpop,
                 tm_subpop=tm_subpop,
             )
@@ -722,7 +776,7 @@ def run(
     unroll: int = 1,
     minibatch_size: Optional[int] = "auto",
     verbose: bool = False,
-    ising_coop: bool = False,
+    legacy_coop: bool = False,
     subpopulation=None,
 ) -> SimulationResult:
     """Run a muscle simulation with the given topology.
@@ -967,7 +1021,7 @@ def run(
      scaled_field_names, n_pops, subpop_arrays) = _resolve_subpopulation(
         subpopulation, topology, total_batch, flat_idx,
         is_list_axis=isinstance(subpopulation, list),
-        ising_coop=ising_coop,
+        legacy_coop=legacy_coop,
     )
 
     # Generate unique RNG keys
@@ -1007,7 +1061,7 @@ def run(
         is_dynamic_ls=is_dynamic_ls,
         n_cg_steps=static_params.n_cg_steps,
         n_newton_steps=static_params.n_newton_steps,
-        ising_coop=ising_coop,
+        legacy_coop=legacy_coop,
         is_subpop_active=is_subpop_active,
         is_mean_field=is_mean_field,
         subpop_has_xb=subpop_has_xb,

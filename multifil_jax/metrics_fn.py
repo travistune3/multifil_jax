@@ -1,12 +1,50 @@
 """
-Unified Metrics for JAX Half-Sarcomere Simulation
+Per-timestep measurements of the simulation.
 
-Single function that computes ALL metrics every timestep. Returns a fixed dict with identical keys every call so JAX sees consistent pytree structure.
+Everything a run reports comes from here. compute_all_metrics() is called once
+per timestep inside the scan, comparing the state before and after the step, and
+returns a fixed set of scalars that are stacked over time into the arrays a user
+finally sees.
+
+WHY ALL METRICS, ALWAYS. The returned dict has the same keys on every call, no
+matter the configuration. This is not laziness: JAX requires the scan body to
+return an identical pytree structure each iteration, and making the metric set
+configurable would put it in the JIT signature, so selecting different metrics
+would trigger a recompilation. Computing all of them is much cheaper than that
+would be — they are reductions over arrays already in registers, next to a
+Newton solve that dominates the step.
+
+WHAT THESE MEASURE, AND WHAT THEY DO NOT
+----------------------------------------
+Force (`axial_force`) is read from the strain in the first backbone spring, not
+summed over crossbridges — see kernels/forces.axial_force_at_mline. It includes
+titin, which at long sarcomere lengths can exceed the active contribution
+entirely. Subtract a relaxed (pCa 9) baseline before interpreting active force.
+
+Occupancy metrics come in two flavours. The plain `frac_tm_*` fractions average
+over every site on the filament; the `*_overlap` variants average only over
+sites a crossbridge could reach. Prefer the latter when comparing across
+geometries — see compute_overlap_tm_fractions() for why the difference bites.
+
+ATP consumption is reported three ways, which will not agree, and should not:
+
+    atp_consumed     a stochastic count of heads observed to detach this step.
+                     Unbiased but noisy, and it is what actually happened.
+    atp_expected_p   the expected number, from transition probabilities.
+                     Smooth, and correctly counts heads that passed through
+                     detachment and out again within one timestep.
+    atp_expected_q   the expected number from a rate-branching argument.
+
+For rates and efficiencies prefer the expected values, whose variance is far
+lower; for event counting use the stochastic one. Disagreement between
+atp_expected_p and atp_expected_q at large dt is a signal that the timestep is
+too long for the kinetics.
 
 Usage:
     from multifil_jax.metrics_fn import compute_all_metrics
     metrics = compute_all_metrics(old_state, new_state, constants, drivers,
-                                  topology, pre_solve_thick_pos, force, solver_residual, dt)
+                                  topology, pre_solve_thick_pos, force,
+                                  solver_residual, newton_iters, dt)
 """
 
 import jax
@@ -21,6 +59,81 @@ if TYPE_CHECKING:
     from multifil_jax.core.sarc_geometry import SarcTopology
     from multifil_jax.core.state import State
     from multifil_jax.core.params import DynamicParams
+
+
+def compute_overlap_tm_fractions(
+    state: 'State',
+    topology: 'SarcTopology',
+) -> Dict[str, jnp.ndarray]:
+    """Tropomyosin activation restricted to sites a crossbridge could reach.
+
+    THE PROBLEM THIS SOLVES. The plain `frac_tm_state_3` metric averages over
+    every tropomyosin site on every thin filament. Many of those sites can never
+    host a crossbridge no matter how activated they are:
+
+      - sites opposite the thick filament's bare zone, where there are no crowns
+      - sites beyond the tip of the thick filament, past the end of the overlap
+      - sites that have slid past the M-line into the other half-sarcomere
+
+    Including them dilutes the average with a constant, and worse, the size of
+    that dilution depends on filament lengths and sarcomere length. So the
+    all-site metric changes when the geometry changes even if activation itself
+    is unaltered. This is not hypothetical: a filament-length correction once
+    moved the all-site fraction from 13.5% to 17.3% almost entirely through the
+    denominator, while the genuinely reachable fraction barely moved
+    (17.9% to 18.2%).
+
+    PREFER THESE VARIANTS whenever comparing across geometries, filament
+    lengths, or species. The all-site versions remain available and are fine for
+    tracking a single configuration over time.
+
+    OVERLAP ZONE DEFINITION. A site counts if it satisfies all of:
+      - at or beyond `crown_offsets.min() - 13.0` (the M-line end of the crown
+        span, extended by the myosin head's reach)
+      - at or before `crown_offsets.max() + 13.0` (the tip end, same reach)
+      - strictly past the M-line, `thin_axial > 0`
+
+    The 13.0 nm is the same head reach used in kernels/geometry.py when
+    searching for binding partners. The two must agree: if this bound were more
+    generous than the search, the denominator would include sites no head can
+    actually reach.
+
+    Note the bounds are computed from `crown_offsets`, which is per-filament, so
+    they automatically follow a myosin superlattice that shifts different
+    filaments to different axial positions.
+
+    Returns a dict with:
+      - frac_tm_state_2_overlap: Ca-open fraction. Responds earlier than
+        state 3 and is the more direct readout of cooperative propagation.
+      - frac_tm_state_3_overlap: fully open, crossbridge-bindable fraction.
+      - frac_tm_available_overlap: states 2 and 3 combined.
+      - n_overlap_sites: the denominator, worth checking when a result surprises
+        you — it should change with sarcomere length and filament geometry, and
+        should NOT change with calcium.
+    """
+    tm_states = state.thin.tm_states
+    thin_axial = state.thin.axial
+
+    near_bound = topology.crown_offsets.min() - 13.0
+    far_bound = topology.crown_offsets.max() + 13.0
+
+    in_reach = (thin_axial >= near_bound) & (thin_axial <= far_bound)
+    visible = thin_axial > 0.0
+    overlap_mask = in_reach & visible
+
+    n_overlap_sites = jnp.sum(overlap_mask).astype(jnp.float32)
+    is_state_2 = (tm_states == 2) & overlap_mask
+    is_state_3 = (tm_states == 3) & overlap_mask
+
+    n_state_2 = jnp.sum(is_state_2).astype(jnp.float32)
+    n_state_3 = jnp.sum(is_state_3).astype(jnp.float32)
+
+    return {
+        'frac_tm_state_2_overlap': n_state_2 / n_overlap_sites,
+        'frac_tm_state_3_overlap': n_state_3 / n_overlap_sites,
+        'frac_tm_available_overlap': (n_state_2 + n_state_3) / n_overlap_sites,
+        'n_overlap_sites': n_overlap_sites,
+    }
 
 
 def compute_all_metrics(
@@ -88,6 +201,7 @@ def compute_all_metrics(
     n_tm_2 = jnp.sum(new_tm == 2).astype(jnp.float32)
     n_tm_3 = jnp.sum(new_tm == 3).astype(jnp.float32)
     actin_permissiveness = jnp.mean((new_state.thin.tm_states == 3).astype(jnp.float32))
+    overlap_tm_fractions = compute_overlap_tm_fractions(new_state, topology)
 
     # ========================================================================
     # TRANSITION EVENT COUNTS
@@ -104,7 +218,7 @@ def compute_all_metrics(
     thick_axial = new_state.thick.axial
     thin_axial = new_state.thin.axial
 
-    thick_rest_positions = topology.crown_offsets[None, :]
+    thick_rest_positions = topology.crown_offsets
     thick_displacement = thick_axial - thick_rest_positions
     thick_displace_flat = thick_displacement.flatten()
 
@@ -116,7 +230,7 @@ def compute_all_metrics(
     # ENERGY METRICS
     # ========================================================================
     k_thick = constants.thick_k
-    L0_thick = topology.crown_offsets[0]
+    L0_thick = topology.crown_offsets[:, 0]
     x1 = new_state.thick.axial[:, 0]
     thick_energy_first = 0.5 * k_thick * (x1 - L0_thick)**2
     thick_energy_first_avg = jnp.mean(thick_energy_first)
@@ -172,15 +286,28 @@ def compute_all_metrics(
     old_xb_flat = old_xb.reshape(-1)
     mask_state3 = (old_xb_flat == 3).astype(jnp.float32)
 
-    # Absorbing-state trick: P_abs_all has row 4 zeroed so state 4 (Free_2) cannot exit.
-    # P_abs_all[:,3,4] gives the probability of visiting state 4 at any point in
-    # [0, dt], correctly counting 3→4→0 paths. Pre-computed in compute_xb_transition_matrices.
+    # Expected ATP, from transition probabilities.
+    #
+    # The naive quantity, P[3,4], is the probability of ENDING the step in
+    # Free_2, which undercounts: a head can go 3 -> 4 -> 0 within one timestep,
+    # spending an ATP but ending where a before/after comparison sees no
+    # detachment at all. P_abs comes from a generator with state 4 made
+    # absorbing, so P_abs[3,4] is the probability of VISITING Free_2 at any
+    # point during the step — the quantity actually wanted. The error grows with
+    # dt and with detachment rate, so it is not negligible at the fast rates of
+    # skeletal myosin.
     atp_expected_p = jnp.sum(mask_state3 * P_abs_all[:, 3, 4])
 
     # Q-matrix branching ratio method
     k_total = Q_all[:, 3, 4]  # rate 3->4 per XB (Tight_2 -> Free_2)
-    # Minimum r34 rate at rest geometry: f_strong=0 → Bell exp(0)=1 → r34_min = A34.
-    # Pure function of constants — recalculated each call, trivially fast.
+    # Independent estimate of the same quantity, from rate branching rather than
+    # from the matrix exponential. A head in Tight_2 leaves at total rate
+    # Q[3,4]; the fraction of those departures that represent genuine
+    # ATP-consuming detachment is estimated by the ratio of the unloaded
+    # detachment rate to the actual (load-accelerated) one.
+    #
+    # k_min is r34 at zero load: the Bell factor exp(f*delta/kT) is 1 at f = 0,
+    # leaving just the pre-exponential coefficient.
     k_min = constants.xb_r34_coeff
     ratio = jnp.where(k_total > 1e-10, k_min / k_total, 1.0)
     ratio = jnp.clip(ratio, 0.0, 1.0)  # clip handles XBs doing positive work (k_total < k_min possible)
@@ -230,6 +357,10 @@ def compute_all_metrics(
         'frac_tm_state_2': n_tm_2 / n_total_tm,
         'frac_tm_state_3': n_tm_3 / n_total_tm,
         'actin_permissiveness': actin_permissiveness,
+        'frac_tm_state_2_overlap': overlap_tm_fractions['frac_tm_state_2_overlap'],
+        'frac_tm_state_3_overlap': overlap_tm_fractions['frac_tm_state_3_overlap'],
+        'frac_tm_available_overlap': overlap_tm_fractions['frac_tm_available_overlap'],
+        'n_overlap_sites': overlap_tm_fractions['n_overlap_sites'],
 
         # Transition events
         'atp_consumed': atp_consumed,

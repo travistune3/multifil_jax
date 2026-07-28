@@ -1,33 +1,66 @@
 """
-Subpopulation feature for JAX Half-Sarcomere.
+Mixed populations of motors with different kinetics.
 
-Model a fraction of XB motors (or TM regulatory units) with modified rate
-constants — mutations (heterozygous/homozygous), cMyBP-C / C-zone effects, or
-mean-field-vs-stochastic validation.
+Real muscle is rarely uniform. A heterozygous mutation puts mutant and wild-type
+myosin side by side on the same filament. Accessory proteins such as cMyBP-C
+decorate only the central stripes of the thick filament, so heads there behave
+differently from heads at the ends. This module lets a simulation contain
+several populations of motors that share the same mechanics but obey different
+rates.
 
-A configuration is a **list of K populations** (index 0 = WT, all scales 1.0),
-carried as multiplicative scale factors on whatever ``DynamicParams`` (the WT
-baseline) was passed to ``run()``. Today the constructors emit K=2 (WT + one
-mutant); nothing in the data path hardcodes 2.
+WHAT A SUBPOPULATION IS
+-----------------------
+A list of K populations, index 0 being wild-type. Each carries a dict of
+MULTIPLICATIVE scale factors applied to whatever DynamicParams was passed to
+run(). Scaling rather than absolute values means one Subpopulation describes a
+perturbation that can be applied on top of any baseline — a mutation defined
+once works against a skeletal, cardiac or fitted parameter set alike.
 
-Two modes:
-- **mean_field**: no mask. The kernel averages the K underlying rate matrices
-  first (``Q_eff = Σ_k f_k Q_k``) and computes probabilities once. Fast,
-  deterministic.
-- **random / c_zone**: integer-label masks ``0..K-1`` assign each XB / TM site to
-  a population; the kernel exponentiates each population's Q and selects per-XB /
-  per-site by label. ``random`` masks are drawn fresh per replicate inside
-  ``run()``; ``c_zone`` masks are deterministic (built at construction).
+Scales must name xb_* or tm_* fields. Mechanical parameters always take the
+wild-type value: populations differ in how fast they cycle, never in how stiff
+they are. That is a modelling limitation, and an intentional one — differing
+stiffness would mean differing forces at the same strain, which the force
+kernels are not structured to represent per motor.
 
-All three modes (``mean_field``, ``random``, ``c_zone``) can be passed to
-``run()`` as a plain object *or* as a list, which becomes a genuine sweep axis
-cross-producted with everything else. A swept ``random`` list additionally
-requires every entry to share one ``seed`` (severity/fraction may still
-differ freely across entries).
+TWO WAYS TO MIX
+---------------
+mean_field
+    No spatial assignment at all. The K rate matrices are averaged with the
+    population fractions as weights, Q_eff = sum_k f_k Q_k, and every motor uses
+    the result. Note this averages GENERATORS, before exponentiating — not
+    parameters, and not probabilities. Averaging parameters would be wrong
+    because rates depend nonlinearly on them; averaging probabilities would be
+    wrong because it double-counts within-step transitions. Deterministic, and
+    the cheapest option: still one matrix exponential.
 
-``Subpopulation`` is imported ONLY here and in ``simulation.py`` — never in
-kernel files. Kernels receive only ``DynamicParams`` lists and integer mask
-arrays, types they already understand.
+random / c_zone
+    Genuine spatial assignment. Every motor and site carries an integer label,
+    each population is exponentiated separately, and each unit selects by label.
+    Costs K times the exponentials but captures something mean-field cannot:
+    local clustering. A patch of mutant heads on one filament interacts through
+    filament compliance and cooperativity in a way that a uniformly averaged
+    motor does not.
+
+    random draws labels per simulation from seed + simulation index, so
+    replicates sample different arrangements and provide statistical power.
+    c_zone assigns by axial position and is fully deterministic.
+
+Comparing mean_field against random with the same fraction is a direct measure
+of how much spatial heterogeneity matters for a given question.
+
+EXACTNESS AT THE EDGES
+----------------------
+fraction = 0 reproduces wild-type bit-for-bit, and fraction = 1 reproduces a
+global parameter scale bit-for-bit, in all three modes. These are not
+approximations that happen to be close; they are exact, and worth using as
+sanity checks when adding a new perturbation.
+
+BOUNDARY
+--------
+Subpopulation is imported only here and in simulation.py. The kernels never see
+this class — they receive plain DynamicParams lists and integer mask arrays,
+types they already understand. Keeping the abstraction out of the kernels is
+what allows the whole feature to add zero overhead when unused.
 """
 
 from dataclasses import dataclass
@@ -171,11 +204,15 @@ def _c_zone_masks(topology, lo_nm: float, hi_nm: float, scales: Dict[str, float]
     labelled by the same axial band only when tm_* scales are present (otherwise
     all WT, so the TM path is untouched).
     """
-    crown_off = np.asarray(topology.crown_offsets)                 # (n_crowns,)
-    crown_in = ((crown_off >= lo_nm) & (crown_off <= hi_nm)).astype(np.int32)  # (n_crowns,)
+    crown_off = np.asarray(topology.crown_offsets)                 # (n_thick, n_crowns)
+    crown_in = ((crown_off >= lo_nm) & (crown_off <= hi_nm)).astype(np.int32)  # (n_thick, n_crowns)
     # Broadcast crown pattern to every XB: (n_thick, n_crowns, n_xb_per_crown).
+    # Per-filament now (not per-crown-index alone) — under a myosin superlattice
+    # (n_superlattice_classes > 1), filaments in different classes sit at
+    # different axial positions for the same crown index, so C-zone membership
+    # is genuinely filament-dependent for the first time.
     xb_mask = np.broadcast_to(
-        crown_in[None, :, None],
+        crown_in[:, :, None],
         (topology.n_thick, topology.n_crowns, topology.n_xb_per_crown),
     ).reshape(-1)
 

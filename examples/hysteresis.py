@@ -135,35 +135,6 @@ force = results_vertebrate.axial_force
 
 
 
-static, dynamic = get_skeletal_params()
-topo_invert = SarcTopology.create(nrows=2, 
-                            ncols=2, 
-                            static_params=static.replace(actin_geometry = 'invertebrate'), 
-                            dynamic_params=dynamic)
-topo_invert = jax.device_put(topo_invert)
-
-
-
-print("Compiling + executing sweep...")
-start = time.time()
-results_invertebrate = run(
-    topo_invert,
-    pCa=4,
-    z_line=1100,
-    lattice_spacing=14,
-    duration_ms=1000,
-    dt=1.0,
-    dynamic_params={
-        'thick_k': thick_sweep,
-        'thin_k': thin_sweep,
-        'titin_b': titin_sweep,
-    },
-    replicates=1,
-)
-end = time.time()
-print(f"Invertebrate sweep completed in {end-start:.2f}s")
-
-
 #%%
 # =============================================================================
 # ANALYSIS
@@ -175,19 +146,15 @@ import numpy as np
 last_n = 100
 
 vert_ss_force = np.array(results_vertebrate.axial_force[..., -last_n:].mean(axis=(-2, -1)))
-invert_ss_force = np.array(results_invertebrate.axial_force[..., -last_n:].mean(axis=(-2, -1)))
 
-print("\nSteady-state force comparison (vertebrate vs invertebrate):")
-print(f"  Vertebrate:   mean={vert_ss_force.mean():.1f} pN, max={vert_ss_force.max():.1f} pN")
-print(f"  Invertebrate: mean={invert_ss_force.mean():.1f} pN, max={invert_ss_force.max():.1f} pN")
+print("\nSteady-state force:")
+print(f"  mean={vert_ss_force.mean():.1f} pN, max={vert_ss_force.max():.1f} pN")
 
 # Thick filament displacement metric
 vert_disp = np.array(results_vertebrate.metrics['thick_displace_mean'][..., -last_n:].mean(axis=(-2, -1)))
-invert_disp = np.array(results_invertebrate.metrics['thick_displace_mean'][..., -last_n:].mean(axis=(-2, -1)))
 
-print("\nThick filament displacement comparison:")
-print(f"  Vertebrate:   mean={vert_disp.mean():.3f} nm, max={vert_disp.max():.3f} nm")
-print(f"  Invertebrate: mean={invert_disp.mean():.3f} nm, max={invert_disp.max():.3f} nm")
+print("\nThick filament displacement:")
+print(f"  mean={vert_disp.mean():.3f} nm, max={vert_disp.max():.3f} nm")
 
 # Optional: matplotlib plots
 try:
@@ -204,19 +171,17 @@ try:
                 label=f'vert k={thick_sweep[i]:.0f}', alpha=0.7)
     ax.set_xlabel('Timestep')
     ax.set_ylabel('Force (pN)')
-    ax.set_title('Vertebrate Force Traces (diagonal sweep)')
+    ax.set_title('Force Traces (diagonal sweep)')
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
     # Force vs stiffness (diagonal)
     ax = axes[1]
     ks = thick_sweep[:diag_n]
-    ax.plot(ks, vert_ss_force.diagonal()[:diag_n], 'o-', label='Vertebrate')
-    ax.plot(ks, invert_ss_force.diagonal()[:diag_n], 's-', label='Invertebrate')
+    ax.plot(ks, vert_ss_force.diagonal()[:diag_n], 'o-')
     ax.set_xlabel('thick_k (pN/nm)')
     ax.set_ylabel('Steady-state Force (pN)')
     ax.set_title('Force vs Stiffness')
-    ax.legend()
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()

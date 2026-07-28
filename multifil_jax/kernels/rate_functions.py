@@ -1,21 +1,82 @@
 """
-Rate Functions for Tropomyosin and Crossbridge Kinetics
+Transition rates for the tropomyosin and crossbridge state machines.
 
-This module contains all rate functions extracted from transitions.py.
-Users can customize rates by:
-1. Modifying the DynamicParams values passed to these functions
-2. Writing custom rate functions with the same signature
+Every rate in the model is defined here, one function per transition. The
+kernels assemble these into rate matrices; this module is where the biophysics
+of "how fast does this step happen, and what does it depend on" lives.
 
-Each rate function takes explicit parameters rather than a params dict,
-making dependencies clear and enabling easy customization.
+Rates are in ms^-1 (a value of 0.6 means 600 s^-1). Energies are in kT.
 
-Rate function naming convention:
-- tm_k_XY: Tropomyosin rate for transition X->Y
-- xb_rXY: Crossbridge rate for transition X->Y
+THE TROPOMYOSIN CYCLE (4 states)
+--------------------------------
+Tropomyosin is a coiled-coil that lies in the groove of the actin helix,
+physically covering the sites myosin needs to bind. Calcium binding to troponin
+lets it move aside. The model resolves that into four states:
 
-States:
-- TM: 0=unbound, 1=Ca-bound, 2=closed, 3=open (permissive)
-- XB: 1=DRX, 2=loose, 3=tight_1, 4=tight_2, 5=free_2, 6=SRX
+    0  Ca-free, blocking      no calcium on troponin, sites covered
+    1  Ca-bound, blocking     calcium bound, tropomyosin has not yet moved
+    2  closed                 tropomyosin shifted, sites still not accessible
+    3  open (permissive)      sites exposed; myosin may bind here
+
+States 1-2-3 are the classical blocked/closed/open picture (McKillop & Geeves
+1993); state 0 splits out the calcium-binding step so calcium concentration
+enters as a genuine rate rather than a switch. Only state 3 permits binding.
+
+The cycle closes 3 -> 0 rather than running backwards through 1: calcium
+dissociates from the open state directly. A site with a crossbridge attached is
+locked in state 3 (both 3->2 and 3->0 are gated off) — the bound head physically
+holds tropomyosin out of the way, which is the structural basis for crossbridge
+binding being self-reinforcing.
+
+THE CROSSBRIDGE CYCLE (6 states)
+--------------------------------
+    0  DRX      disordered relaxed; head is free, ATP hydrolysed, ready to bind
+    1  Loose    weakly bound to actin, pre-power-stroke
+    2  Tight_1  strongly bound, pre-power-stroke (phosphate released)
+    3  Tight_2  strongly bound, post-power-stroke (work has been done)
+    4  Free_2   just detached after ADP release; ATP has bound
+    5  SRX      super-relaxed; head folded back against the thick filament
+
+The force-producing path is 0 -> 1 -> 2 -> 3 -> 4 -> 0, consuming one ATP per
+lap. States 1 and 4 use the weak spring configuration; 2 and 3 use the strong
+one. The transition 2 -> 3 is the working stroke.
+
+SRX is not part of that cycle — it is a reserve. Heads parked in SRX have very
+low ATPase and cannot bind at all; calcium recruits them out (xb_rate_50).
+This gives the thick filament its own activation mechanism, separate from
+tropomyosin's, and it is a large part of why force rises so steeply with
+calcium. The model's SRX is deeper than the single-tier SRX/DRX equilibrium used
+in some published models: a physics-motivated choice, not established precedent.
+
+HOW STRAIN ENTERS THE RATES
+---------------------------
+Two distinct mechanisms, easy to conflate:
+
+  Energy-difference (Boltzmann) — used for 0->1 and 1->2. The rate depends on the
+  elastic energy the head would store in each configuration at its current
+  geometry, so a head positioned where the strong state is favourable
+  isomerizes faster. Reverse rates follow by detailed balance.
+
+  Bell / load-dependent — used for 2->3 and 3->4. The rate depends on the FORCE
+  the head is currently carrying, via exp(+/- f*delta/kT), where delta is the
+  distance to the transition state. Resisting load slows the working stroke
+  (2->3) and, for fast skeletal myosin, accelerates detachment (3->4). The
+  opposite signs are essential, not cosmetic.
+
+Reverse rates are derived from forward rates and free-energy differences rather
+than being free parameters, so the cycle cannot violate detailed balance and
+manufacture energy. The exception is 3->4 and 4->0, which are deliberately
+one-way: they are the irreversible, ATP-consuming part of the cycle.
+
+CUSTOMIZING
+-----------
+Each function takes explicit scalar arguments rather than a parameter object, so
+dependencies are visible in the signature. To change a rate law, either sweep
+the DynamicParams values these read, or write a replacement with the same
+signature.
+
+Naming: ``tm_rate_XY`` / ``xb_rate_XY`` is the rate for state X -> state Y, with
+state indices as listed above.
 """
 import jax.numpy as jnp
 
@@ -25,98 +86,146 @@ import jax.numpy as jnp
 # =============================================================================
 
 def tm_rate_01(ca_conc, k_01_base, coop_factor):
-    """Rate 0->1 (Ca binding).
+    """Rate 0->1: calcium binds troponin C.
 
-    Calcium binding rate depends on calcium concentration and cooperativity.
+    The only step in the whole model that reads calcium concentration directly.
+    Because it is second-order (rate proportional to [Ca2+]), the rate constant
+    carries units of M^-1 ms^-1 while the rate itself comes out in ms^-1.
+
+    Everything downstream of this — how steeply force rises with calcium, how
+    fast a twitch relaxes — is emergent from this step plus cooperativity plus
+    the SRX gate. There is no direct pCa-to-force mapping anywhere.
 
     Args:
-        ca_conc: Calcium concentration (M)
-        k_01_base: Base rate constant (per M per ms) - from params.tm_k_01
-        coop_factor: Cooperativity multiplier (1.0 if not cooperative)
+        ca_conc: Calcium concentration (M), i.e. 10**(-pCa)
+        k_01_base: Second-order rate constant (M^-1 ms^-1) - params.tm_k_01
+        coop_factor: Cooperativity multiplier (1.0 when not cooperative)
 
     Returns:
-        Rate k_01 (per ms)
+        Rate k_01 (ms^-1)
     """
     return k_01_base * ca_conc * coop_factor
 
 
 def tm_rate_10(k_01_base, Keq_01):
-    """Rate 1->0 (Ca unbinding) - detailed balance.
+    """Rate 1->0: calcium dissociates from troponin C.
+
+    Fixed by detailed balance rather than being an independent parameter:
+    k_10 = k_01_base / Keq_01. Note that k_01_base is used here WITHOUT the
+    calcium concentration, so Keq_01 has units of M^-1 and the ratio comes out
+    as a first-order rate — this is the standard association/dissociation pair,
+    not an approximation.
 
     Args:
-        k_01_base: Base forward rate constant (per M per ms)
-        Keq_01: Equilibrium constant for Ca binding
+        k_01_base: Second-order forward rate constant (M^-1 ms^-1)
+        Keq_01: Association equilibrium constant (M^-1)
 
     Returns:
-        Rate k_10 (per ms)
+        Rate k_10 (ms^-1)
     """
     return k_01_base / Keq_01
 
 
 def tm_rate_12(k_12_base, coop_factor):
-    """Rate 1->2 (Closed transition).
+    """Rate 1->2: tropomyosin shifts from blocking to closed.
+
+    The mechanical consequence of calcium binding: troponin's grip on
+    tropomyosin loosens and the strand rolls toward the actin groove. Sites are
+    still not open for binding after this step — that is 2->3.
 
     Args:
-        k_12_base: Base rate constant (per ms) - from params.tm_k_12.
-                   1.0 ms⁻¹ (skeletal) / 0.5 ms⁻¹ (cardiac);
-                   Fraser & Bhatt 2019; Geeves & Lehrer 1994 (20–1000 s⁻¹).
+        k_12_base: Rate constant (ms^-1) - params.tm_k_12.
+                   1.0 skeletal / 0.5 cardiac; Fraser & Bhatt 2019;
+                   Geeves & Lehrer 1994 report 20-1000 s^-1 for this class of
+                   transition, a range wide enough that the choice within it is
+                   effectively a modelling decision.
         coop_factor: Cooperativity multiplier
 
     Returns:
-        Rate k_12 (per ms)
+        Rate k_12 (ms^-1)
     """
     return k_12_base * coop_factor
 
 
 def tm_rate_21(k_12_base, Keq_12):
-    """Rate 2->1 (Return from closed) - detailed balance.
+    """Rate 2->1: tropomyosin rolls back to the blocking position.
+
+    Detailed balance: k_21 = k_12_base / Keq_12.
 
     Args:
-        k_12_base: Base forward rate constant (per ms)
-        Keq_12: Equilibrium constant
+        k_12_base: Forward rate constant (ms^-1)
+        Keq_12: Equilibrium constant (dimensionless)
 
     Returns:
-        Rate k_21 (per ms)
+        Rate k_21 (ms^-1)
     """
     return k_12_base / Keq_12
 
 
 def tm_rate_23(k_23_base, coop_factor):
-    """Rate 2->3 (Open transition - becomes permissive).
+    """Rate 2->3: tropomyosin opens, exposing the binding site.
+
+    The step that actually gates myosin. Sites in state 3 are the only ones a
+    crossbridge can attach to (see xb_rate_01's permissiveness argument).
 
     Args:
-        k_23_base: Base rate constant (per ms) - from params.tm_k_23
+        k_23_base: Rate constant (ms^-1) - params.tm_k_23
         coop_factor: Cooperativity multiplier
 
     Returns:
-        Rate k_23 (per ms)
+        Rate k_23 (ms^-1)
     """
     return k_23_base * coop_factor
 
 
 def tm_rate_32(k_23_base, Keq_23, can_leave):
-    """Rate 3->2 (Return from open) - detailed balance.
+    """Rate 3->2: tropomyosin closes again.
+
+    Detailed balance, times a gate. ``can_leave`` is 0 when a crossbridge is
+    attached at this site: an attached head physically obstructs tropomyosin's
+    return, so the site cannot close underneath it. This is a hard lock, not a
+    slowdown, and it is one of the two ways binding reinforces itself (the other
+    being cooperative coupling to neighbours).
+
+    Note Keq_23 < 1 at rest, so the closed state is favoured in the absence of
+    calcium — the open state is the excursion, not the resting condition.
 
     Args:
-        k_23_base: Base forward rate constant (per ms)
-        Keq_23: Equilibrium constant
-        can_leave: 1.0 if site can leave state 3, 0.0 if XB bound
+        k_23_base: Forward rate constant (ms^-1)
+        Keq_23: Equilibrium constant (dimensionless)
+        can_leave: 1.0 if the site is free, 0.0 if a crossbridge is bound
 
     Returns:
-        Rate k_32 (per ms)
+        Rate k_32 (ms^-1)
     """
     return (k_23_base / Keq_23) * can_leave
 
 
 def tm_rate_30(k_30_base, can_leave):
-    """Rate 3->0 (Return to unbound from open state).
+    """Rate 3->0: calcium dissociates directly from the open state.
+
+    This is what closes the tropomyosin cycle. Rather than retracing 3->2->1->0,
+    the model lets an open site drop straight back to Ca-free-and-blocking,
+    which makes the four states a cycle rather than a reversible chain.
+
+    Consequences worth being aware of:
+      - Relaxation kinetics are governed largely by this rate, not by the
+        forward path. For cardiac muscle it is the slowest TM step.
+      - Because it is one-way, this step is where the TM cycle stops obeying
+        detailed balance. That is deliberate, but it means cooperativity must
+        NOT be applied here: boosting the cycle-closing step along with the
+        forward steps produces runaway anti-cooperative behaviour rather than
+        sharper activation. The Ising path leaves this rate at its base value
+        for exactly that reason.
+      - ``can_leave`` gates it to 0 while a crossbridge is attached, same as
+        tm_rate_32: a bound head prevents the site from deactivating.
 
     Args:
-        k_30_base: Base rate constant (per ms) - from params.tm_k_30
-        can_leave: 1.0 if site can leave state 3, 0.0 if XB bound
+        k_30_base: Rate constant (ms^-1) - params.tm_k_30
+        can_leave: 1.0 if the site is free, 0.0 if a crossbridge is bound
 
     Returns:
-        Rate k_30 (per ms)
+        Rate k_30 (ms^-1)
     """
     return k_30_base * can_leave
 
@@ -126,35 +235,63 @@ def tm_rate_30(k_30_base, can_leave):
 # =============================================================================
 
 def xb_rate_01(permissiveness, r01_coeff, E_weak):
-    """Rate DRX->Loose (binding).
+    """Rate 0->1: DRX head attaches weakly to actin.
 
-    This is the main binding rate. 
+    The gateway into the force-producing cycle, and the only crossbridge rate
+    that tropomyosin gates directly. Two factors multiply:
+
+      permissiveness  1 if the target site's tropomyosin is open (state 3),
+                      0 otherwise — a hard gate, so a head cannot bind a
+                      covered site at any strain.
+      exp(-E_weak)    Boltzmann penalty for the elastic energy the head must
+                      store to reach this site in its weak configuration.
+                      Heads far from their unstrained geometry bind
+                      exponentially more slowly, which is what confines binding
+                      to a narrow axial window around each head's rest position.
 
     Args:
-        permissiveness: 0-1, whether binding site is available (from TM state)
-        r01_coeff: Consolidated binding coefficient - from params.xb_r01_coeff
-                   (= OOP mh_br * tau = 424.987 * 0.72 = 305.99)
-        E_weak: Weak state potential energy (kT units)
+        permissiveness: 0 or 1, whether the target site is open (from TM state)
+        r01_coeff: Pre-exponential binding coefficient (ms^-1) - params.xb_r01_coeff.
+                   [G] 305.99 is inherited from an earlier parameterization of
+                   this model, where it arose as the product of a binding rate
+                   and a duty-cycle scaling. It has no independent literature
+                   source and should be treated as a free parameter: it sets the
+                   overall attachment timescale and is a natural first candidate
+                   when fitting.
+        E_weak: Elastic energy of the weak configuration at this geometry (kT)
 
     Returns:
-        Rate r01 (per ms)
+        Rate r01 (ms^-1)
     """
     r01 = permissiveness * r01_coeff * jnp.exp(-E_weak)
     return jnp.where(jnp.isnan(r01), 0.0, r01)
 
 
 def xb_rate_10(r01, U_DRX, U_loose):
-    """Rate Loose->DRX (unbinding) - detailed balance.
+    """Rate 1->0: weakly bound head detaches.
 
-    Uses log-space arithmetic to avoid overflow.
+    Detailed balance against the forward rate: r10 = r01 * exp(U_loose - U_DRX).
+    Because U_loose carries the head's elastic energy, a badly strained weak
+    bridge detaches quickly — weak binding is only stable near the head's
+    unstrained geometry.
+
+    Computed in log space, since r01 spans many orders of magnitude across the
+    strain range and the naive product overflows float32.
+
+    The +0.005 floor inside the logarithm keeps the rate finite where r01 is
+    exactly zero, which happens for every head facing a covered site
+    (permissiveness = 0). Without it those heads would produce log(0) = -inf and
+    poison the rate matrix. The floor is numerical housekeeping — it puts a small
+    non-zero detachment rate on heads that are not attached in the first place,
+    where it has no physical effect.
 
     Args:
-        r01: Forward binding rate
-        U_DRX: Free energy of DRX state (kT units)
-        U_loose: Free energy of loose state (kT units)
+        r01: Forward binding rate (ms^-1)
+        U_DRX: Free energy of the DRX state (kT)
+        U_loose: Free energy of the loose state, including elastic strain (kT)
 
     Returns:
-        Rate r10 (per ms)
+        Rate r10 (ms^-1), capped at 10000 ms^-1
     """
     upper = 10000.0
     log_r21 = jnp.log(r01 + 0.005) - (U_DRX - U_loose)
@@ -164,44 +301,62 @@ def xb_rate_10(r01, U_DRX, U_loose):
 
 
 def xb_rate_12(A12, E_diff):
-    """Rate Loose->Tight_1 (weak-to-strong isomerization).
+    """Rate 1->2: weak-to-strong isomerization (phosphate release).
 
-    Symmetric barrier (α=0.5): r12 = A12 × exp(ΔG₂₃/2kT) = A12 × exp(E_diff/2).
-    Faster when the strong state has less elastic strain than the weak state (E_diff > 0),
-    restoring full position-dependent mechanosensitivity.
-    Cap at 30 kT prevents overflow without affecting physiological range.
+    Biologically this is Pi release converting a loosely tethered head into a
+    strongly bound one. It is the step that commits a head to force production.
+
+    Rate law: r12 = A12 * exp(E_diff / 2), where E_diff = E_weak - E_strong is
+    how much elastic energy the head sheds by switching configurations at its
+    current position. Positive E_diff means the strong configuration is the more
+    relaxed one there, and the isomerization is faster.
+
+    The division by 2 is a symmetric-barrier assumption (alpha = 0.5): the
+    transition state is taken to sit halfway between the two configurations, so
+    half the energy difference appears in the forward rate and half in the
+    reverse. This is a modelling choice with no direct measurement behind it. A
+    different alpha would redistribute strain dependence between r12 and r21
+    without changing their ratio, which detailed balance fixes.
+
+    E_diff is capped at 30 kT before exponentiating: beyond that the rate is
+    already far above anything the timestep can resolve, and float32 overflows.
 
     Args:
-        A12: Pre-exponential rate coefficient (per ms) - from params.xb_r12_coeff.
-             Fitting parameter targeting process B apparent rate (2πb). Skeletal:
-             2πb ~ 20–60 s⁻¹ at 20–25°C (Kawai & Zhao 1993 Biophys J 65:638).
-             Note: 286 s⁻¹ from Kawai & Zhao 1993 is k₂ (ATP-induced detachment,
-             process C) — not the isomerization rate. The symmetric barrier (α=0.5)
-             is a modeling assumption, not derived from Duke 1999.
-        E_diff: Energy difference E_weak - E_strong (kT units, positive favors strong state)
+        A12: Pre-exponential rate coefficient (ms^-1) - params.xb_r12_coeff.
+             [F] Not a measured isomerization rate. It is tuned so the model
+             reproduces the apparent rate of "process B" in sinusoidal analysis
+             (2*pi*b ~ 20-60 s^-1 for skeletal at 20-25 C; Kawai & Zhao 1993
+             Biophys J 65:638). Be careful with that paper's numbers: its
+             286 s^-1 is k2, ATP-induced detachment (process C), NOT this step.
+        E_diff: E_weak - E_strong at the head's current geometry (kT); positive
+                favours the strong configuration
 
     Returns:
-        Rate r12 (per ms)
-
-    References:
-        Kawai & Zhao 1993 Biophys J 65:638 (process B rates); Månsson 2016 Biophys J.
+        Rate r12 (ms^-1)
     """
     r12 = A12 * jnp.exp(jnp.minimum(E_diff, 30.0) / 2.0)
     return jnp.where(jnp.isnan(r12), 0.0, r12)
 
 
 def xb_rate_21(r12, U_loose, U_tight_1):
-    """Rate Tight_1->Loose (reverse power stroke) - detailed balance.
+    """Rate 2->1: strong-to-weak reversal (phosphate rebinding).
 
-    Uses log-space arithmetic.
+    Detailed balance: r21 = r12 * exp(U_tight_1 - U_loose). Since the strong
+    state sits well below the loose state in free energy, this reversal is
+    strongly suppressed under normal conditions — but it becomes significant for
+    heads bound at large strain, where U_tight_1's elastic term climbs. That is
+    the model's route for a badly-positioned head to back out without completing
+    the cycle and paying an ATP.
+
+    Log-space arithmetic, as with r10, to survive the dynamic range in float32.
 
     Args:
-        r12: Forward rate
-        U_loose: Free energy of loose state
-        U_tight_1: Free energy of tight_1 state
+        r12: Forward isomerization rate (ms^-1)
+        U_loose: Free energy of the loose state, including strain (kT)
+        U_tight_1: Free energy of the tight_1 state, including strain (kT)
 
     Returns:
-        Rate r21 (per ms)
+        Rate r21 (ms^-1), capped at 10000 ms^-1
     """
     upper = 10000.0
     log_r32 = jnp.log(r12) - (U_loose - U_tight_1)
@@ -210,27 +365,40 @@ def xb_rate_21(r12, U_loose, U_tight_1):
 
 
 def xb_rate_23(A23, f_strong, delta23, k_t):
-    """Rate Tight_1->Tight_2 (power stroke).
+    """Rate 2->3: the working stroke (lever-arm swing).
 
-    Bell model: r23 = A23 × exp(-f × δ₃₄ / kT).
-    Resisting force (f > 0) slows the stroke; assisting force accelerates it.
-    δ₃₄ ≈ 0.5 nm is the lever-arm transition-state distance.
-    Tight_1 and Tight_2 share the same spring, so there is no E_diff dependence.
+    The force-generating event. The lever arm rotates, and because the head is
+    already attached to actin, that rotation pulls the thin filament toward the
+    M-line.
+
+    Bell model: r23 = A23 * exp(-f * delta_23 / kT). A load resisting the stroke
+    (f > 0) slows it; an assisting load speeds it up. Physically, external load
+    tilts the energy landscape against the transition state, and delta_23 is how
+    far along the reaction coordinate that transition state sits.
+
+    Note the MINUS sign in the exponent, opposite to xb_rate_34. That contrast is
+    the model's mechanochemistry: load holds the stroke back but hurries
+    detachment along.
+
+    Unlike r12, there is no E_diff term here — Tight_1 and Tight_2 share the same
+    spring configuration, so the elastic energy is unchanged by the transition
+    and only the load term matters.
 
     Args:
-        A23: Pre-exponential rate (per ms) - from params.xb_r23_coeff.
-             Calibrated to ~70-100 s⁻¹ at zero load (Millar & Homsher 1990).
-        f_strong: Force in strong state (pN); positive = resisting (toward M-line)
-        delta23: Transition-state distance for power stroke (nm) - params.xb_delta_23.
-                 1.0 nm; Pate & Cooke 1989 JMRCM 10:181; Huxley & Simmons 1971 (1–2 nm).
-        k_t: Thermal energy kT (pN·nm)
+        A23: Zero-load rate (ms^-1) - params.xb_r23_coeff.
+             [I] Calibrated to ~70-100 s^-1 unloaded (Millar & Homsher 1990).
+        f_strong: Force carried in the strong state (pN); positive = resisting
+        delta23: Transition-state distance (nm) - params.xb_delta_23.
+                 [M] 1.0 nm; Pate & Cooke 1989 JMRCM 10:181; Huxley & Simmons
+                 1971 Nature 233:533 report 1-2 nm.
+        k_t: Thermal energy kT (pN*nm)
 
     Returns:
-        Rate r23 (per ms)
+        Rate r23 (ms^-1), capped at 10000 ms^-1
 
     References:
-        Bell 1978 Science; Walcott 2010 Biophys J; Reconditi 2011 PNAS; Piazzesi 2007 Cell;
-        Pate & Cooke 1989 JMRCM 10:181; Huxley & Simmons 1971 Nature.
+        Bell 1978 Science 200:618; Piazzesi 2007 Cell 131:784;
+        Reconditi 2011 PNAS 108:7236; Walcott 2010 Biophys J 99:1129.
     """
     upper = 10000.0
     r23 = A23 * jnp.exp(-f_strong * delta23 / k_t)
@@ -238,22 +406,30 @@ def xb_rate_23(A23, f_strong, delta23, k_t):
 
 
 def xb_rate_32(r23, U_tight_1, U_tight_2):
-    """Rate Tight_2->Tight_1 (reverse power stroke) - detailed balance.
+    """Rate 3->2: reverse working stroke.
 
-    r32 = r23 × exp(U_tight_2 - U_tight_1).
-    With new defaults (U_tight_2=-23, U_tight_1=-18.6): r32 ≈ 0.012 × r23 —
-    strongly suppresses the reverse stroke, consistent with high duty ratio.
+    Detailed balance: r32 = r23 * exp(U_tight_2 - U_tight_1). At the default free
+    energies (U_tight_1 = -15 kT, U_tight_2 = -21 kT) the 6 kT drop across the
+    stroke gives r32 ~ exp(-6) ~ 0.0025 * r23, so the stroke is effectively
+    one-way. That asymmetry is what makes the cycle productive: heads that have
+    stroked stay stroked long enough to bear load, rather than rattling back and
+    forth and averaging to zero work.
+
+    Both free energies include the same elastic term (Tight_1 and Tight_2 share a
+    spring configuration), so it cancels in the difference — this rate is
+    strain-independent, unlike its forward partner.
 
     Args:
-        r23: Forward power-stroke rate (per ms)
-        U_tight_1: Free energy of tight_1 state (kT units, includes E_strong)
-        U_tight_2: Free energy of tight_2 state (kT units, includes E_strong)
+        r23: Forward working-stroke rate (ms^-1)
+        U_tight_1: Free energy of tight_1, including strain (kT)
+        U_tight_2: Free energy of tight_2, including strain (kT)
 
     Returns:
-        Rate r32 (per ms)
+        Rate r32 (ms^-1), capped at 10000 ms^-1
 
     References:
-        Hill 1977 Free Energy Transduction; Pate & Cooke 1989 JMRCM 10:181.
+        Hill 1977 Free Energy Transduction in Biology;
+        Pate & Cooke 1989 J Muscle Res Cell Motil 10:181.
     """
     upper = 10000.0
     log_r43 = jnp.log(r23 + 1e-30) + (U_tight_2 - U_tight_1)
@@ -261,26 +437,32 @@ def xb_rate_32(r23, U_tight_1, U_tight_2):
 
 
 def xb_rate_34(A34, f_strong, delta34, k_t):
-    """Rate Tight_2->Free_2 (ADP release / detachment).
+    """Rate 3->4: ADP release and detachment.
 
-    Slip bond (Bell 1978): tensile load accelerates ADP release for fast skeletal
-    myosin II. Positive sign is essential — opposite sign to r23 (catch bond would
-    suppress detachment under load, contradicting rapid skeletal muscle kinetics).
-    δ₄₅ ≈ 0.5 nm.
+    The post-stroke head releases ADP, binds ATP, and lets go of actin. This is
+    the rate-limiting step of the cycle for most myosins, and it consumes the
+    ATP: state 4 is the model's accounting point for ATP turnover.
+
+    Slip bond: r34 = A34 * exp(+f * delta_34 / kT). Tensile load ACCELERATES
+    detachment. The positive sign is not interchangeable with r23's negative one
+    — a catch bond here (load suppressing detachment) would make heads cling
+    harder the more they resist, which contradicts the fast unloaded shortening
+    velocities and rapid tension redevelopment seen in skeletal muscle.
 
     Args:
-        A34: Pre-exponential detachment rate (per ms) - from params.xb_r34_coeff.
-             ≥500 s⁻¹ at near-zero load (Siemankowski & White 1984 JBC).
-        f_strong: Force in strong state (pN); positive = tensile (accelerates detachment)
-        delta34: Transition-state distance for detachment (nm) - params.xb_delta_34
-        k_t: Thermal energy kT (pN·nm)
+        A34: Zero-load detachment rate (ms^-1) - params.xb_r34_coeff.
+             [M] >=500 s^-1 at near-zero load for fast skeletal myosin
+             (Siemankowski & White 1984 JBC 259:5045); cardiac is ~10x slower.
+        f_strong: Force carried in the strong state (pN); positive = tensile
+        delta34: Transition-state distance (nm) - params.xb_delta_34
+        k_t: Thermal energy kT (pN*nm)
 
     Returns:
-        Rate r34 (per ms)
+        Rate r34 (ms^-1), capped at 10000 ms^-1
 
     References:
-        Bell 1978 Science; Siemankowski & White 1984 JBC; Veigel 2005 Nat Cell Biol;
-        Capitanio 2006 PNAS; Walcott 2010 Biophys J; Prodanovic 2019 J Gen Physiol.
+        Bell 1978 Science 200:618; Veigel 2005 Nat Cell Biol 7:861;
+        Capitanio 2006 PNAS 103:87; Prodanovic 2019 J Gen Physiol 151:1013.
     """
     upper = 10000.0
     r34 = A34 * jnp.exp(f_strong * delta34 / k_t)
@@ -288,73 +470,126 @@ def xb_rate_34(A34, f_strong, delta34, k_t):
 
 
 def xb_rate_43():
-    """Rate Free_2->Tight_2 (reverse binding after detachment).
+    """Rate 4->3: re-attachment straight back into the post-stroke state.
 
-    This is zero - no reverse transition.
+    Identically zero. Once ATP has bound and the head has released actin, it
+    cannot simply reverse into the strongly-bound post-stroke state — that would
+    run the ATPase backwards and let the model recover the energy it just spent.
+    Detachment is the irreversible step that makes the cycle a cycle.
+
+    Kept as a function rather than an inline 0.0 so the rate matrix reads
+    symmetrically and so an alternative model can override it.
 
     Returns:
-        Rate r43 = 0 (per ms)
+        0.0
     """
     return 0.0
 
 
 def xb_rate_40(r40_rate):
-    """Rate Free_2->DRX (recovery to relaxed state).
+    """Rate 4->0: recovery stroke, returning the head to DRX.
+
+    ATP is hydrolysed and the lever arm re-primes, so the head is ready to bind
+    again. Modelled as a plain first-order rate: nothing here depends on strain,
+    since the head is detached and carries no load.
 
     Args:
-        r40_rate: Rate constant - from params.xb_r40
-                  (= 0.1, was hardcoded in OOP, now parameterized)
+        r40_rate: Rate constant (ms^-1) - params.xb_r40.
+                  [G] 0.1 is unsourced — it was a hardcoded constant in an
+                  earlier parameterization of this model and is retained for
+                  continuity. It sets how quickly detached heads become
+                  available again, so it caps the achievable cycling rate; worth
+                  revisiting if cycling kinetics are ever the fitting target.
 
     Returns:
-        Rate r40 (per ms)
+        Rate r40 (ms^-1)
     """
     return r40_rate
 
 
 def xb_rate_04(r04_rate):
-    """Rate DRX->Free_2 (rare direct transition).
+    """Rate 0->4: reverse of the recovery stroke.
+
+    A DRX head slipping back into the post-hydrolysis, pre-recovery state. Rare,
+    but non-zero — this pair is the one reversible link between the detached
+    states, and including it keeps that portion of the cycle thermodynamically
+    consistent rather than artificially one-way.
 
     Args:
-        r04_rate: Rate constant - from params.xb_r04.
-                  0.01 ms⁻¹; Mijailovich 2020 (k−H=10 s⁻¹); detailed balance r40/r04=10.
+        r04_rate: Rate constant (ms^-1) - params.xb_r04.
+                  [M] 0.01; Mijailovich 2020 PMC7852458 reports k_-H = 10 s^-1.
+                  Paired with xb_r40 = 0.1 this gives an equilibrium constant of
+                  10 for hydrolysis, matching the classical measurement that
+                  hydrolysis on myosin is only modestly favourable.
 
     Returns:
-        Rate r04 (per ms)
+        Rate r04 (ms^-1)
     """
     return r04_rate
 
 
 def xb_rate_50(ca_conc, k0, kmax, b, ca50):
-    """Rate SRX->DRX (Ca-dependent activation from super-relaxed).
+    """Rate 5->0: calcium recruits a head out of the super-relaxed state.
 
-    Hill equation for calcium-dependent SRX exit.
+    THICK FILAMENT ACTIVATION. Alongside tropomyosin's thin-filament regulation,
+    this is the model's second, independent way for calcium to control force —
+    and often the dominant one. Heads in SRX are folded back against the
+    backbone with their ATPase suppressed; they cannot bind at any strain. Raise
+    calcium and they are released into the available (DRX) pool.
+
+    Hill form:  r50 = k0 + (kmax - k0) * Ca^b / (ca50^b + Ca^b)
+
+    The Hill exponent b is what makes this a steep switch rather than a gradual
+    ramp, and it is a large part of why simulated force-pCa curves come out
+    steeper than single-site calcium binding could ever produce.
+
+    Do not read this rate as an "SRX release rate" to be balanced against some
+    sequestration rate of similar size: xb_r05 (the reverse) is a
+    SEQUESTRATION/parking rate, and the two are asymmetric by design.
 
     Args:
         ca_conc: Calcium concentration (M)
-        k0: Basal rate (per ms) - from params.xb_srx_k0.
-            Skeletal 0.007 ms⁻¹; cardiac 0.005 ms⁻¹; Mijailovich 2020 (kPS0=5 s⁻¹).
-        kmax: Maximum rate (per ms) - from params.xb_srx_kmax.
-              0.4 ms⁻¹; Mijailovich 2020 (kPSmax=400 s⁻¹).
-        b: Hill coefficient - from params.xb_srx_b.
-           5.0; Mijailovich 2020; Linari 2015 Nature 528:276.
-        ca50: Ca50 for half-activation (M) - from params.xb_srx_ca50
+        k0: Basal rate at zero calcium (ms^-1) - params.xb_srx_k0.
+            [I] 0.007 skeletal / 0.005 cardiac; Mijailovich 2020 PMC7852458
+            reports kPS0 = 5 s^-1.
+        kmax: Saturating rate at high calcium (ms^-1) - params.xb_srx_kmax.
+              [M] 0.4; Mijailovich 2020 kPSmax = 400 s^-1.
+        b: Hill exponent - params.xb_srx_b.
+           [M] 5.0; Mijailovich 2020; consistent with the sharp myosin
+           recruitment in Linari 2015 Nature 528:276.
+        ca50: Calcium for half-maximal recruitment (M) - params.xb_srx_ca50.
+              [G] 1e-6 (pCa 6) is a round number in the physiological range,
+              not a measured value for this transition.
 
     Returns:
-        Rate r50 (per ms)
+        Rate r50 (ms^-1)
     """
     return k0 + ((kmax - k0) * ca_conc**b) / (ca50**b + ca_conc**b)
 
 
 def xb_rate_05(r05_rate):
-    """Rate DRX->SRX (entering super-relaxed state).
+    """Rate 0->5: an available head parks itself in the super-relaxed state.
+
+    Sequestration, not release. A DRX head folds back against the thick filament
+    backbone and drops out of the recruitable pool.
+
+    Together with xb_rate_50 this sets the resting SRX occupancy: the fraction
+    parked at equilibrium is r05 / (r05 + r50(Ca)), so at low calcium — where
+    r50 falls to k0 — the balance tips heavily toward SRX. Skeletal defaults
+    (r05 = 0.007, k0 = 0.007) give roughly half the heads parked at rest. The
+    cardiac preset uses a much larger r05 (0.2), putting the great majority of
+    cardiac heads in reserve at rest and leaving more headroom for calcium to
+    recruit — which is where much of cardiac contractile reserve comes from.
 
     Args:
-        r05_rate: Consolidated rate - from params.xb_r05.
-                  Skeletal 0.007 ms⁻¹ (50% SRX at rest); cardiac 0.012 ms⁻¹ (70% SRX);
-                  Stewart 2010 PNAS 107:430; Linari 2015 Nature 528:276.
+        r05_rate: Rate constant (ms^-1) - params.xb_r05.
+                  [M] skeletal 0.007 (~50% SRX at rest; Stewart 2010 PNAS
+                  107:430); cardiac 0.2, matching Mijailovich 2020's
+                  k_-PS = 200 s^-1. 200 s^-1 is the literature ceiling for this
+                  rate, not a floor to stay under.
 
     Returns:
-        Rate r05 (per ms)
+        Rate r05 (ms^-1)
     """
     return r05_rate
 
@@ -365,31 +600,53 @@ def xb_rate_05(r05_rate):
 
 def compute_xb_energies(r, theta, g_k_weak, g_r_weak, c_k_weak, c_r_weak,
                         g_k_strong, g_r_strong, c_k_strong, c_r_strong, k_t):
-    """Compute crossbridge potential energies in weak and strong states.
+    """Elastic energy a crossbridge would store in each spring configuration.
+
+    Evaluates the two-spring head potential (see core/params.py for the geometry)
+    at a head's CURRENT position, once for the weak rest configuration and once
+    for the strong one:
+
+        E = [ 0.5*g_k*(r - g_rest)^2  +  0.5*c_k*(theta - c_rest)^2 ] / kT
+
+    Both are computed for every head regardless of which state it is actually in,
+    because the rates need the comparison: E_weak controls attachment
+    (xb_rate_01), and E_diff = E_weak - E_strong controls the weak-to-strong
+    isomerization (xb_rate_12). A head sitting where the strong configuration is
+    the relaxed one has large positive E_diff and isomerizes readily; a head
+    reaching awkwardly does not.
+
+    E_diff is accumulated term by term rather than as E_weak - E_strong. At
+    typical geometries the two energies are large and nearly equal, so the naive
+    subtraction loses most of its significant digits in float32 — and E_diff then
+    goes straight into an exponential, where that error is amplified.
+
+    In state terms: the weak configuration applies to states 1 (Loose) and
+    4 (Free_2); the strong configuration to states 2 (Tight_1) and 3 (Tight_2).
 
     Args:
-        r: Radial distance from thick to thin filament (nm)
-        theta: Angular position (radians)
-        g_k_weak, g_r_weak: Globular domain spring constant and rest length (weak)
-        c_k_weak, c_r_weak: Converter domain spring constant and rest angle (weak)
-        g_k_strong, g_r_strong: Globular domain (strong)
-        c_k_strong, c_r_strong: Converter domain (strong)
+        r: Head length, sqrt(axial^2 + lattice_spacing^2) (nm) — NOT the radial
+           distance alone
+        theta: Head angle from the filament axis, atan2(radial, axial) (radians)
+        g_k_weak, g_r_weak: Globular linear spring constant and rest length (weak)
+        c_k_weak, c_r_weak: Converter angular spring constant and rest angle (weak)
+        g_k_strong, g_r_strong: Globular spring, strong configuration
+        c_k_strong, c_r_strong: Converter spring, strong configuration
         k_t: Thermal energy kT (pN*nm)
 
     Returns:
-        E_weak: Energy in weak state (kT units)
-        E_strong: Energy in strong state (kT units)
-        E_diff: E_weak - E_strong (computed directly for precision)
+        E_weak: Elastic energy in the weak configuration (kT)
+        E_strong: Elastic energy in the strong configuration (kT)
+        E_diff: E_weak - E_strong, computed term-wise for float32 precision (kT)
     """
-    # Weak state energy (states 2, 5)
+    # Weak configuration — states 1 (Loose) and 4 (Free_2)
     E_weak = (0.5 * g_k_weak * (r - g_r_weak)**2 +
               0.5 * c_k_weak * (theta - c_r_weak)**2) / k_t
 
-    # Strong state energy (states 3, 4)
+    # Strong configuration — states 2 (Tight_1) and 3 (Tight_2)
     E_strong = (0.5 * g_k_strong * (r - g_r_strong)**2 +
                 0.5 * c_k_strong * (theta - c_r_strong)**2) / k_t
 
-    # Compute difference directly to avoid catastrophic cancellation
+    # Term-wise difference — avoids catastrophic cancellation, see docstring
     delta_g_energy = 0.5 * (g_k_weak * (r - g_r_weak)**2 - g_k_strong * (r - g_r_strong)**2)
     delta_c_energy = 0.5 * (c_k_weak * (theta - c_r_weak)**2 - c_k_strong * (theta - c_r_strong)**2)
     E_diff = (delta_g_energy + delta_c_energy) / k_t

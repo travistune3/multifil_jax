@@ -90,7 +90,7 @@ rm -rf ~/.cache/multifil_jax/xla/
 Peak VRAM scales with batch size and simulation duration:
 
 ```
-peak VRAM (GB) ≈ minibatch_size × n_steps × 45 metrics × 4 bytes × 2 / 1e9
+peak VRAM (GB) ≈ minibatch_size × n_steps × 52 metrics × 4 bytes × 2 / 1e9
 ```
 
 | minibatch_size | Peak VRAM (approx, at 1000 steps) |

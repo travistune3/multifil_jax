@@ -148,23 +148,9 @@ print(f"Replicate forces (mean over time): {[float(result_reps.axial_force[i].me
 
 #%%
 # ===========================================================================
-# 7. INVERTEBRATE GEOMETRY
+# 7. STRUCTURAL SWEEP (stack results from different topologies)
 # ===========================================================================
-print("\n7. Invertebrate Geometry")
-print("-" * 50)
-
-static_invert = StaticParams(actin_geometry='invertebrate')
-topo_invert = SarcTopology.create(nrows=2, ncols=2, static_params=static_invert, dynamic_params=dynamic)
-topo_invert = jax.device_put(topo_invert)
-
-result_invert = run(topo_invert, pCa=4.5, z_line=1100.0, duration_ms=100)
-print(f"Invertebrate mean force: {float(result_invert.axial_force.mean()):.2f} pN")
-
-#%%
-# ===========================================================================
-# 8. STRUCTURAL SWEEP (stack results from different topologies)
-# ===========================================================================
-print("\n8. Structural Sweep (SimulationResult.stack)")
+print("\n7. Structural Sweep (SimulationResult.stack)")
 print("-" * 50)
 
 results_list = []
@@ -209,6 +195,4 @@ v3.0 API Cheatsheet:
     std  = result.std()         # standard deviation over replicates
     sliced = result.sel(pCa=4.5)  # select by coordinate value
 
-    # Invertebrate geometry
-    static = StaticParams(actin_geometry='invertebrate')
 """)

@@ -1,25 +1,57 @@
 """
-MultiFilament JAX Implementation
+multifil_jax — a GPU-accelerated spatially-explicit half-sarcomere model.
 
-High-performance JAX implementation of half-sarcomere muscle contraction model.
+Simulates the molecular machinery of muscle contraction: individual myosin heads
+cycling through a six-state chemomechanical cycle, tropomyosin regulating access
+to actin under calcium control and cooperative coupling, and the whole filament
+lattice held in mechanical equilibrium at every timestep. Force emerges from the
+interaction of thousands of stochastic motors with a compliant elastic
+structure; it is never prescribed.
 
-Basic usage:
-    from multifil_jax import SarcTopology, get_skeletal_params
-    from multifil_jax.core.params import StaticParams
+The model is spatially explicit, which is the point of it. Each head has a real
+position in a hexagonal filament lattice, reaches for real binding sites, and
+competes with its neighbours through filament compliance. Questions about
+geometry — lattice spacing, filament registration, sarcomere length, species
+differences in packing — can be asked directly rather than parameterized away.
+
+Everything is JAX. The full simulation compiles to a single GPU kernel, and
+parameter sweeps run as one batched computation rather than a loop, which makes
+sweeping hundreds of conditions little more expensive than one.
+
+QUICK START
+-----------
+    from multifil_jax import SarcTopology, run
+    from multifil_jax.core.params import get_skeletal_params
 
     static, dynamic = get_skeletal_params()
     topo = SarcTopology.create(nrows=2, ncols=2,
                                static_params=static, dynamic_params=dynamic)
 
-    # Run simulation via top-level run() API
-    from multifil_jax import run
-    result = run(topo, pCa=4.5, z_line=900.0, duration_ms=100)
+    result = run(topo, pCa=4.5, z_line=1100.0, duration_ms=1000,
+                 dynamic_params=dynamic, static_params=static)
     print(result.summary())
 
-For parameter sweeps:
-    result = run(topo, pCa=[4.5, 5.0, 6.0], replicates=5)
+Pass a list instead of a scalar to sweep it — the axes are Cartesian-producted
+and run in parallel:
 
-All metrics are always computed (no metric selection needed).
+    result = run(topo, pCa=[9.0, 6.0, 5.5, 4.5], replicates=5)
+
+WHERE THINGS LIVE
+-----------------
+    core/params.py        every physical parameter, with citations and an
+                          explicit confidence tier; four species presets
+    core/sarc_geometry.py the filament lattice and all structural index maps
+    core/state.py         what changes each timestep, and nothing else
+    kernels/              the physics: rate laws, forces, transitions, solver
+    metrics_fn.py         everything a run reports
+    simulation.py         run(), the batching machinery, and SimulationResult
+
+A NOTE ON PARAMETERS
+--------------------
+Muscle models are underdetermined. Several parameters here have no direct
+measurement, and some that do have measurements spanning an order of magnitude.
+Every value in core/params.py is therefore tagged [M] measured, [I] inferred,
+[G] guess, or [F] fitted. Check the tag before treating a number as evidence.
 """
 
 # Version info

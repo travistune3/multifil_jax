@@ -1,29 +1,74 @@
 """
-Equilibrium Solver for multifil_jax.
+Mechanical equilibrium solver.
 
-Solves for filament positions where all forces balance (F(x) = 0) using
-Newton-Raphson with CG and block-tridiagonal preconditioning.
+THE PROBLEM
+-----------
+After the kinetics phase, crossbridges have attached and detached, so the
+lattice is no longer in force balance. This module finds the filament node
+positions x at which every node's net axial force vanishes:
 
-Loop Architecture:
-- Newton: jax.lax.while_loop (body traced once; exits at convergence or cap)
-- CG and Thomas solve: Python for loops (XLA unrolls at trace time)
-- thomas_factor stays as Python for loop (called once before scan, not in hot path)
+    F(x) = 0
 
-Performance:
-- CG uses 1 JVP per iteration vs BiCGStab's 2
-- Baked-in negation avoids per-iteration sign flip overhead
-- Python loop unrolling enables full XLA fusion (no WhileOp barriers)
+This is solved to convergence at every timestep. There is no time integration
+of the mechanics — see kernels/forces.py for why an instantaneously equilibrated
+treatment is appropriate at this scale. It is also, by a wide margin, the most
+expensive part of a timestep.
 
-Preconditioner Strategy:
------------------------
-Static preconditioner (passive springs only, no titin) is OPTIMAL because:
-1. Titin stiffness is negligible at normal conditions (<0.01% of passive)
-2. At extreme stretch, titin exp(b*stretch) overflows and breaks convergence
-3. Static preconditioner handles all conditions including stiff titin
+WHY NEWTON, AND WHY IT CONVERGES SO FAST
+----------------------------------------
+F is nonlinear, mostly because crossbridge force depends on head geometry
+through square roots and arctangents. But it is very nearly linear: the
+filament backbones are exactly linear springs, and they dominate the Jacobian.
+So Newton's method converges in one to a few iterations from a warm start, and
+the previous timestep's positions are always an excellent warm start — the
+lattice moves only slightly per millisecond.
+
+The outer loop is a lax.while_loop that exits as soon as the residual falls
+below tolerance, rather than always running a fixed count.
+
+WHY THE LINEAR SOLVE IS ITERATIVE
+---------------------------------
+Each Newton step needs to solve J dx = F. Forming J explicitly is out of the
+question: it is (n_nodes x n_nodes) for a system with tens of thousands of
+nodes. Instead conjugate gradient is used, which needs only the ACTION of J on a
+vector — and that comes free from JAX's forward-mode autodiff (jax.jvp) applied
+to the residual function. The Jacobian is never assembled at all.
+
+CG rather than a general-purpose Krylov method because J is symmetric positive
+definite here (it is the Hessian of an elastic energy), and CG needs one
+Jacobian-vector product per iteration where BiCGStab would need two.
+
+THE PRECONDITIONER
+------------------
+CG converges quickly only if the system is well conditioned, so it is
+preconditioned with an approximate inverse. The approximation used is the
+backbone springs alone — no crossbridges, no titin. That makes each filament's
+block a TRIDIAGONAL matrix (each node couples only to its two neighbours), which
+can be factored exactly by the Thomas algorithm.
+
+Two properties make this a good choice rather than a lazy one:
+
+  It is constant. The backbone stiffness never changes during a simulation, so
+  the factorization is computed ONCE before the time loop and reused every step
+  thereafter, rather than being rebuilt as crossbridges come and go.
+
+  It is robust. Including titin would be more accurate in principle, but titin's
+  exponential stiffness overflows at extreme stretch and would destroy the
+  preconditioner exactly when the solve is hardest. The backbone-only
+  approximation degrades gracefully instead.
+
+LATTICE SPACING AS AN UNKNOWN
+-----------------------------
+In dynamic lattice spacing mode the filament separation d is not prescribed but
+determined by radial force balance. Rather than alternating between an axial and
+a radial solve, d is appended to the position vector as one extra degree of
+freedom and the whole augmented system is solved at once. Autodiff then supplies
+the cross-coupling terms — how d affects axial forces, and how the node
+positions affect the radial balance — automatically and exactly.
 
 Usage:
     from multifil_jax.kernels.solver import solve_equilibrium
-    state, residual, iters = solve_equilibrium(state, constants, topology)
+    state, residual, new_ls, n_iters = solve_equilibrium(state, constants, topology)
 """
 
 import jax
@@ -43,10 +88,19 @@ if TYPE_CHECKING:
     from multifil_jax.core.state import State
     from multifil_jax.core.params import DynamicParams
 
-# Minimum tolerance achievable with float32 arithmetic at default spring constants.
-# Float32 position epsilon at typical filament positions (~900 nm) ≈ 1e-4 nm.
-# Force floor = thick_k × 1e-4 nm. At default thick_k=2020 pN/nm: floor ≈ 0.20 pN.
-# For stiffer springs this floor scales proportionally — see solve_equilibrium().
+# Absolute floor on the convergence tolerance, in pN.
+#
+# There is a limit to how small a residual float32 can even represent here. Node
+# positions are ~1000 nm, where consecutive float32 values differ by ~1e-4 nm, so
+# a position cannot be resolved more finely than that. Multiplying by the
+# backbone stiffness turns that position quantum into a force quantum:
+# thick_k * 1e-4 pN. Asking the solver for a residual below it makes the
+# while_loop iterate until its cap, burning time to chase a target that
+# arithmetic cannot express.
+#
+# At the default thick_k = 7500 pN/nm that floor is ~0.75 pN, so this constant
+# is not what binds at default parameters — solve_equilibrium() takes the
+# maximum of this and the stiffness-scaled floor. It matters at soft parameters.
 MIN_FLOAT32_TOLERANCE = 0.25
 
 
@@ -72,10 +126,18 @@ class ThomasFactors(NamedTuple):
 
 
 def thomas_factor(lower: jnp.ndarray, diag: jnp.ndarray, upper: jnp.ndarray) -> ThomasFactors:
-    """Forward sweep of Thomas algorithm (LU factorization of tridiagonal matrix).
+    """Factor a tridiagonal matrix — the forward sweep of the Thomas algorithm.
 
-    Uses Python for loop (unrolled at trace time) so XLA can fuse the entire
-    sweep — no WhileOp fusion barriers from lax.scan.
+    Thomas is Gaussian elimination specialized to tridiagonal systems: it runs
+    in O(n) rather than O(n^3) because eliminating each row touches only the one
+    below it. This function does the elimination and stores what
+    back-substitution will need.
+
+    Called ONCE per simulation, before the time loop, since the preconditioner
+    matrix is constant. That is why a Python for loop is acceptable here despite
+    being sequential — it is unrolled at trace time and never appears in the hot
+    path. (thomas_solve, which DOES run every CG iteration, uses a parallel scan
+    instead.)
 
     Args:
         lower: (n-1,) sub-diagonal
@@ -101,17 +163,33 @@ def thomas_factor(lower: jnp.ndarray, diag: jnp.ndarray, upper: jnp.ndarray) -> 
 
 
 def thomas_solve(factors: ThomasFactors, rhs: jnp.ndarray) -> jnp.ndarray:
-    """Back-substitution using pre-factored Thomas data.
+    """Solve a tridiagonal system using pre-computed factors.
 
-    Uses jax.lax.associative_scan for both forward and back substitution.
-    Both passes are linear recurrences of the form  state[i] = a[i]*state[i-1] + b[i],
-    which are associative under  (a2,b2) ∘ (a1,b1) = (a2*a1, a2*b1+b2).
+    Runs on every CG iteration of every Newton step of every timestep, so it is
+    genuinely hot, and a sequential sweep would serialize a GPU that has
+    thousands of idle lanes.
 
-    Compared to Python for-loops:
-      - ~5× fewer jaxpr equations → ~23× faster JIT compile
-      - ~20% faster runtime on GPU (parallel O(log n) vs sequential O(n))
-      - Numerical error ~1e-4 relative, acceptable since preconditioner
-        is already an approximation (κ=1.04 → M is ~4% off from J)
+    Both substitution passes are linear recurrences of the form
+
+        state[i] = a[i] * state[i-1] + b[i]
+
+    which look inherently sequential but are not. Such a recurrence is an affine
+    map, and affine maps COMPOSE associatively:
+
+        (a2, b2) o (a1, b1) = (a2*a1, a2*b1 + b2)
+
+    so the whole recurrence can be evaluated by a parallel prefix scan in
+    O(log n) depth instead of O(n) steps. jax.lax.associative_scan does exactly
+    that. Back substitution runs the same way on reversed arrays.
+
+    The parallel form is also far cheaper to compile: it emits roughly a fifth
+    as many jaxpr equations as an unrolled loop of the same length.
+
+    Accuracy: the reassociation costs about 1e-4 relative error compared to the
+    sequential sweep. Irrelevant here — this matrix is only a preconditioner, an
+    approximation to the true Jacobian by construction, and CG corrects for its
+    inexactness. Do not reuse this routine where an exact tridiagonal solve is
+    required.
 
     Args:
         factors: Pre-computed ThomasFactors from thomas_factor()
@@ -289,7 +367,21 @@ def _preconditioned_cg(neg_jac_mv, precond_mv, b, x0, n_cg_steps):
 
 
 def _run_newton(residual_fn, precond_mv, pos0, tol, n_newton_steps, n_cg_steps, post_step=None):
-    """Newton while_loop kernel shared by fixed-LS and dynamic-LS solvers.
+    """The Newton iteration itself, shared by the fixed- and dynamic-spacing solvers.
+
+    Each step solves J dx = F for the update and applies it. The Jacobian-vector
+    product is obtained by forward-mode autodiff of residual_fn — the Jacobian
+    is never assembled. Note the sign is folded into neg_jac_mv rather than
+    negating dx afterwards, saving a pass over the vector each CG iteration.
+
+    Exits as soon as max|F| falls below tol, or after n_newton_steps. Both
+    conditions live in the while_loop predicate, so the body is traced once
+    regardless of how many iterations actually run.
+
+    Non-finite updates are zeroed rather than propagated. This is a safety net
+    for extreme parameter combinations where the Jacobian is near-singular:
+    the step is skipped, the iteration continues, and a poor residual is
+    reported at the end rather than NaN spreading through the whole batch.
 
     Args:
         residual_fn: pos -> force residual vector
@@ -309,9 +401,13 @@ def _run_newton(residual_fn, precond_mv, pos0, tol, n_newton_steps, n_cg_steps, 
     def body(carry):
         x, f, i = carry
         if n_cg_steps == 0:
-            # Richardson iteration: dx = M^{-1} f (no JVP).
-            # Only converges well when preconditioner M ≈ J (detached XBs).
-            # Use n_cg_steps>=1 for systems with many attached crossbridges.
+            # Richardson iteration: take the preconditioner's own solve as the
+            # step, with no CG refinement and no Jacobian-vector product at all.
+            # This is only valid when the preconditioner is nearly the true
+            # Jacobian, i.e. when the backbone springs are essentially the whole
+            # system. That holds with no crossbridges attached and fails once
+            # they are: attached heads add stiffness the preconditioner does not
+            # model, and the iteration diverges. Not a usable default.
             dx = precond_mv(f)
         else:
             neg_jac_mv = lambda v: -jax.jvp(residual_fn, (x,), (v,))[1]
@@ -611,9 +707,10 @@ def solve_equilibrium(
     n_thin, n_sites = thin_axial.shape
     n_thick_nodes = n_thick * n_crowns
 
-    # Resolve tolerance with float32 precision floor.
-    # floor ≈ thick_k × 1e-4 (float32 position epsilon at ~900 nm).
-    # At default thick_k=2020: floor ≈ 0.20 pN. At 5× stiff: floor ≈ 1.01 pN.
+    # Raise the requested tolerance to the float32 precision floor if needed.
+    # See MIN_FLOAT32_TOLERANCE: the floor scales as thick_k * 1e-4, which is
+    # ~0.75 pN at the default thick_k = 7500. Asking for less is unachievable
+    # and merely makes the Newton loop run to its iteration cap.
     if tolerance is None:
         tolerance = constants.solver_tol
     float32_floor = constants.thick_k * jnp.asarray(1e-4)

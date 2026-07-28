@@ -1,8 +1,40 @@
 """
-Force Calculations for JAX Half-Sarcomere
+Force calculations for the half-sarcomere.
 
-This module provides ALL force calculations for the multifil_jax simulation.
-Functions are organized by their purpose and the type of forces calculated.
+WHAT IS BEING BALANCED
+----------------------
+The half-sarcomere is a network of springs. Each thick filament is a chain of
+crowns connected by backbone springs; each thin filament is a chain of binding
+sites connected likewise. Crossbridges bridge between them, and titin tethers
+the thick filament to the Z-disc. Every node has a position, and mechanical
+equilibrium means the net axial force on every node is zero.
+
+This module computes those forces. The solver (kernels/solver.py) then moves the
+nodes until the residual vanishes:
+
+    F(x) = F_backbone(x) + F_crossbridge(x) + F_titin(x) = 0
+
+Note what is NOT here: inertia and viscosity. The system is solved to
+equilibrium at every timestep rather than integrated forward in time. At
+sarcomere scale, viscous relaxation is far faster than the chemistry, so the
+mechanics can be treated as instantaneously equilibrated after each kinetic
+step. This is why there is a Newton solve in the loop rather than an ODE
+integrator.
+
+SIGN CONVENTION
+---------------
+Positions increase from the M-line (0) toward the Z-line. A positive force on a
+node pushes it toward larger coordinates, i.e. away from the M-line. Contractile
+force therefore appears as a NEGATIVE force on thin filament nodes — the thin
+filament is being pulled inward.
+
+AXIAL AND RADIAL
+----------------
+Most of this module computes AXIAL forces, which is what the equilibrium solver
+balances and what "muscle force" means. Two functions at the end compute RADIAL
+forces instead: crossbridges and titin both act at an angle, so they squeeze the
+filament lattice together as well as pulling along it. Those are used only in
+dynamic lattice spacing mode, where the spacing itself is solved as an unknown.
 
 FORCE TYPE OVERVIEW:
 ====================
@@ -63,19 +95,39 @@ def compute_thick_passive_forces_single(
     titin_rest: float,
     n_titin: int = 6
 ) -> jnp.ndarray:
-    """Compute net force on each crown of one thick filament.
+    """Net axial force on each crown of one thick filament: backbone + titin.
+
+    The thick filament is a chain of springs running from the M-line out to the
+    tip. The M-line itself is treated as a fixed anchor at position 0 — it is the
+    mirror plane where the two half-sarcomeres meet, so by symmetry it does not
+    move.
+
+    Net force on an interior crown is the difference between the springs on
+    either side of it, so a uniformly stretched filament has zero net force
+    everywhere except at its ends, as it should.
+
+    TITIN acts only on the LAST crown, the filament tip, because that is where
+    it attaches. It is a one-sided exponential spring reaching diagonally to the
+    Z-disc: its length is sqrt(axial^2 + lattice_spacing^2), and only the axial
+    component enters here. It pulls the tip toward the Z-line, and it is
+    one-sided — compression produces no force, since a protein tether cannot
+    push.
 
     Args:
-        positions: (n_crowns,) crown axial positions
-        rests: (n_crowns,) rest spacings between crowns
-        thick_k: Thick filament spring constant (pN/nm)
-        z_line: Z-line position (nm)
-        lattice_spacing: Lattice spacing (nm)
-        titin_a, titin_b, titin_rest: Titin parameters
-        n_titin: Number of titin filaments attached to this thick (default 6)
+        positions: (n_crowns,) crown axial positions (nm)
+        rests: (n_crowns,) rest spacing between each crown and the previous node
+        thick_k: Backbone spring constant per segment (pN/nm)
+        z_line: Z-line position (nm), the far anchor for titin
+        lattice_spacing: Radial thick-to-thin distance (nm), the other leg of
+            titin's diagonal
+        titin_a, titin_b, titin_rest: Exponential spring parameters,
+            F = titin_a * exp(titin_b * (L - titin_rest))
+        n_titin: Titin molecules per thick filament. 6 matches the vertebrate
+            sixfold arrangement; unverified for the 1:3 insect lattice, where it
+            scales total passive force directly.
 
     Returns:
-        forces: (n_crowns,) net force on each crown
+        forces: (n_crowns,) net axial force on each crown (pN)
     """
     # Prepend M-line position (0) to crown positions
     axial_with_mline = jnp.concatenate([jnp.array([0.0]), positions])
@@ -231,12 +283,19 @@ def thin_filament_internal_forces(axial_positions: jnp.ndarray,
                                    rest_spacings: jnp.ndarray,
                                    k: float,
                                    z_line: float) -> jnp.ndarray:
-    """Calculate NET force on each thin filament binding site node.
+    """Net axial force on each thin filament node, from the backbone springs only.
 
-    This is the JAX equivalent of NumPy's af.py::_axial_thin_filament_forces().
+    The thin filament is anchored at the Z-line and runs inward toward the
+    M-line, so the chain here is the mirror image of the thick filament's: the
+    Z-line is the fixed end, appended as the final node.
 
-    Returns NET force on each node = force from right spring - force from left spring.
-    When cumsummed with np.triu(), gives cumulative tension at each site.
+    Net force on a node is the difference between the springs on either side of
+    it. Taking a running sum of these from one end gives the cumulative TENSION
+    borne at each point along the filament, which is what the legacy
+    cooperativity model reads.
+
+    Crossbridge forces are deliberately excluded — see
+    calculate_thin_forces_for_cooperativity().
 
     Args:
         axial_positions: (n_thin, n_sites) binding site positions (nm)
@@ -276,18 +335,18 @@ def calculate_thin_forces_for_cooperativity(
     constants: 'DynamicParams',
     topology: 'SarcTopology',
 ) -> jnp.ndarray:
-    """Calculate INTERNAL thin filament forces for cooperativity calculations.
+    """Internal thin filament tension, for the legacy cooperativity model.
 
-    PURPOSE: These forces are used by update_cooperativity() to determine
-    the cooperative span of tropomyosin based on filament tension.
+    Used only on the legacy cooperativity path (run(legacy_coop=True)), where
+    the cooperative span depends on how much tension the filament is carrying.
+    The default Ising path does not call this at all.
 
-    FORCE TYPE: INTERNAL spring forces from thin filament backbone deformation.
-    These are NOT crossbridge forces - they represent the tension transmitted
-    through the actin filament springs.
-
-    CRITICAL DISTINCTION: The NumPy OOP version (af._axial_thin_filament_forces)
-    explicitly states "sans cross-bridges" - meaning internal spring forces only.
-    Using crossbridge forces here would be INCORRECT for cooperativity.
+    THESE ARE BACKBONE SPRING FORCES ONLY, NOT CROSSBRIDGE FORCES, and the
+    distinction is load-bearing rather than pedantic. The quantity the model
+    wants is the strain transmitted ALONG the actin filament, which is what
+    physically deforms tropomyosin and biases neighbouring sites. Passing
+    crossbridge forces here instead would be measuring the wrong thing: those
+    are the loads applied TO the filament, not the tension carried within it.
 
     Args:
         state: State NamedTuple containing thin.axial: (n_thin, n_sites) positions
@@ -300,7 +359,6 @@ def calculate_thin_forces_for_cooperativity(
     See Also:
         - thin_filament_internal_forces() - The underlying calculation
         - calculate_crossbridge_forces_on_thin() - EXTERNAL forces (different purpose)
-        - NumPy reference: multifil/af.py:732-753 (_axial_thin_filament_forces)
     """
     return thin_filament_internal_forces(
         state.thin.axial,
@@ -323,10 +381,33 @@ def compute_xb_forces_vectorized(
     params: 'DynamicParams',
     geometry: 'SarcTopology'
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Fully vectorized crossbridge force calculation.
+    """Axial force every attached crossbridge exerts on its crown and its site.
 
-    Uses geometry.xb_to_thin_id for thin filament lookup (no division).
-    Uses segment_sum for efficient GPU accumulation.
+    Each attached head is a two-spring element (see core/params.py for the
+    geometry and where the rest configurations come from). Given the head's
+    current offset x to its bound site and the lattice spacing d, its length and
+    angle are r = sqrt(x^2 + d^2) and theta = atan2(d, x), and the axial force
+    follows from differentiating the two-spring potential with respect to the
+    crown's position:
+
+        F = g_k*(r - g_rest)*cos(theta) - (c_k/r)*(theta - c_rest)*sin(theta)
+              globular, linear                converter, angular
+
+    THE MINUS SIGN ON THE ANGULAR TERM IS NOT COSMETIC. The two springs pull the
+    head in competing directions: extending the linear spring resists
+    lengthening, while winding the angular spring past its rest angle drives the
+    head the other way. Flipping that sign inverts the converter's contribution,
+    and because c_k can dominate g_k in the strong state, it can silently
+    reverse the sign of total muscle force.
+
+    Which rest configuration applies depends on the head's state: strong
+    (states 2 and 3) or weak (states 1 and 4). Heads in states 0 or 5 are
+    detached and contribute nothing.
+
+    Forces are equal and opposite: whatever a head does to its crown, it does the
+    negative of to its binding site. Site accumulation uses segment_sum because
+    many heads can share one site, and atomics avoid materializing an
+    (n_xb x n_sites) scatter matrix.
 
     Args:
         positions_thick: (n_thick, n_crowns) crown positions
@@ -462,7 +543,7 @@ def compute_forces_vectorized(
     The residual is: F(x) = 0 at equilibrium
 
     Rest spacings are sourced from geometry (topology):
-        thick: geometry.crown_rests[None, :] broadcast to (n_thick, n_crowns)
+        thick: geometry.crown_rests (n_thick, n_crowns), per-filament
         thin:  geometry.binding_rests (n_thin, n_sites)
 
     Args:
@@ -481,8 +562,7 @@ def compute_forces_vectorized(
     Returns:
         forces: (n_thick_nodes + n_thin_nodes,) flattened force residual
     """
-    n_thick = positions_thick.shape[0]
-    rests_thick = jnp.broadcast_to(geometry.crown_rests[None, :], (n_thick, geometry.crown_rests.shape[0]))
+    rests_thick = geometry.crown_rests
     rests_thin = geometry.binding_rests
 
     # 1. Thick filament passive forces (with titin)
@@ -573,10 +653,9 @@ def compute_thick_forces_vectorized(
         Forces on thick nodes: (n_thick, n_crowns)
     """
     # 1. Passive forces from thick filament springs (including titin)
-    n_thick = state.thick.axial.shape[0]
     f_passive = compute_thick_passive_forces_vectorized(
         state.thick.axial,
-        jnp.broadcast_to(topology.crown_rests[None, :], (n_thick, topology.crown_rests.shape[0])),
+        topology.crown_rests,
         constants.thick_k,
         constants.z_line,
         constants.lattice_spacing,
@@ -605,26 +684,43 @@ def compute_thick_forces_vectorized(
 # ============================================================================
 
 def axial_force_at_mline(state: 'State', constants: 'DynamicParams', topology: 'SarcTopology') -> float:
-    """Calculate total axial force at the M-line (effective axial force).
+    """Total axial force delivered to the M-line. The model's primary output.
 
-    This is the key output for force-length and force-velocity measurements.
+    This is what "muscle force" means for this simulation, and what a
+    force transducer attached to the preparation would read.
 
-    IMPORTANT: This is the SPRING force transmitted through the thick filament
-    backbone to the M-line, NOT the sum of all crossbridge forces.
+    IT IS MEASURED, NOT SUMMED. The force is read from the strain in the first
+    backbone spring of each thick filament — the segment between the M-line and
+    the first crown:
 
-    Formula: force = sum_over_thick_filaments( (crown[0] - bare_zone) * thick_k )
+        force = sum over thick filaments of (crown[0] - bare_zone) * thick_k
 
-    Matches OOP mf.effective_axial_force() at mf.py:562.
+    Deliberately NOT the sum of individual crossbridge forces. Once the solver
+    has equilibrated the lattice, every force generated anywhere on the filament
+    must be transmitted through that first segment to reach the M-line, so its
+    strain is the honest total — including the contributions of titin and of
+    filament compliance, and correctly excluding any internal forces that cancel.
+    Summing crossbridge forces directly would double-count strain that the
+    backbone is already carrying.
+
+    A corollary worth remembering: this reading is only meaningful once the
+    solver has converged. Reading it mid-solve gives the force implied by a
+    not-yet-equilibrated configuration.
+
+    Also note that at rest this is NOT zero — titin alone can dominate it at
+    long sarcomere lengths. Subtract a relaxed (pCa 9) baseline before
+    interpreting active force.
+
 
     Args:
         state: State NamedTuple (pure state, no embedded params)
         constants: DynamicParams with thick_k
-        topology: SarcTopology with crown_offsets[0] = bare_zone distance
+        topology: SarcTopology with crown_offsets[:, 0] = per-filament bare_zone distance
 
     Returns:
         force: Total axial force at M-line (pN)
     """
-    bare_zone = topology.crown_offsets[0]
+    bare_zone = topology.crown_offsets[:, 0]
     force_per_thick = (state.thick.axial[:, 0] - bare_zone) * constants.thick_k
     return jnp.sum(force_per_thick)
 
@@ -633,10 +729,18 @@ def axial_force_at_mline(state: 'State', constants: 'DynamicParams', topology: '
 # RADIAL FORCE FUNCTIONS (for dynamic lattice spacing solver)
 # ============================================================================
 
-# n_titin_per_thick used in radial force calculation.
-# Must match the default in compute_thick_passive_forces_vectorized (which uses
-# n_titin_per_thick=6). Changing this without changing that function would produce
-# inconsistent axial/radial force magnitudes.
+# Titin molecules per thick filament, for the radial force path.
+#
+# MUST match the n_titin_per_thick default used on the axial path
+# (compute_thick_passive_forces_vectorized). The two paths describe the same
+# physical tethers resolved along different axes; if they disagree on how many
+# there are, the axial and radial force magnitudes become mutually inconsistent
+# and the dynamic-lattice-spacing solve balances against a fiction.
+#
+# 6 matches the vertebrate sixfold arrangement of titin around each thick
+# filament. It is unverified for the 1:3 invertebrate lattice — no source giving
+# a per-thick-filament connecting-filament count for insect flight muscle was
+# located — and it scales passive force linearly, so it matters.
 _N_TITIN_PER_THICK = 6
 
 

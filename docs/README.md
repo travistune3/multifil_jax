@@ -12,7 +12,7 @@ minimal.
 
 1. [What Is Being Simulated?](#1-what-is-being-simulated)
 2. [Why JAX Instead of NumPy?](#2-why-jax-instead-of-numpy)
-3. [The Four Things You Need to Run a Simulation](#3-the-four-things-you-need-to-run-a-simulation)
+3. [The Three Things You Need to Run a Simulation](#3-the-three-things-you-need-to-run-a-simulation)
 4. [Running Your First Simulation](#4-running-your-first-simulation)
 5. [Understanding SimulationResult](#5-understanding-simulationresult)
 6. [What Is in results.metrics?](#6-what-is-in-resultsmetrics)
@@ -22,9 +22,11 @@ minimal.
 10. [Batch Bucketing: Why JIT Cares About Array Sizes](#10-batch-bucketing-why-jit-cares-about-array-sizes)
 11. [What Can Be Swept (vmapped) and What Cannot](#11-what-can-be-swept-vmapped-and-what-cannot)
 12. [What Happens Inside Each Timestep](#12-what-happens-inside-each-timestep)
-13. [Dynamic Lattice Spacing](#13-dynamic-lattice-spacing)
-14. [The Tiered Architecture: State, Topology, Constants, Drivers](#14-the-tiered-architecture-state-topology-constants-drivers)
-15. [Key File Reference](#15-key-file-reference)
+13. [Tropomyosin Cooperativity: Two Models](#13-tropomyosin-cooperativity-two-models)
+14. [Subpopulations: Mixed Motor Populations](#14-subpopulations-mixed-motor-populations)
+15. [Dynamic Lattice Spacing](#15-dynamic-lattice-spacing)
+16. [The Tiered Architecture: State, Topology, Constants, Drivers](#16-the-tiered-architecture-state-topology-constants-drivers)
+17. [Key File Reference](#17-key-file-reference)
 
 ---
 
@@ -86,28 +88,52 @@ a few seconds rather than recompiling.
 
 ---
 
-## 3. The Four Things You Need to Run a Simulation
+## 3. The Three Things You Need to Run a Simulation
 
-Before calling `run()`, you need three objects. Understanding what each one is
-— and which ones can be changed without recompiling — is the most important
-concept in this codebase.
+Before calling `run()`, you need three objects: a `StaticParams`, a
+`DynamicParams`, and a `SarcTopology` built from both. Understanding what each
+one is — and which ones can be changed without recompiling — is the most
+important concept in this codebase.
 
 ### StaticParams and DynamicParams (the parameters)
 
-`get_skeletal_params()` and `get_cardiac_params()` (`multifil_jax/core/params.py`) each return two objects:
+`multifil_jax/core/params.py` provides four preset factories, each returning a
+`(StaticParams, DynamicParams)` pair:
 
-**StaticParams** is a frozen Python dataclass containing structural configuration:
-how many crowns per filament (default 52), how many actin polymers per thin
-filament (default 15), the actin geometry type (vertebrate or invertebrate), and
-solver settings. These values are baked into the compiled GPU kernel. Changing
-any of them means JAX must recompile.
+| Factory | Muscle type | Notes |
+|---------|-------------|-------|
+| `get_skeletal_params()` | vertebrate fast-twitch skeletal, ~26 °C | the defaults |
+| `get_cardiac_params()` | vertebrate cardiac | slower TM/XB kinetics, stiffer titin |
+| `get_lethocerus_params()` | insect flight muscle (giant water bug) | 1:3 lattice, 4 XBs/crown, ~2× longer filaments |
+| `get_drosophila_params()` | insect flight muscle (fruit fly) | Lethocerus geometry + a 3-class myosin superlattice |
+
+The first two are importable from the package root; the two insect-flight-muscle
+(IFM) presets come from `multifil_jax.core.params`. The IFM presets set geometry
+from the structural literature but leave all crossbridge and tropomyosin *kinetics*
+at their skeletal values — they are starting points, not fitted parameter sets.
+
+**StaticParams** is a frozen Python dataclass with 21 fields of structural
+configuration: how many crowns per filament (default 52), how many actin polymers
+per thin filament (default 15), the actin geometry type (vertebrate or
+invertebrate), the actin helix pitch, how many crossbridges sit on each crown,
+the solver iteration caps, and the crossbridge binning resolution. These values
+are baked into the compiled GPU kernel — changing any of them means JAX must
+recompile.
 
 **DynamicParams** is a JAX-aware data structure containing all the actual
 physics: spring stiffnesses, rate function coefficients, calcium binding
-constants, and default values for pCa, z_line, and lattice spacing. Because
-`DynamicParams` is a JAX PyTree, its values can be swept across — you can run
-hundreds of physical parameter combinations without recompiling. There are
-approximately 45 fields.
+constants, cooperativity coupling strengths, and default values for pCa, z_line,
+and lattice spacing. Because `DynamicParams` is a JAX PyTree, its values can be
+swept across — you can run hundreds of physical parameter combinations without
+recompiling. There are 49 fields, all defined with literature citations in the
+`_DYNAMIC_DEFAULTS` dictionary at the top of `params.py`.
+
+To modify parameters, use `.copy()`, which validates field names:
+
+```python
+static, dynamic = get_cardiac_params()
+dynamic = dynamic.copy(thick_k=9000.0, xb_r05=0.15)
+```
 
 ### SarcTopology (the geometry)
 
@@ -125,9 +151,28 @@ recompilation. All lattice sizes run at approximately the same speed (~5 ms per
 timestep on an RTX 3090) because larger lattices simply have more GPU threads
 working in parallel.
 
+Some lattice shapes are rejected outright: invertebrate geometry needs an even
+`nrows` (otherwise some thick filament face has no thin filament neighbor across
+the periodic boundary), and the Drosophila superlattice additionally needs `ncols`
+to be a multiple of 3. `SarcTopology.create()` raises a `ValueError` explaining
+which constraint failed rather than building a malformed lattice. Note that 4×4 —
+the usual go-to size elsewhere — does **not** work with `get_drosophila_params()`;
+use 4×3, 6×6, or 4×6.
+
 Once created, the topology should be put on the GPU via `jax.device_put(topo)`.
 This copies all index arrays to GPU memory once rather than transferring them
 on every call.
+
+**One pitfall worth knowing about.** Every crossbridge slot needs *some* target
+index, because JAX requires fixed array shapes. Crossbridges with no real
+geometric partner (which happens when a crown's arm points at empty space) get a
+placeholder entry of "thin filament 0, face 0" — indistinguishable from a real
+target if you read `topo.xb_to_thin_id` directly. A separate boolean array,
+`topo.xb_valid`, flags them. The simulation kernels already gate on it, but
+analysis code must too. Use `topo.valid_xb_targets()`, which returns the masked
+`(xb_index, thin_id, thin_face)` triple. This matters most for small or asymmetric
+lattices: in one measured insect-flight-muscle configuration, 56 % of crossbridge
+slots were placeholders.
 
 ---
 
@@ -147,9 +192,15 @@ static, dynamic = get_skeletal_params()
 topo = SarcTopology.create(nrows=2, ncols=2, static_params=static, dynamic_params=dynamic)
 topo = jax.device_put(topo)
 
-result = run(topo, pCa=4.5, z_line=900.0, duration_ms=1000, dt=1.0)
+result = run(topo, pCa=4.5, z_line=900.0, duration_ms=1000, dt=1.0,
+             dynamic_params=dynamic, static_params=static)
 print(result.summary())
 ```
+
+Passing `dynamic_params` and `static_params` explicitly is optional for the
+skeletal preset (it *is* the default), but it is a good habit: `run()` falls back
+to fresh skeletal defaults when they are omitted, which silently discards a
+cardiac or IFM preset. See section 8 for the full story.
 
 `pCa=4.5` means a calcium concentration of 10^(-4.5), which is moderate
 activation. `pCa=9.0` is essentially no calcium (resting muscle). `z_line=900`
@@ -183,10 +234,15 @@ For a pCa sweep over 5 values with 3 replicates and 1000 steps:
 - `result.axial_force` has shape `(5, 3, 1000)`.
 - `result.metrics['n_bound']` has shape `(5, 3, 1000)`.
 
-The ordering of dimensions always follows the order in which sweep parameters
-were provided, with replicates second-to-last and time always last. The
-`result._axis_names` list names each dimension, and `result.coords` is a
-dictionary mapping each axis name to its actual values.
+Sweep axes come back in a FIXED internal order, **not** the order you passed
+the arguments in: `z_line`, `pCa`, `lattice_spacing`, then `K_lat`, `nu`, then
+any `dynamic_params` axes, then `subpopulation`. Replicates is always
+second-to-last and time always last.
+
+Do not index sweep axes by position on the assumption that they follow your
+call. Read `result._axis_names` to see the actual layout, and prefer
+`result.sel(pCa=4.5)` to select by coordinate value — that is correct
+regardless of ordering. `result.coords` maps each axis name to its values.
 
 **Key attributes you will use:**
 
@@ -194,31 +250,42 @@ dictionary mapping each axis name to its actual values.
 primary output of a mechanical simulation. It is a property that returns
 `result.metrics['axial_force']`.
 
-`result.metrics` — a `MetricsDict` containing ~46 quantities computed
+`result.metrics` — a `MetricsDict` containing 52 quantities computed
 at every timestep (described fully in the next section). `MetricsDict` supports
 both dict-style access (`result.metrics['n_bound']`) and attribute access
 (`result.metrics.n_bound`).
 
 `result.metrics['solver_residual']` — a diagnostic trace showing how well the
-mechanical equilibrium solver converged at each step. Values below 0.5 pN are
-considered converged.
+mechanical equilibrium solver converged at each step. `run()` warns after the
+fact if the residual exceeds `StaticParams.solver_residual_tol` (default 1.5 pN).
+That threshold is not a physics constant: it sits just above the float32
+precision floor, which scales roughly as `thick_k × 2e-4`. If you raise `thick_k`
+or `thin_k` well above their defaults, raise the tolerance with them or you will
+get spurious warnings.
 
 `result.metrics['newton_iters']` — the number of Newton iterations the solver
-used at each step. Typically 1–2 for standard parameters.
+used at each step. Typically 1–4 for standard parameters.
 
 `result.z_line`, `result.pCa`, `result.lattice_spacing` — the input traces
 actually used during the simulation, useful for aligning outputs with protocol
 timing.
 
 `result.topology_config` — a plain dictionary (no JAX arrays) listing the
-structural dimensions: n_thick, n_thin, n_crowns, n_sites, total_xbs, etc.
+structural dimensions: `n_thick`, `n_thin`, `n_crowns`, `n_sites`, `n_titin`,
+`n_faces_per_thin`, `total_xbs`.
+
+`result.metadata` — `{'master_seed': ...}` only. Grid shape, axis names, and
+coordinates are first-class attributes, not metadata entries.
 
 **Methods:**
 
 `result.mean()` — averages across the replicates axis, returning a new
 `SimulationResult` with the replicates dimension removed.
 
-`result.std()` — standard deviation across replicates.
+`result.std()` — standard deviation across replicates. (Note that the input
+traces `z_line`/`pCa`/`lattice_spacing` are *averaged* over replicates in both
+`.mean()` and `.std()` — a standard deviation of a driver that was identical
+across replicates is not a useful quantity.)
 
 `result.sel(pCa=4.5)` — selects the slice where pCa equals 4.5, returning a
 new `SimulationResult` with that sweep dimension removed.
@@ -232,30 +299,40 @@ into a single result with a new outer sweep dimension.
 ## 6. What Is in results.metrics?
 
 Every timestep, after the mechanical state has been updated, `compute_all_metrics()`
-(`multifil_jax/metrics_fn.py`) computes ~46 scalar quantities and accumulates
+(`multifil_jax/metrics_fn.py`) computes 52 scalar quantities and accumulates
 them into arrays. These are returned in `result.metrics` as a `MetricsDict`.
 Every key in this dictionary maps to an array with the same shape as
 `result.axial_force`.
 
 **Protocol values (what was actually applied or measured each step):**
 - `'axial_force'` — total M-line force (pN); also accessible as `result.axial_force`
-- `'solver_residual'` — Newton solver max force imbalance (pN); below 0.5 = converged
+- `'solver_residual'` — Newton solver max force imbalance (pN)
 - `'z_line'` — z-line position trace (nm)
 - `'pCa'` — pCa trace
 - `'lattice_spacing'` — lattice spacing trace (nm); when using dynamic LS, this is
   the emergent value solved each step, not the input
 
-**Crossbridge state counts** (raw integer counts of crossbridges in each state):
-- `'n_bound'` — total number of crossbridges bound to actin (states 2, 3, 4)
-- `'n_xb_drx'` — disordered relaxed state (state 1, active but unbound)
-- `'n_xb_loose'` — loosely bound / weakly attached (state 2)
-- `'n_xb_tight_1'` — first strong-binding state (state 3, post power stroke)
-- `'n_xb_tight_2'` — second strong-binding state (state 4, pre-detachment)
-- `'n_xb_free_2'` — released state after ATP hydrolysis (state 5)
-- `'n_xb_srx'` — super-relaxed / off state (state 6)
+**Crossbridge state counts** (raw integer counts of crossbridges in each state).
+The six crossbridge states are indexed 0–5:
+
+| Index | Metric key | Meaning |
+|-------|-----------|---------|
+| 0 | `'n_xb_drx'` | disordered relaxed — available but detached |
+| 1 | `'n_xb_loose'` | weakly bound to actin |
+| 2 | `'n_xb_tight_1'` | strongly bound, before the power stroke |
+| 3 | `'n_xb_tight_2'` | strongly bound, after the power stroke |
+| 4 | `'n_xb_free_2'` | just detached, post-ATP |
+| 5 | `'n_xb_srx'` | super-relaxed — parked, not recruitable |
+
+- `'n_bound'` — total crossbridges attached to actin (states 1, 2, and 3)
+
+The super-relaxed (SRX) state is the model's activation reserve: heads parked
+there cannot bind until calcium recruits them out. It is the mechanism behind
+most of the model's calcium sensitivity, alongside tropomyosin cooperativity.
 
 **Crossbridge state fractions** (same as above but divided by total XB count):
-- `'frac_xb_bound'`, `'frac_xb_drx'`, `'frac_xb_loose'`, etc.
+- `'frac_xb_bound'`, `'frac_xb_drx'`, `'frac_xb_loose'`, `'frac_xb_tight_1'`,
+  `'frac_xb_tight_2'`, `'frac_xb_free_2'`, `'frac_xb_srx'`
 
 **Tropomyosin (TM) state counts** — TM is a four-state regulatory chain:
 - `'n_tm_state_0'` through `'n_tm_state_3'` — counts in each TM state
@@ -263,11 +340,25 @@ Every key in this dictionary maps to an array with the same shape as
 - `'actin_permissiveness'` — mean float 0–1 indicating how accessible actin
   binding sites are across all thin filaments
 
+**Tropomyosin fractions restricted to the overlap zone** — the four keys above
+average over *every* binding site on every thin filament, including sites in the
+thick filament's bare zone and sites beyond its tip, which no crossbridge can
+ever reach. These four keys use only the reachable sites instead:
+- `'frac_tm_state_2_overlap'` — calcium-open fraction within reach
+- `'frac_tm_state_3_overlap'` — fully-open (crossbridge-bindable) fraction within reach
+- `'frac_tm_available_overlap'` — states 2 and 3 combined
+- `'n_overlap_sites'` — the denominator, useful as a sanity check
+
+**Prefer the `_overlap` variants whenever you compare across geometries or
+filament lengths.** The all-site versions change simply because the denominator
+changed: one filament-length correction moved `frac_tm_state_3` from 13.5 % to
+17.3 % while the true overlap-zone value barely moved (17.9 % → 18.2 %).
+
 **Transition events** (events that occurred in this timestep):
-- `'atp_consumed'` — stochastic count of crossbridges that completed the
-  power stroke and consumed an ATP molecule this step (state 4 → state 5)
+- `'atp_consumed'` — stochastic count of crossbridges that detached and consumed
+  an ATP molecule this step (state 3 → state 4, including 3 → 4 → 0 within one step)
 - `'newly_bound'` — count of crossbridges that newly attached to actin
-  (state 1 → state 2)
+  (state 0 → state 1)
 - `'atp_expected_p'` — expected ATP consumption using the P-matrix method
   (a smoother, expected-value estimate rather than stochastic count)
 - `'atp_expected_q'` — expected ATP consumption using Q-matrix branching
@@ -296,7 +387,7 @@ Every key in this dictionary maps to an array with the same shape as
 
 **Solver diagnostics:**
 - `'newton_iters'` — number of Newton iterations used by the equilibrium solver
-  this step. Typically 1–2 for standard parameters; useful for diagnosing
+  this step. Typically 1–4 for standard parameters; useful for diagnosing
   convergence at extreme parameter values.
 
 ---
@@ -401,15 +492,16 @@ result = run(topo,
              z_line=[850.0, 900.0, 950.0],
              duration_ms=1000)
 # result.axial_force shape: (3, 3, 1, 1000)
-# (n_pCa, n_z_line, replicates, time)
+# (n_z_line, n_pCa, replicates, time)  <- z_line first, regardless of
+#                                         the order the arguments were passed
 ```
 
 **Physical parameter sweeps** — sweeping over values in `DynamicParams` works
 the same way, using the `dynamic_params` argument as a dict:
 
 ```python
-thick_sweep = [1000, 1500, 2000, 2500, 3000]   # pN/nm
-thin_sweep  = [800,  1200, 1600]                # pN/nm
+thick_sweep = [5000, 6000, 7500, 9000, 11000]   # pN/nm per segment
+thin_sweep  = [4000, 5500, 7000]                 # pN/nm per segment
 
 result = run(topo, pCa=4.5, z_line=900.0,
              dynamic_params={'thick_k': thick_sweep, 'thin_k': thin_sweep},
@@ -423,12 +515,35 @@ You can also combine protocol sweeps with physical parameter sweeps:
 ```python
 result = run(topo,
              pCa=[9.0, 4.5],
-             dynamic_params={'thick_k': [1000, 2000, 3000]},
+             dynamic_params={'thick_k': [5000, 7500, 10000]},
              replicates=3,
              duration_ms=500)
 # result.axial_force shape: (2, 3, 3, 500)
 # (n_pCa, n_thick_k, replicates, time)
 ```
+
+> ⚠️ **The dict form always starts from skeletal defaults.** When you pass a
+> dict, `run()` builds its base parameters from a fresh `DynamicParams()` and
+> applies your keys on top. Every field you did *not* name reverts to the
+> skeletal value — so sweeping one parameter of a cardiac or insect preset this
+> way silently discards the whole preset. This is easy to miss because nothing
+> errors; the run just quietly simulates a different muscle.
+
+**Candidate-list sweeps** — the safe way to sweep a non-skeletal preset, and the
+general mechanism for sweeping many parameters at once. Pass a *list of
+`DynamicParams` objects*; each becomes one point on a `'candidates'` sweep axis:
+
+```python
+static, dynamic = get_cardiac_params()          # cardiac base preserved
+
+candidates = [dynamic.copy(thick_k=k) for k in (5000, 7500, 10000)]
+result = run(topo, pCa=4.5, dynamic_params=candidates, static_params=static)
+# result.axial_force shape: (3, 1, n_steps)
+```
+
+Because each candidate is a complete parameter set, this also covers the case
+where you want to vary a dozen parameters together — the usual pattern when
+batching an optimizer's population of trial parameter sets through one call.
 
 **Time-varying inputs** — passing a NumPy array of length `n_steps` applies
 a different value at every timestep (a time trace rather than a scalar):
@@ -539,7 +654,7 @@ calls the same compiled kernel, so there is no recompilation. The default
 `"auto"` setting chunks batches of 16384+ into groups of 4096, which
 benchmarks show is ~2% faster due to better L2 cache utilization. The primary
 reason to use minibatching is to bound peak GPU VRAM on memory-constrained GPUs
-(e.g. 8 GB): peak VRAM ≈ minibatch_size × n_steps × 46 × 4 bytes × 2.
+(e.g. 8 GB): peak VRAM ≈ minibatch_size × n_steps × 52 metrics × 4 bytes × 2.
 
 ---
 
@@ -560,6 +675,10 @@ constants, and the default pCa/z_line/lattice_spacing.
 `K_lat` and `nu` (lattice stiffness and Poisson exponent) can also be swept
 as lists. They join the Cartesian product grid alongside other sweep parameters.
 
+**Subpopulations** (section 14) can be swept as a list too, becoming their own
+axis. The one restriction is that a subpopulation list and a `dynamic_params`
+candidate list are mutually exclusive — both claim the same role.
+
 The number of **replicates** can change freely — it just changes the batch
 size, which is handled by bucket rounding.
 
@@ -576,14 +695,24 @@ shapes. A 2×2 lattice and a 4×4 lattice require separate compiled kernels.
 This is why `SarcTopology` is constructed once and reused across many `run()`
 calls.
 
-`StaticParams` fields (n_crowns, actin_geometry, n_newton_steps, n_cg_steps)
-are embedded into the compiled kernel at trace time. Changing any of these
-requires creating a new topology and recompiling.
+`StaticParams` fields (`n_crowns`, `actin_geometry`, `n_xb_per_crown`,
+`n_newton_steps`, `n_cg_steps`, the actin helix geometry, the binning
+resolution, …) are embedded into the compiled kernel at trace time. Changing any
+of these requires creating a new topology and recompiling.
 
 Switching between **fixed LS and dynamic LS** modes requires recompilation,
 because `is_dynamic_ls` is a JIT static argument. However, different `K_lat`
 values within dynamic LS mode share the same compiled kernel (K_lat is traced,
 not static).
+
+Switching the **cooperativity model** (`legacy_coop`) recompiles, since the two
+models run structurally different kinetics code.
+
+For **subpopulations**, the split is more subtle. The *shape* of the
+configuration — how many populations, which fields they scale, whether it is
+mean-field or mask-based — is static and recompiles. The *values* (scale factors,
+fractions, masks) ride the batch dimension and do not. So sweeping mutation
+severity is free; changing which parameter the mutation acts on is not.
 
 **The fundamental rule:** if two runs would produce arrays of different shapes
 anywhere inside the simulation loop, they require separate compiled kernels.
@@ -608,74 +737,204 @@ for most of a simulation but overridden at specific timesteps without branching.
 A merged `resolved_constants` object is built via `DynamicParams.with_drivers()`
 (`multifil_jax/core/params.py`) and used for all subsequent steps.
 
-**Step 1: Calculate thin filament internal forces.** Before updating cooperativity,
-the codebase computes the internal tension forces along each thin filament spring
-chain using `calculate_thin_forces_for_cooperativity()` (`multifil_jax/kernels/forces.py`).
-This gives the raw spring forces at each actin site, which determine how far
-the cooperative activation signal can spread.
-
-**Step 2: Update cooperativity.** `update_cooperativity()` (`multifil_jax/kernels/cooperativity.py`)
-implements the mechanical feedback mechanism for calcium regulation. Tropomyosin
-cooperativity means that when one region of the thin filament is active (calcium
-bound), it mechanically biases neighboring regions toward activation. The "span"
-of this influence depends on the local filament tension: higher tension → longer
-cooperative span. This step updates which actin sites are cooperatively
-activated and their permissiveness values (how likely they are to accept a
-crossbridge).
-
-**Step 3: Update nearest binding sites.** For every crossbridge, `update_nearest_neighbors()`
-(`multifil_jax/kernels/geometry.py`) computes the exact axial and radial
-distance to the nearest available actin binding site. These distances are the
+**Step 1: Update nearest binding sites.** For every crossbridge, `update_nearest_neighbors()`
+(`multifil_jax/kernels/geometry.py`) finds the nearest available actin binding
+site and records the axial and radial distance to it. These distances are the
 geometric inputs to the rate functions that determine how likely a crossbridge
 is to bind or detach. This is recomputed every step because filament positions
 change after each equilibrium solve.
 
-**Step 4: Thin filament (tropomyosin) transitions.** `thin_transitions()` (`multifil_jax/kernels/transitions.py`)
-applies a four-state stochastic Markov model to the tropomyosin chain on each
-thin filament. The four states represent different positions of the tropomyosin
-strand relative to actin, ranging from fully blocking crossbridge access (state 0)
-to fully open (state 3). The transition rate matrix Q is computed based on
-current calcium concentration and cooperativity, converted to a transition
-probability matrix P via a matrix exponential, and then used to draw stochastic
-transitions for each site. The matrix exponential is computed using a
-Padé approximation with scaling-and-squaring via `expm_pade6_batch()`.
+Two details are easy to get wrong. The *search* uses the myosin head position —
+the crown base plus a 13 nm reach — but the *recorded distance* is measured from
+the crown base. And binding sites that have crossed past the M-line (position
+≤ 0) are masked out entirely rather than clamped, so crossbridges near the M-line
+cannot bind behind it.
 
-**Step 5: Thick filament (crossbridge) transitions.** `thick_transitions()` (`multifil_jax/kernels/transitions.py`)
-applies a six-state Markov model to every individual crossbridge. The six states
-are: super-relaxed off (state 6), disordered relaxed (state 1), weakly bound
-(state 2), and three strongly-bound states (3, 4, 5) representing the power
-stroke and ATP hydrolysis cycle. Transition rates depend on the exact axial and
-radial distances computed in Step 3, as well as the current permissiveness from
-Step 2. Each crossbridge gets its own transition matrix computed from its exact
-geometry — no approximations or binning. The shared helper `compute_xb_transition_matrices()`
-returns one (6×6) Q and P matrix per crossbridge.
+**Step 2: Thin filament (tropomyosin) transitions.** `thin_transitions_ising()`
+(`multifil_jax/kernels/transitions.py`) applies a four-state stochastic Markov
+model to the tropomyosin chain on each thin filament. The four states represent
+different positions of the tropomyosin strand relative to actin, ranging from
+fully blocking crossbridge access (state 0) to fully open (state 3). The
+transition rate matrix Q is computed from the current calcium concentration and
+each site's cooperative coupling to its two chain neighbors, converted to a
+transition probability matrix P via a matrix exponential, then used to draw
+stochastic transitions for each site. The matrix exponential is computed with a
+Padé approximation plus scaling-and-squaring via `expm_pade6_batch()`.
 
-**Step 6: Solve mechanical equilibrium.** After crossbridges have attached or
+Because a site's coupling depends only on the states of its two neighbors (each
+count capped at 2), there are just 27 distinct rate matrices in the whole
+system — so one batched matrix exponential and a gather serve every site.
+Section 13 covers the cooperativity model itself.
+
+**Step 3: Thick filament (crossbridge) transitions.** `thick_transitions()` (`multifil_jax/kernels/transitions.py`)
+applies a six-state Markov model to every individual crossbridge — states 0–5 as
+listed in section 6, covering the super-relaxed reserve, the detached-but-available
+state, weak binding, the power stroke, and ATP-driven detachment. Transition rates
+depend on the axial and radial distances computed in Step 1 and on whether the
+nearest tropomyosin site is open (from Step 2).
+
+Rather than computing one matrix exponential per crossbridge, the rates are
+evaluated on a grid of axial-distance bins (`StaticParams.n_xb_bins`, default 200)
+at each of the two tropomyosin permissiveness levels. That is 400 grid positions
+regardless of lattice size, and each crossbridge gathers the row matching its own
+bin — roughly 6× fewer exponentials than one-per-crossbridge at a 4×4 lattice,
+where this step dominated the timestep cost. Crossbridges flagged invalid by
+`xb_valid` are forced into the impermissive block, where the binding rate is
+exactly zero.
+
+**Step 4: Solve mechanical equilibrium.** After crossbridges have attached or
 detached, the filament network is no longer at mechanical equilibrium — the
 force balance has changed. `solve_equilibrium()` (`multifil_jax/kernels/solver.py`)
 runs a Newton-CG iterative solver to find new filament node positions that
 satisfy force balance everywhere. The Newton loop uses `jax.lax.while_loop`
 and exits as soon as the maximum force imbalance falls below a tolerance
-threshold (or after a maximum number of iterations). A tridiagonal preconditioner
-factored before the scan loop (via `build_prefactored_preconditioner()`,
-`multifil_jax/kernels/solver.py`) accelerates the inner conjugate-gradient
-solve. This step is by far the most computationally intensive.
+threshold (or after `StaticParams.n_newton_steps` iterations). A tridiagonal
+preconditioner factored before the scan loop (via `build_prefactored_preconditioner()`)
+accelerates the inner conjugate-gradient solve, which runs
+`StaticParams.n_cg_steps` iterations (default 6). This step is by far the most
+computationally intensive.
 
-Steps 0–5 are encapsulated in `kinetics_step()`, which returns the post-kinetics
+Steps 0–3 are encapsulated in `kinetics_step()`, which returns the post-kinetics
 state and `resolved_constants`. This separation exists to support future
 finite-element coupling: run kinetics across all coupled sarcomeres independently,
 then perform a coupled mechanical equilibration.
+
+With `legacy_coop=True` the kinetics phase gains two extra steps ahead of Step 1
+— computing internal thin filament spring tension via
+`calculate_thin_forces_for_cooperativity()`, then `update_cooperativity()` to set
+each site's tension-dependent cooperative span — and Step 2 uses
+`thin_transitions()` instead. See section 13.
 
 After all steps complete, the new state, solver residual, emergent lattice
 spacing, and iteration count are returned. The scan loop in `run_single_sim`
 carries the state forward to the next timestep. Immediately after `timestep()`
 returns, `compute_all_metrics()` is called inside the scan body, comparing the
-state before and after the step to produce all ~46 scalar metrics. These are
+state before and after the step to produce all 52 scalar metrics. These are
 accumulated as arrays across time and returned as `result.metrics`.
 
 ---
 
-## 13. Dynamic Lattice Spacing
+## 13. Tropomyosin Cooperativity: Two Models
+
+Calcium alone does not explain how steeply muscle force rises with calcium
+concentration. Real muscle has a Hill coefficient around 3, meaning force turns
+on far more sharply than independent calcium binding would predict. Something
+couples neighboring regions of the thin filament together: when one stretch of
+tropomyosin swings open, its neighbors become more likely to follow.
+
+The codebase implements two models of that coupling, selected by the
+`legacy_coop` argument to `run()`.
+
+### The default: a symmetric Ising chain
+
+Each tropomyosin site looks at its two neighbors **along its own tropomyosin
+strand** — one up, one down. Those neighbors are precomputed structurally, stored
+as `topology.tm_prev_neighbor` and `topology.tm_next_neighbor`. Their states
+produce a local "field" that biases the site:
+
+```
+h = J_C × (open neighbors) + J_M × (crossbridge-bound neighbors)
+        − 0.5 × (J_C + J_M) × (closed neighbors)
+```
+
+Forward transition rates are multiplied by `exp(+h/2)` and backward rates by
+`exp(−h/2)`. Splitting the factor symmetrically between the two directions is
+what keeps the model thermodynamically consistent: the equilibrium constant
+shifts by exactly `exp(h)`, which is the Boltzmann factor for a state energy
+lowered by `h` kT. The coupling is a genuine free-energy term, and detailed
+balance holds with respect to it — as opposed to boosting only the forward rate,
+which would create a perpetual cycle.
+
+The scaling applies to the three reversible legs (0↔1 calcium binding, 1↔2, and
+2↔3). The one-way cycle-closing step 3→0 is deliberately left at its base rate:
+slowing it too produces anti-cooperative cascades.
+
+Two parameters control it:
+
+- **`tm_J_M`** — coupling to neighbors that have a crossbridge bound. This is the
+  active knob; it sets the emergent Hill steepness of the force–calcium curve.
+- **`tm_J_C`** — coupling to calcium-open neighbors. Empirically inert, and
+  defaults to 0.
+
+Both are in units of kT. Because they set an *emergent* property rather than a
+directly measurable one, `tm_J_M` is calibrated by matching a simulated
+force–pCa curve to a measured Hill coefficient — and it must be recalibrated
+after any change to the chain's structure, since a chain that couples only to
+immediate neighbors behaves differently from one coupling over a fixed distance.
+
+### The legacy model: tension-dependent span
+
+The older model (`run(..., legacy_coop=True)`) works differently: it computes the
+mechanical tension along each thin filament, converts that into a cooperative
+*span* in nanometers, and marks every site within that span of an active site as
+cooperatively activated. Higher tension gives a longer span. The relevant
+parameters are `tm_coop_magnitude`, `tm_span_base`, `tm_span_force50`, and
+`tm_span_steep`.
+
+This path is deprecated. It is kept so that older fitted parameter sets remain
+reproducible, and it is the only code path that reads the z-line position during
+the kinetics phase — a detail that matters for future multi-sarcomere coupling.
+New work should use the default.
+
+The two models are not interchangeable: a parameter set fitted under one will not
+reproduce the same force–calcium curve under the other.
+
+---
+
+## 14. Subpopulations: Mixed Motor Populations
+
+Real muscle is rarely uniform. A heterozygous mutation puts mutant and wild-type
+myosin side by side on the same filament. Regulatory proteins like cMyBP-C
+decorate only the central stripes of the thick filament, so the crossbridges there
+behave differently from those at the ends.
+
+The `subpopulation` argument to `run()` models this. You describe one or more
+populations as **multiplicative scale factors** on whatever `DynamicParams` you
+already passed in, and the kernel applies each population's rates to its own
+share of the motors:
+
+```python
+from multifil_jax import Subpopulation
+
+# Half the motors have a 3× faster binding rate and a stabilized SRX state
+sp = Subpopulation.mean_field(0.5, xb_r01_coeff=3.0, xb_srx_kmax=0.3)
+result = run(topo, pCa=4.5, subpopulation=sp, dynamic_params=dynamic)
+```
+
+Three constructors, differing in *how* motors are assigned:
+
+| Constructor | How motors are assigned | When to use it |
+|---|---|---|
+| `Subpopulation.mean_field(fraction, **scales)` | no assignment — every motor sees the fraction-weighted average of the rate matrices | fast, deterministic, no replicate noise |
+| `Subpopulation.random(fraction, seed, **scales)` | each motor is independently mutant with probability `fraction` | realistic mosaicism; replicates give statistical power |
+| `Subpopulation.c_zone(topo, min_nm, max_nm, **scales)` | motors on crowns within an axial band from the M-line (default 350–650 nm) | cMyBP-C and other spatially localized effects |
+
+`mean_field` is not an approximation bolted on afterwards: it averages the
+underlying *rate matrices* before exponentiating them, which is the mathematically
+correct blend. `random` masks are redrawn per simulation from `seed + sim_index`,
+so replicates sample different spatial arrangements rather than repeating one.
+
+Two edge cases are exact rather than approximate, which makes them useful as
+sanity checks: `fraction=0.0` reproduces wild-type bit-for-bit, and
+`fraction=1.0` reproduces a global parameter scale bit-for-bit — in all three
+modes.
+
+**Constraints** (all raise rather than failing silently):
+
+- Scale factors must name `xb_*` or `tm_*` fields. Mechanical parameters always
+  use the wild-type value; only transition rates can differ between populations.
+  A population with different spring stiffness is not supported.
+- `tm_*` scaling requires `legacy_coop=True`; it is not implemented on the
+  default Ising path.
+- Passing a *list* of subpopulations makes them a sweep axis. All entries must
+  share the same mode and the same number of populations, and swept `random`
+  entries must share one seed (fractions and severities may vary freely).
+
+See `examples/subpopulation.py` for a worked example.
+
+---
+
+## 15. Dynamic Lattice Spacing
 
 By default, the lattice spacing (the distance from a thick filament to its
 neighboring thin filaments, typically ~14 nm) is either held constant or
@@ -748,7 +1007,7 @@ changes, or stiffness sweeps.
 
 ---
 
-## 14. The Tiered Architecture: State, Topology, Constants, Drivers
+## 16. The Tiered Architecture: State, Topology, Constants, Drivers
 
 The codebase separates simulation data into four tiers to control what can
 change, when, and at what cost. Understanding this is helpful when you want
@@ -765,8 +1024,18 @@ updated immutably at each step via `._replace()`.
 **Tier 1 — Topology** (`multifil_jax/core/sarc_geometry.py`): The structural
 connectivity of the sarcomere. Contains pre-computed index maps: which thick
 filament faces which thin filament, what the rest spacings between crowns are,
-how titin connects thick to thin, etc. This never changes during a simulation.
-It is the only tier that requires recompilation when changed.
+how titin connects thick to thin, which tropomyosin sites neighbor each other on
+the same strand, and the crossbridge distance-bin grid. This never changes during
+a simulation. It is the only tier that requires recompilation when changed.
+
+Two things about the topology are worth knowing when reading the arrays directly.
+Crown positions (`crown_offsets`, `crown_rests`) are stored **per thick
+filament**, shape `(n_thick, n_crowns)`, not one shared profile — under a myosin
+superlattice, filaments in different classes sit at different axial offsets. And
+the filament rotational starting phases (`thick_starts`, `thin_starts`) default to
+a deterministic evenly-spread pattern rather than random draws; random starts used
+to make every lattice inherit one arbitrary phase configuration's bias, an effect
+far larger than the kinetic noise it was hiding inside.
 
 **Tier 2 — Constants / DynamicParams** (`multifil_jax/core/params.py`):
 All physical parameters — spring stiffnesses, rate coefficients, energy
@@ -785,28 +1054,37 @@ and "active" only during specific steps.
 
 ---
 
-## 15. Key File Reference
+## 17. Key File Reference
 
 | File | What It Contains |
 |------|-----------------|
 | `multifil_jax/simulation.py` | `run()` — the main entry point for all simulations |
 | `multifil_jax/simulation.py` | `SimulationResult` — the result container |
 | `multifil_jax/simulation.py` | `BATCH_BUCKETS`, `get_bucket_size()`, `_run_sim_kernel()` |
-| `multifil_jax/timestep.py` | `kinetics_step()` — stochastic phase (steps 0–5) |
+| `multifil_jax/timestep.py` | `kinetics_step()` — stochastic phase (driver resolution through transitions) |
 | `multifil_jax/timestep.py` | `timestep()` — full step orchestrator (kinetics + solve) |
-| `multifil_jax/metrics_fn.py` | `compute_all_metrics()` — ~46-metric MetricsDict |
+| `multifil_jax/metrics_fn.py` | `compute_all_metrics()` — 52-metric MetricsDict |
 | `multifil_jax/core/state.py` | `State`, `realize_state()`, `Drivers`, `resolve_value()`, `MetricsDict` |
-| `multifil_jax/core/params.py` | `StaticParams`, `DynamicParams`, `get_skeletal_params()`, `get_cardiac_params()` |
-| `multifil_jax/core/sarc_geometry.py` | `SarcTopology.create()` — topology builder |
-| `multifil_jax/kernels/cooperativity.py` | `update_cooperativity()` — TM cooperative activation |
+| `multifil_jax/core/params.py` | `StaticParams`, `DynamicParams`, and the four species presets |
+| `multifil_jax/core/sarc_geometry.py` | `SarcTopology.create()` — topology builder; `valid_xb_targets()` |
+| `multifil_jax/core/subpopulation.py` | `Subpopulation` — mixed motor populations |
+| `multifil_jax/kernels/cooperativity.py` | Legacy tension-span cooperativity; Ising neighbor counting |
 | `multifil_jax/kernels/geometry.py` | `update_nearest_neighbors()` — XB-to-BS distances |
-| `multifil_jax/kernels/transitions.py` | `thin_transitions()`, `thick_transitions()`, `compute_xb_transition_matrices()` |
+| `multifil_jax/kernels/transitions.py` | `thin_transitions_ising()`, `thin_transitions()`, `thick_transitions()`, `compute_xb_transition_matrices()` |
 | `multifil_jax/kernels/forces.py` | `axial_force_at_mline()`, `compute_forces_vectorized()`, `_xb_radial_force_total()`, `_titin_radial_force_total()` |
 | `multifil_jax/kernels/solver.py` | `solve_equilibrium()` (unified fixed/dynamic LS), Thomas algorithm |
 | `multifil_jax/kernels/rate_functions.py` | Crossbridge rate functions (geometry-dependent) |
+| `multifil_jax/helper.py` | `count_transitions()`, force/equilibrium validation helpers |
 | `multifil_jax/utils/hardware.py` | GPU detection, XLA cache configuration |
 | `examples/quickstart.py` | Worked examples: isometric, sweeps, transients, structural stack |
 | `examples/dynamic_lattice_spacing.py` | Dynamic LS demo: isometric, force comparison, K_lat sweep, length ramp |
+| `examples/subpopulation.py` | Subpopulation demo (mean-field / random / C-zone) |
+| `examples/hysteresis.py` | Length-ramp hysteresis / work-loop protocol |
+| `examples/sinusoidal_analysis.py` | Complex-modulus (Kawai-style) frequency analysis |
+| `examples/stiffness_sweep_cardiac.py` | Cardiac stiffness sweep |
 | `examples/benchmarks/benchmark_minibatch.py` | Minibatch size benchmark CLI |
 | `examples/benchmarks/benchmark_dynamic_ls.py` | Dynamic LS performance and lattice scaling benchmark |
-| `tests/` | Test suite |
+| `examples/benchmarks/profile_jax.py` | JAX/XLA profiling harness |
+
+For deeper technical detail — exact function signatures, PyTree field layouts,
+solver internals — see `docs/CODE_Architecture.md`.

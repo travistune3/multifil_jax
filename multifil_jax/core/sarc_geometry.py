@@ -1,24 +1,54 @@
 """
-SarcTopology: Consolidated Sarcomere Topology for JAX Simulations
-==================================================================
+Sarcomere structure: which filament is where, and what can reach what.
 
-This module consolidates topology.py and template.py into a single SarcTopology
-class with flattened index maps optimized for JAX kernel operations.
+Everything geometric and unchanging lives here. A SarcTopology is built once on
+the CPU, moved to the GPU, and then reused for every simulation that shares its
+structure. It never changes during a run.
 
-Core Principle: Fixed-Width Arrays for XLA Efficiency
-------------------------------------------------------
-XLA requires concrete shapes at compile-time. Dynamic-size slicing per XB
-triggers serialized execution or recompilation. The solution is to pre-compute
-fixed-width arrays that enable single unified Gather operations across all XBs.
-
-PyTree Registration
+WHAT IS BEING BUILT
 -------------------
-SarcTopology is a registered JAX PyTree where:
-- Arrays are "children" (traced by JAX, flow through vmap/scan as data)
-- Integers are "aux_data" (static, used for compilation decisions)
+Real muscle packs filaments into a hexagonal lattice. Thick filaments sit on the
+lattice points; thin filaments sit between them, and how many thin filaments
+surround each thick one is a genuine anatomical difference between species:
 
-This allows the topology to flow through vmap/scan as a single unit while
-ensuring shape-defining integers remain static for compilation.
+    vertebrate      1 thick : 2 thin, thin filaments at lattice interstices,
+                    each thin facing 3 thick filaments
+    invertebrate    1 thick : 3 thin, thin filaments at edge midpoints,
+                    each thin facing 2 thick filaments
+
+From that arrangement everything else follows: which thin filament each myosin
+head faces, which actin monomers are close enough to the right azimuth to be
+binding sites, where crowns and sites sit axially, which sites are neighbours on
+the same tropomyosin strand, and where titin attaches.
+
+The lattice is periodic by default, so a modest number of filaments approximates
+the interior of a much larger myofibril rather than a fibre bundle dominated by
+its own free surfaces.
+
+WHY IT IS ALL PRECOMPUTED INTO FIXED-WIDTH ARRAYS
+-------------------------------------------------
+XLA needs shapes known at compile time. Anything that would vary in length per
+crossbridge — "the list of sites this head can reach" — has to become a
+rectangular array, padded to a common width, or the whole simulation degrades
+into per-element control flow. So the geometry is resolved once here, into
+arrays the kernels can gather from uniformly.
+
+The cost of that is padding, and padding is not always benign. A head with no
+real target still occupies a slot in xb_to_thin_id and xb_to_thin_face, filled
+with a placeholder (0, 0) that is indistinguishable from a genuine reference to
+thin filament 0. The companion boolean array xb_valid is what separates the two,
+and analysis code that reads the index arrays without consulting it will silently
+overcount filament 0. Use valid_xb_targets() instead. This is not an edge case in
+asymmetric lattices: with fourfold crown symmetry and a rotation that does not
+align with the hexagonal directions, a majority of slots can be placeholders.
+
+PYTREE REGISTRATION
+-------------------
+SarcTopology is a registered JAX PyTree. Arrays are children, so they are traced
+and can move through vmap and scan as data; the shape-defining integers are
+aux_data, so they stay static and available to the compiler. This lets the whole
+topology be passed around as one object without JAX trying to trace its
+dimensions.
 
 Usage
 -----
@@ -26,13 +56,9 @@ Usage
 >>> from multifil_jax.core.params import get_skeletal_params
 >>>
 >>> static, dynamic = get_skeletal_params()
->>> topo = SarcTopology.create(nrows=2, ncols=2, static_params=static, dynamic_params=dynamic)
->>> topo = jax.device_put(topo)  # Move to GPU once
->>>
->>> # For parameter sweeps, use same topology for all sweep points:
->>> for params in sweep_grid:
->>>     state = realize_state(topo, params, z_line, pCa, lattice_spacing)
->>>     result = run(topo, ...)
+>>> topo = SarcTopology.create(nrows=2, ncols=2, static_params=static,
+...                            dynamic_params=dynamic)
+>>> topo = jax.device_put(topo)   # move to GPU once, reuse for every run
 """
 
 import jax
@@ -52,6 +78,13 @@ from .params import StaticParams, DynamicParams
 SQRT3 = np.float32(np.sqrt(3))
 THICK_THIN_DISTANCE = np.float32(1.0 / np.sqrt(3))
 THICK_THIN_DISTANCE_INVERTEBRATE = np.float32(0.5)
+
+# Squire 2006 3-fold actin (thin-filament) registration: the 6 actins around
+# each myosin sit at 3 systematic axial phases (actin_half_pitch/3 apart, with
+# 60°/120° rotations). A hex lattice has exactly 3 edge directions, and each
+# invertebrate thin filament's edge direction IS its registration class — so the
+# count is structural (# hex edge directions), never a tunable knob.
+N_ACTIN_REGISTRATION_CLASSES = 3  # hex edge directions = Squire 3-fold
 
 # Face orientation vectors (index 0-5)
 ORIENTATION_VECTORS = np.array([
@@ -91,15 +124,19 @@ class SarcTopology:
         n_thin: Number of thin filaments
         n_sites: Maximum binding sites per thin filament
         n_titin: Number of titin connections
-        n_xb_per_crown: Number of crossbridges per crown (always 3)
+        n_xb_per_crown: Number of crossbridges per crown (3 vertebrate default, 4 IFM)
         n_faces_per_thin: Number of faces per thin filament (3 vertebrate, 2 invertebrate)
         max_sites_per_face: Maximum binding sites per thin face
-        total_xbs: Total number of crossbridges (n_thick * n_crowns * 3)
+        total_xbs: Total number of crossbridges (n_thick * n_crowns * n_xb_per_crown)
 
     Attributes (Flattened Index Maps - children, traced):
         xb_to_thin_id: (total_xbs,) - Global XB -> thin filament ID
         xb_to_thin_face: (total_xbs,) - Global XB -> thin face index
         xb_to_site_indices: (total_xbs, max_sites_per_face) - FIXED-WIDTH search array
+        xb_valid: (total_xbs,) bool - False where the XB has no real geometric
+            thin-filament partner this crown (continuous-formula miss, or a
+            genuinely unconnected thick face); always True for the legacy path
+            and for vertebrate defaults. Kinetics must gate binding on this.
 
     Attributes (Connectivity Arrays - children, traced):
         thick_to_thin: (n_thick, 6, 2) - [thick, face, (thin_idx, thin_face)]
@@ -109,12 +146,19 @@ class SarcTopology:
         titin_connections: (n_titin, 4) - titin connectivity
 
     Attributes (Structural Arrays - children, traced):
-        crown_offsets: (n_crowns,) - axial offset for each crown from M-line
-        crown_rests: (n_crowns,) - rest spacing for each crown
+        crown_offsets: (n_thick, n_crowns) - axial offset for each crown from
+            M-line, per thick filament (superlattice-aware; identical across
+            filaments unless n_superlattice_classes > 1)
+        crown_rests: (n_thick, n_crowns) - rest spacing for each crown, per
+            thick filament
         binding_offsets: (n_thin, n_sites) - z_line - site_position offsets
         binding_rests: (n_thin, n_sites) - rest spacing between binding sites
         tm_chains: (n_thin, n_sites) - TM chain assignment (0 or 1)
-        thick_starts: (n_thick,) - crown level start offset (1-3)
+        tm_prev_neighbor: (n_thin, n_sites) int32 - nearest same-chain predecessor
+            site index (self-referencing at chain endpoints or padding)
+        tm_next_neighbor: (n_thin, n_sites) int32 - nearest same-chain successor
+            site index (self-referencing at chain endpoints or padding)
+        thick_starts: (n_thick,) - crown level start offset (1..n_xb_per_crown)
         thin_starts: (n_thin,) - helical twist start offset (0-25)
         eye_4: (4, 4) - identity matrix for TM matrix exponential
         eye_6: (6, 6) - identity matrix for XB matrix exponential
@@ -126,7 +170,7 @@ class SarcTopology:
         'n_xb_per_crown', 'n_faces_per_thin', 'max_sites_per_face',
         'total_xbs',
         # Flattened index maps (children)
-        'xb_to_thin_id', 'xb_to_thin_face', 'xb_to_site_indices',
+        'xb_to_thin_id', 'xb_to_thin_face', 'xb_to_site_indices', 'xb_valid',
         # Connectivity arrays (children)
         'thick_to_thin', 'thin_to_thick', 'face_to_sites', 'n_sites_per_face',
         'titin_connections',
@@ -138,6 +182,8 @@ class SarcTopology:
         'n_xb_bins',         # int — number of bins (= n_xb_bins from StaticParams)
         'xb_bin_edges',      # (n_xb_bins+1,) float32 — bin boundaries
         'xb_bin_centers',    # (n_xb_bins,)   float32 — bin midpoints
+        # Topological TM same-chain neighbors (children, appended at end)
+        'tm_prev_neighbor', 'tm_next_neighbor',
     )
 
     def __init__(
@@ -157,6 +203,7 @@ class SarcTopology:
         xb_to_thin_id: jnp.ndarray,        # (total_xbs,)
         xb_to_thin_face: jnp.ndarray,      # (total_xbs,)
         xb_to_site_indices: jnp.ndarray,   # (total_xbs, max_sites_per_face)
+        xb_valid: jnp.ndarray,             # (total_xbs,) bool
 
         # === CONNECTIVITY ARRAYS (children - traced) ===
         thick_to_thin: jnp.ndarray,        # (n_thick, 6, 2)
@@ -166,8 +213,8 @@ class SarcTopology:
         titin_connections: jnp.ndarray,    # (n_titin, 4)
 
         # === STRUCTURAL ARRAYS (children - traced) ===
-        crown_offsets: jnp.ndarray,        # (n_crowns,)
-        crown_rests: jnp.ndarray,          # (n_crowns,)
+        crown_offsets: jnp.ndarray,        # (n_thick, n_crowns)
+        crown_rests: jnp.ndarray,          # (n_thick, n_crowns)
         binding_offsets: jnp.ndarray,      # (n_thin, n_sites)
         binding_rests: jnp.ndarray,        # (n_thin, n_sites)
         tm_chains: jnp.ndarray,            # (n_thin, n_sites)
@@ -182,6 +229,10 @@ class SarcTopology:
         n_xb_bins: int,
         xb_bin_edges: jnp.ndarray,         # (n_xb_bins+1,) float32
         xb_bin_centers: jnp.ndarray,       # (n_xb_bins,)   float32
+
+        # === TOPOLOGICAL TM SAME-CHAIN NEIGHBORS (children - traced) ===
+        tm_prev_neighbor: jnp.ndarray,     # (n_thin, n_sites) int32
+        tm_next_neighbor: jnp.ndarray,     # (n_thin, n_sites) int32
     ):
         """Initialize SarcTopology with structural dimensions and pre-allocated arrays."""
         # Store integers
@@ -199,6 +250,7 @@ class SarcTopology:
         self.xb_to_thin_id = xb_to_thin_id
         self.xb_to_thin_face = xb_to_thin_face
         self.xb_to_site_indices = xb_to_site_indices
+        self.xb_valid = xb_valid
 
         # Store connectivity arrays
         self.thick_to_thin = thick_to_thin
@@ -220,12 +272,52 @@ class SarcTopology:
         self.n_xb_bins = n_xb_bins
         self.xb_bin_edges = xb_bin_edges
         self.xb_bin_centers = xb_bin_centers
+        self.tm_prev_neighbor = tm_prev_neighbor
+        self.tm_next_neighbor = tm_next_neighbor
+
+    def valid_xb_targets(self) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """Crossbridge connectivity with placeholder entries removed.
+
+        USE THIS RATHER THAN READING xb_to_thin_id / xb_to_thin_face DIRECTLY.
+
+        Those two arrays must have an entry for every crossbridge slot, because
+        JAX gathers need static shapes. But not every slot corresponds to a head
+        that can actually reach a thin filament: a crown's arm may point into a
+        gap in the lattice, which happens whenever the azimuthal rotation between
+        crowns is not a multiple of the 60 degrees separating hexagonal
+        neighbours. Those slots are filled with a PLACEHOLDER of
+        (thin_idx=0, thin_face=0).
+
+        Nothing about the placeholder value distinguishes it from a real
+        reference to thin filament 0, face 0. The separate boolean array
+        `xb_valid` is the only thing that does. So any code that tallies
+        connectivity from the raw arrays — counting how many heads target a
+        given filament, or which crowns supply a particular binding site — will
+        overcount filament 0 by exactly the number of placeholders unless it
+        masks first.
+
+        The magnitude is not small in asymmetric lattices. With fourfold crown
+        symmetry and a 33.75 degree rotation, over half of all slots can be
+        placeholders. In large symmetric vertebrate lattices every slot is valid
+        and the distinction is moot, which is precisely why the bug is easy to
+        introduce while working on one and only notice on the other.
+
+        The simulation kernels already gate on xb_valid. This helper exists so
+        analysis and debugging code does not have to re-derive the mask.
+
+        Returns:
+            xb_index: (n_valid,) flat indices into the total_xbs-length arrays
+            thin_id: (n_valid,) the thin filament each of those heads targets
+            thin_face: (n_valid,) the face on that filament
+        """
+        idx = jnp.where(self.xb_valid)[0]
+        return idx, self.xb_to_thin_id[idx], self.xb_to_thin_face[idx]
 
     def tree_flatten(self) -> Tuple[Tuple[jnp.ndarray, ...], Tuple[int, ...]]:
         """Flatten for JAX: arrays are children, integers are aux_data."""
         children = (
             # Flattened index maps
-            self.xb_to_thin_id, self.xb_to_thin_face, self.xb_to_site_indices,
+            self.xb_to_thin_id, self.xb_to_thin_face, self.xb_to_site_indices, self.xb_valid,
             # Connectivity arrays
             self.thick_to_thin, self.thin_to_thick, self.face_to_sites,
             self.n_sites_per_face, self.titin_connections,
@@ -234,6 +326,7 @@ class SarcTopology:
             self.binding_rests, self.tm_chains, self.thick_starts, self.thin_starts,
             self.eye_4, self.eye_6,
             self.xb_bin_edges, self.xb_bin_centers,
+            self.tm_prev_neighbor, self.tm_next_neighbor,
         )
         aux_data = (
             self.n_thick, self.n_crowns, self.n_thin, self.n_sites,
@@ -262,22 +355,25 @@ class SarcTopology:
             xb_to_thin_id=children[0],
             xb_to_thin_face=children[1],
             xb_to_site_indices=children[2],
-            thick_to_thin=children[3],
-            thin_to_thick=children[4],
-            face_to_sites=children[5],
-            n_sites_per_face=children[6],
-            titin_connections=children[7],
-            crown_offsets=children[8],
-            crown_rests=children[9],
-            binding_offsets=children[10],
-            binding_rests=children[11],
-            tm_chains=children[12],
-            thick_starts=children[13],
-            thin_starts=children[14],
-            eye_4=children[15],
-            eye_6=children[16],
-            xb_bin_edges=children[17],
-            xb_bin_centers=children[18],
+            xb_valid=children[3],
+            thick_to_thin=children[4],
+            thin_to_thick=children[5],
+            face_to_sites=children[6],
+            n_sites_per_face=children[7],
+            titin_connections=children[8],
+            crown_offsets=children[9],
+            crown_rests=children[10],
+            binding_offsets=children[11],
+            binding_rests=children[12],
+            tm_chains=children[13],
+            thick_starts=children[14],
+            thin_starts=children[15],
+            eye_4=children[16],
+            eye_6=children[17],
+            xb_bin_edges=children[18],
+            xb_bin_centers=children[19],
+            tm_prev_neighbor=children[20],
+            tm_next_neighbor=children[21],
         )
 
     @classmethod
@@ -312,7 +408,8 @@ class SarcTopology:
             thin_starts: Optional list of helical twist start offsets (0-25).
                 Omit (None) for the default deterministic unbiased spread; pass a
                 list of length n_thin to override (must match n_thin or ValueError).
-            thick_starts: Optional list of crown level start offsets (1-3).
+            thick_starts: Optional list of crown level start offsets
+                (1..static_params.n_xb_per_crown).
                 Omit (None) for the default deterministic unbiased spread; pass a
                 list of length n_thick to override (must match n_thick or ValueError).
 
@@ -333,7 +430,7 @@ class SarcTopology:
 
         # thick_starts: default deterministic unbiased spread, else validated override
         if thick_starts is None:
-            thick_starts_arr = _spread_starts(n_thick, 1, 4)
+            thick_starts_arr = _spread_starts(n_thick, 1, static_params.n_xb_per_crown + 1)
         else:
             if len(thick_starts) != n_thick:
                 raise ValueError(f"thick_starts must have length n_thick={n_thick}, got {len(thick_starts)}")
@@ -351,9 +448,22 @@ class SarcTopology:
             )
         n_thin = len(thin_positions)
 
-        # thin_starts: default deterministic unbiased spread, else validated override
+        # Squire 3-fold actin registration class per thin filament (edge
+        # direction). None for vertebrate (interstice geometry) → all class 0.
+        thin_class_arr = _compute_thin_registration_classes(
+            thick_positions, thin_thick_pairs, box_x, box_y, periodic
+        )
+
+        # thin_starts default is geometry-aware:
+        #   invertebrate → base_k = 0 (crystalline lattice is locked; the 3-fold
+        #     class supplies the only systematic phase variation),
+        #   vertebrate  → S83 deterministic decorrelated spread.
+        # An explicit thin_starts= still overrides either default.
         if thin_starts is None:
-            thin_starts_arr = _spread_starts(n_thin, 0, 26)
+            if actin_geometry == "vertebrate":
+                thin_starts_arr = _spread_starts(n_thin, 0, 26)
+            else:
+                thin_starts_arr = np.zeros(n_thin, dtype=np.int32)
         else:
             if len(thin_starts) != n_thin:
                 raise ValueError(f"thin_starts must have length n_thin={n_thin}, got {len(thin_starts)}")
@@ -380,6 +490,33 @@ class SarcTopology:
                 if conn is not None:
                     thin_to_thick_arr[thin_idx, face_idx] = [conn[0], conn[1]]
 
+        # thick_to_thin completeness check: under periodic boundaries every thick
+        # face must reach a real thin filament (a genuinely missing spatial
+        # neighbor here is a malformed lattice, e.g. invertebrate geometry at
+        # odd nrows — independent of n_xb_per_crown/legacy_crown_geometry).
+        # Non-periodic lattices legitimately have unconnected boundary faces,
+        # so this check only applies when periodic=True.
+        if periodic:
+            missing = np.argwhere(thick_to_thin_arr[:, :, 0] < 0)
+            if len(missing) > 0:
+                thick_idx0, face_idx0 = missing[0]
+                raise ValueError(
+                    f"thick_to_thin has {len(missing)} unconnected (thick, face) pair(s) "
+                    f"under periodic=True (e.g. thick={thick_idx0}, face={face_idx0}) — "
+                    f"malformed lattice for nrows={nrows}, ncols={ncols}, "
+                    f"actin_geometry='{actin_geometry}'. Invertebrate geometry requires "
+                    "an even nrows."
+                )
+
+        if periodic and static_params.n_superlattice_classes == 3:
+            if nrows % 2 != 0 or ncols % 3 != 0:
+                raise ValueError(
+                    f"n_superlattice_classes=3 requires nrows even AND ncols a multiple "
+                    f"of 3 under periodic=True (got nrows={nrows}, ncols={ncols}) — "
+                    "otherwise the 3-coloring has same-class neighbor pairs at the "
+                    "periodic seam. Known-good examples: 2x3, 4x3, 6x6, 4x6, 6x9, 8x3."
+                )
+
         # Generate titin connections
         titin_connections_list = []
         for thick_idx in range(n_thick):
@@ -390,26 +527,45 @@ class SarcTopology:
         n_titin = len(titin_connections_list)
         titin_arr = np.array(titin_connections_list, dtype=np.int32) if titin_connections_list else np.zeros((0, 4), dtype=np.int32)
 
-        # 4. Calculate crown offsets
+        # 4. Calculate crown offsets (per-filament, superlattice-aware)
+        superlattice_class = _compute_superlattice_classes(
+            n_thick, ncols, static_params.n_superlattice_classes
+        )
+        bare_zone_arr = (
+            static_params.thick_bare_zone
+            + superlattice_class.astype(np.float32)
+            * (static_params.thick_crown_spacing / static_params.n_superlattice_classes)
+        )
         crown_offsets, crown_rests = _calculate_crown_offsets(
-            n_crowns, static_params.thick_bare_zone, static_params.thick_crown_spacing
+            n_crowns, bare_zone_arr, static_params.thick_crown_spacing
         )
 
         # 5. Calculate binding site offsets
         (binding_offsets_list, binding_rests_list, face_to_sites_list,
-         n_sites_per_face_list, tm_chains_list, max_sites) = _calculate_binding_site_offsets(
-            thin_orientations, thin_starts_arr, n_thin, n_polymers_per_thin, n_faces_per_thin
+         n_sites_per_face_list, tm_chains_list, max_sites,
+         tm_prev_neighbor_list, tm_next_neighbor_list) = _calculate_binding_site_offsets(
+            thin_orientations, thin_starts_arr, n_thin, n_polymers_per_thin, n_faces_per_thin,
+            static_params.actin_half_pitch, static_params.mono_per_poly,
+            static_params.polymer_base_turns, static_params.target_zone_wiggle,
+            thin_class=thin_class_arr,
         )
 
         # Pad to uniform arrays
         binding_offsets_arr = np.zeros((n_thin, max_sites), dtype=np.float32)
         binding_rests_arr = np.full((n_thin, max_sites), 2.77, dtype=np.float32)
         tm_chains_arr = np.zeros((n_thin, max_sites), dtype=np.int32)
+        # Row-local self-index default: padding slots self-reference (harmless via
+        # the self-exclusion check) rather than defaulting to 0, which would
+        # silently fake a same-chain link to real site 0.
+        tm_prev_neighbor_arr = np.tile(np.arange(max_sites, dtype=np.int32), (n_thin, 1))
+        tm_next_neighbor_arr = np.tile(np.arange(max_sites, dtype=np.int32), (n_thin, 1))
         for i in range(n_thin):
             n = len(binding_offsets_list[i])
             binding_offsets_arr[i, :n] = binding_offsets_list[i]
             binding_rests_arr[i, :n] = binding_rests_list[i]
             tm_chains_arr[i, :n] = tm_chains_list[i]
+            tm_prev_neighbor_arr[i, :n] = tm_prev_neighbor_list[i]
+            tm_next_neighbor_arr[i, :n] = tm_next_neighbor_list[i]
 
         # Find max sites per face
         max_sites_per_face = max(
@@ -426,10 +582,12 @@ class SarcTopology:
                 n_sites_per_face_arr[i, j] = len(sites)
 
         # 6. Compute FIXED-WIDTH flattened index maps
-        total_xbs = n_thick * n_crowns * 3
-        xb_to_thin_id, xb_to_thin_face, xb_to_site_indices = _compute_flat_index_maps_fixed_width(
+        total_xbs = n_thick * n_crowns * static_params.n_xb_per_crown
+        xb_to_thin_id, xb_to_thin_face, xb_to_site_indices, xb_valid = _compute_flat_index_maps_fixed_width(
             thick_to_thin_arr, face_to_sites_arr, n_sites_per_face_arr,
-            thick_starts_arr, n_thick, n_crowns, max_sites_per_face
+            thick_starts_arr, n_thick, n_crowns, max_sites_per_face,
+            static_params.n_xb_per_crown, static_params.crown_rotation_deg,
+            static_params.crown_face_wiggle_deg, static_params.legacy_crown_geometry,
         )
 
         # Pre-allocate structural constants
@@ -452,7 +610,7 @@ class SarcTopology:
             n_thin=n_thin,
             n_sites=max_sites,
             n_titin=n_titin,
-            n_xb_per_crown=3,
+            n_xb_per_crown=static_params.n_xb_per_crown,
             n_faces_per_thin=n_faces_per_thin,
             max_sites_per_face=max_sites_per_face,
             total_xbs=total_xbs,
@@ -461,6 +619,7 @@ class SarcTopology:
             xb_to_thin_id=jnp.asarray(xb_to_thin_id),
             xb_to_thin_face=jnp.asarray(xb_to_thin_face),
             xb_to_site_indices=jnp.asarray(xb_to_site_indices),
+            xb_valid=jnp.asarray(xb_valid),
             # Connectivity arrays
             thick_to_thin=jnp.asarray(thick_to_thin_arr),
             thin_to_thick=jnp.asarray(thin_to_thick_arr),
@@ -473,6 +632,8 @@ class SarcTopology:
             binding_offsets=jnp.asarray(binding_offsets_arr),
             binding_rests=jnp.asarray(binding_rests_arr),
             tm_chains=jnp.asarray(tm_chains_arr),
+            tm_prev_neighbor=jnp.asarray(tm_prev_neighbor_arr),
+            tm_next_neighbor=jnp.asarray(tm_next_neighbor_arr),
             thick_starts=jnp.asarray(thick_starts_arr),
             thin_starts=jnp.asarray(thin_starts_arr),
             # Structural constants
@@ -954,14 +1115,78 @@ def _spread_starts(n, low, high):
     return (low + (np.arange(n) * _spread_step(nv)) % nv).astype(np.int32)
 
 
-def _calculate_crown_offsets(n_crowns: int, bare_zone: float, crown_spacing: float) -> Tuple[np.ndarray, np.ndarray]:
-    """Calculate crown axial offsets relative to M-line."""
-    bare_zone = np.float32(bare_zone)
-    crown_spacing = np.float32(crown_spacing)
+def _compute_superlattice_classes(n_thick: int, ncols: int, n_superlattice_classes: int) -> np.ndarray:
+    """Axial-coordinate 3-coloring for the Drosophila myosin superlattice.
 
-    offsets = bare_zone + np.arange(n_crowns, dtype=np.float32) * crown_spacing
-    rests = np.full(n_crowns, crown_spacing, dtype=np.float32)
-    rests[0] = bare_zone
+    thick_idx -> (row, col) via row-major reconstruction, matching
+    _generate_hexagonal_thick_positions's iteration order exactly.
+    At n_superlattice_classes=1, class[i]=0 for every i — the formula
+    degenerates for free, no special-casing needed at any call site.
+    """
+    thick_idx = np.arange(n_thick)
+    row = thick_idx // ncols
+    col = thick_idx % ncols
+    q = col - (row - (row & 1)) // 2
+    r = row
+    return ((q - r) % n_superlattice_classes).astype(np.int32)
+
+
+def _compute_thin_registration_classes(
+    thick_positions: np.ndarray,
+    thin_thick_pairs: Optional[List[Tuple[int, int]]],
+    box_x: float,
+    box_y: float,
+    periodic: bool,
+) -> Optional[np.ndarray]:
+    """Squire 2006 3-fold actin registration class per thin filament.
+
+    The thin-filament analog of _compute_superlattice_classes (thick). Each
+    invertebrate thin filament sits at an edge midpoint between two thick
+    filaments (thin_thick_pairs = (i, j)); a hex lattice has exactly 3 edge
+    directions (0°/60°/120° mod 180°), and that direction IS the Squire
+    registration class. Returns (n_thin,) int32 in {0, 1, 2}.
+
+    Arrangement validated against Squire 2006 (JMB 361:823, p.826): this rule
+    makes the six actins around each myosin run 0,1,2,0,1,2 by angular position
+    — adjacent actins one phase apart, same phase on opposite (collinear) edges —
+    reproducing Squire's stated "systematic relative rotations of 60°/120° and
+    axial shifts of 38.7/3 = 12.9 nm" for the six surrounding actins.
+
+    Vertebrate geometry has no thin_thick_pairs (thins sit at interstices, not
+    edges) — returns None, treated downstream as all class 0, so registration is
+    a no-op and byte-identical to the pre-registration behavior.
+    """
+    if thin_thick_pairs is None:
+        return None
+    classes = np.empty(len(thin_thick_pairs), dtype=np.int32)
+    for idx, (i, j) in enumerate(thin_thick_pairs):
+        dx = thick_positions[j][0] - thick_positions[i][0]
+        dy = thick_positions[j][1] - thick_positions[i][1]
+        if periodic:
+            dx = dx - box_x * np.round(dx / box_x)
+            dy = dy - box_y * np.round(dy / box_y)
+        angle = np.degrees(np.arctan2(dy, dx)) % 180.0   # edge direction, undirected
+        classes[idx] = int(np.round(angle / 60.0)) % N_ACTIN_REGISTRATION_CLASSES
+    return classes
+
+
+def _calculate_crown_offsets(
+    n_crowns: int, bare_zone: np.ndarray, crown_spacing: float
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Calculate crown axial offsets relative to M-line, per thick filament.
+
+    bare_zone: (n_thick,) array, one value per filament.
+    """
+    bare_zone = np.asarray(bare_zone, dtype=np.float32)   # (n_thick,)
+    crown_spacing = np.float32(crown_spacing)
+    n_thick = bare_zone.shape[0]
+
+    offsets = (
+        bare_zone[:, None]
+        + np.arange(n_crowns, dtype=np.float32)[None, :] * crown_spacing
+    )  # (n_thick, n_crowns)
+    rests = np.full((n_thick, n_crowns), crown_spacing, dtype=np.float32)
+    rests[:, 0] = bare_zone
 
     return offsets, rests
 
@@ -972,11 +1197,57 @@ def _calculate_binding_site_offsets(
     n_thin: int,
     n_polymers_per_thin: int,
     n_faces_per_thin: int,
-) -> Tuple[List[np.ndarray], List[np.ndarray], List[List[np.ndarray]], List[List[int]], List[np.ndarray], int]:
-    """Calculate binding site offsets for each thin filament."""
-    mono_per_poly = 26
-    polymer_base_length = np.float32(72.0)
-    polymer_base_turns = np.float32(12.0)
+    actin_half_pitch: float,
+    mono_per_poly: int,
+    polymer_base_turns: float,
+    target_zone_wiggle: float,
+    thin_class: np.ndarray = None,
+) -> Tuple[List[np.ndarray], List[np.ndarray], List[List[np.ndarray]], List[List[int]], List[np.ndarray], int, List[np.ndarray], List[np.ndarray]]:
+    """Calculate binding site offsets for each thin filament.
+
+    Helix geometry (actin_half_pitch/mono_per_poly/polymer_base_turns) and the
+    target-zone acceptance window (target_zone_wiggle) come from StaticParams.
+    Vertebrate defaults (36.0 / 26 / 12.0 / rev-24) reproduce the prior hardcodes.
+
+    thin_class: (n_thin,) int32 in {0,1,2}, the Squire 3-fold registration class
+    per thin filament (None → all class 0). Each class shifts that filament's
+    binding-site grid by Squire's measured inter-filament screw:
+      angular: start += class · round(mono_per_poly/3)  (≈ 60°/120° rotation)
+      axial:   grid  += class · (actin_half_pitch/3)    (12.9/25.8 nm, +Z; see
+               the sign/handedness rationale in the body)
+    At class 0 both shifts vanish, so vertebrate/cardiac is byte-identical.
+    """
+    if thin_class is None:
+        thin_class = np.zeros(n_thin, dtype=np.int32)
+
+    # Per-class 3-fold offsets. Magnitudes are Squire 2006 (JMB 361:823, p.826):
+    # the six actins around each myosin sit at relative rotations of 60°/120° AND
+    # axial shifts of 38.7/3 = 12.9 nm — one rigid inter-filament screw per step.
+    #   angular: class · round(mono_per_poly/3) monomers = best integer approx to
+    #            Squire's 60° (9 mono → 64.3°, ~4.3° off; intrinsic to the 28/13
+    #            helix, since 60° is not an exact multiple of the 12.857° grid).
+    #   axial:   class · (actin_half_pitch/3) = 12.9 / 25.8 nm.
+    # SIGN (+, toward the Z-line): a phase shift on a *finite* monomer array must
+    #   truncate at one end; + puts that boundary effect in the crown-free I-band
+    #   (past crown_offsets.max(), already unreachable/masked) rather than across
+    #   the M-line into the crown zone. Measured: '−' pushes 4 sites per class-2
+    #   thin behind the M-line (a class-asymmetric artifact), '+' leaves all three
+    #   classes symmetric. Squire fixes the magnitude and relative arrangement,
+    #   not our coordinate sign, so this is a free, artifact-avoiding choice.
+    # RESIDUAL (does NOT affect the 3-fold structure or match/mismatch magnitude):
+    #   the absolute chirality of the screw vs real Lethocerus is not fixed by
+    #   Squire's relative low-angle X-ray data, nor by the Hu 2016 cryo-EM (myosin
+    #   only); pinning it would need a thin-filament 3D reconstruction. It mirrors
+    #   the whole lattice only. The absolute AZIMUTHAL actin-vs-crown registration
+    #   (base_k) is likewise unmeasured and gauge-degenerate with the crown-face
+    #   convention → base_k defaults to 0 (see create()). Its EFFECT is real, not
+    #   noise: Squire Fig.6b/7d show head-attachment probability oscillates with
+    #   registration — that IS stretch activation, so it must not be averaged out.
+    angular_step = int(round(mono_per_poly / N_ACTIN_REGISTRATION_CLASSES))
+    axial_step = np.float32(actin_half_pitch / N_ACTIN_REGISTRATION_CLASSES)
+
+    polymer_base_length = np.float32(2 * actin_half_pitch)
+    polymer_base_turns = np.float32(polymer_base_turns)
 
     rev = np.float32(2 * np.pi)
     pitch = polymer_base_turns * rev / mono_per_poly
@@ -995,10 +1266,17 @@ def _calculate_binding_site_offsets(
     all_face_to_sites = []
     all_n_sites_per_face = []
     all_tm_chains = []
+    all_tm_prev_neighbor = []
+    all_tm_next_neighbor = []
 
     for thin_idx in range(n_thin):
         active_faces = list(thin_face_orientations[thin_idx])
-        start = thin_starts[thin_idx]
+        cls = int(thin_class[thin_idx])
+        start = thin_starts[thin_idx] + cls * angular_step
+        # This thin's axially-shifted monomer grid (Squire screw translation per
+        # class, +Z toward the Z-line — see the sign rationale above). The base
+        # monomer_offsets stays the shared grid; only this copy is shifted.
+        monomer_offsets_this = monomer_offsets + cls * axial_step
 
         monomer_angles = np.array([
             ((m + start + 1) % mono_per_poly) * pitch % rev
@@ -1009,7 +1287,7 @@ def _calculate_binding_site_offsets(
         face_angles = np.arctan2(orientation_vectors[:, 1], orientation_vectors[:, 0])
         face_angles = np.where(face_angles < 0, face_angles + rev, face_angles)
 
-        wiggle = rev / 24
+        wiggle = np.float32(target_zone_wiggle)
         mono_in_faces = []
 
         for face_angle in face_angles:
@@ -1018,21 +1296,38 @@ def _calculate_binding_site_offsets(
             face_matches = np.where(within_wiggle)[0]
             mono_in_faces.append(face_matches)
 
-        offsets_by_face = [monomer_offsets[mono_ind] for mono_ind in mono_in_faces]
+        offsets_by_face = [monomer_offsets_this[mono_ind] for mono_ind in mono_in_faces]
 
         if len(offsets_by_face) > 0 and any(len(f) > 0 for f in offsets_by_face):
             offsets_flat = np.sort(np.hstack(offsets_by_face))[::-1]
         else:
-            offsets_flat = monomer_offsets[::-1]
+            offsets_flat = monomer_offsets_this[::-1]
 
         tm_chain_this_thin = []
         for offset in offsets_flat:
-            mono_idx_matches = np.where(np.abs(monomer_offsets - offset) < 1e-6)[0]
+            mono_idx_matches = np.where(np.abs(monomer_offsets_this - offset) < 1e-6)[0]
             if len(mono_idx_matches) > 0:
                 mono_index = mono_idx_matches[0]
             else:
                 mono_index = 0
             tm_chain_this_thin.append(mono_index % 2)
+
+        # Topological same-chain neighbors: each site's nearest predecessor/successor
+        # within its own chain's own axial ordering (offsets_flat is already axially
+        # sorted, and tm_chain_this_thin was built by iterating it in order, so the
+        # indices where chain==c are already that chain's axial ordering). Chain
+        # endpoints self-reference (no real neighbor on that side) rather than using
+        # -1, since NumPy silently wraps -1 to the last element on gather.
+        n_sites_this_thin = len(offsets_flat)
+        chain_arr = np.array(tm_chain_this_thin, dtype=np.int32)
+        prev_neighbor = np.arange(n_sites_this_thin, dtype=np.int32)
+        next_neighbor = np.arange(n_sites_this_thin, dtype=np.int32)
+        for c in (0, 1):
+            chain_site_indices = np.where(chain_arr == c)[0]
+            for k in range(1, len(chain_site_indices)):
+                prev_neighbor[chain_site_indices[k]] = chain_site_indices[k - 1]
+            for k in range(len(chain_site_indices) - 1):
+                next_neighbor[chain_site_indices[k]] = chain_site_indices[k + 1]
 
         node_index_by_face = []
         for face_offsets in offsets_by_face:
@@ -1055,16 +1350,22 @@ def _calculate_binding_site_offsets(
         rests_list.append(rests.astype(np.float32))
         all_face_to_sites.append(node_index_by_face)
         all_n_sites_per_face.append(n_sites_this_face)
-        all_tm_chains.append(np.array(tm_chain_this_thin, dtype=np.int32))
+        all_tm_chains.append(chain_arr)
+        all_tm_prev_neighbor.append(prev_neighbor)
+        all_tm_next_neighbor.append(next_neighbor)
 
     max_sites = max(len(offsets) for offsets in offsets_list)
 
-    return offsets_list, rests_list, all_face_to_sites, all_n_sites_per_face, all_tm_chains, max_sites
+    return (offsets_list, rests_list, all_face_to_sites, all_n_sites_per_face, all_tm_chains, max_sites,
+            all_tm_prev_neighbor, all_tm_next_neighbor)
 
 
 # =============================================================================
 # FLATTENED INDEX MAP COMPUTATION
 # =============================================================================
+
+_LEGACY_FACE_PATTERN = np.array([[0, 2, 4], [1, 3, 5], [0, 2, 4]])  # Level 1, 2, 3
+
 
 def _compute_flat_index_maps_fixed_width(
     thick_to_thin: np.ndarray,
@@ -1073,8 +1374,12 @@ def _compute_flat_index_maps_fixed_width(
     thick_starts: np.ndarray,
     n_thick: int,
     n_crowns: int,
-    max_sites_per_face: int
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    max_sites_per_face: int,
+    n_xb_per_crown: int,
+    crown_rotation_deg: float,
+    crown_face_wiggle_deg: float,
+    legacy_crown_geometry: bool,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Convert nested Thick->Face->Thin to flat XB->Thin maps with fixed-width arrays.
 
     KEY OPTIMIZATION: xb_to_site_indices has shape (total_xbs, max_sites_per_face)
@@ -1083,32 +1388,83 @@ def _compute_flat_index_maps_fixed_width(
     - No dynamic-size slicing per XB
     - Full GPU parallelization via vmap
 
+    HOW A HEAD IS ASSIGNED A TARGET. Each crown is rotated azimuthally relative
+    to the one below it, and each head on a crown points in its own direction.
+    A head can only reach a thin filament that its arm actually points at, so
+    the assignment is: compute the head's azimuth, find the nearest of the six
+    hexagonal neighbour directions, and accept the match if it falls within
+    crown_face_wiggle_deg.
+
+    Whether every head finds a partner depends entirely on the arithmetic:
+
+      3 heads per crown, 60 degrees rotation — every head lands exactly on a
+        hexagonal direction. All heads match, and the six faces are used evenly.
+
+      4 heads per crown, 33.75 degrees rotation — 33.75 is not a multiple of
+        60, so heads drift out of alignment as the rotation accumulates and
+        only about half find a partner. This is a real structural property of
+        the geometry, not a modelling failure: the unmatched heads are marked
+        invalid in xb_valid and are permanently excluded from binding.
+
+    Setting legacy_crown_geometry=True substitutes a fixed lookup table for the
+    azimuth calculation, which is only meaningful for 3 heads per crown. It is
+    retained for compatibility with configurations that assume it.
+
+    face_idx here is an abstract 0-5 label, not a physical angle. The mapping
+    from label to direction — which differs by 30 degrees between the vertebrate
+    and invertebrate lattices — was already resolved when thick_to_thin was
+    built, which is what lets this function stay agnostic about which lattice it
+    is working on.
+
     Returns:
         xb_to_thin_id: (total_xbs,) - Target thin filament for each XB
         xb_to_thin_face: (total_xbs,) - Target thin face for each XB
         xb_to_site_indices: (total_xbs, max_sites_per_face) - FIXED-WIDTH site indices
             Padded with neutral value (first valid site) for GPU parallelization
+        xb_valid: (total_xbs,) bool - False where the XB has no real geometric
+            thin-filament partner this crown (face didn't match, or the thick
+            filament genuinely has no neighbor there). Always True for the
+            legacy path. Downstream kinetics (transitions.py) must gate the
+            binding rate on this — it is NOT enforced here.
     """
-    total_xbs = n_thick * n_crowns * 3
-    face_pattern = np.array([[0, 2, 4], [1, 3, 5], [0, 2, 4]])  # Level 1, 2, 3
+    total_xbs = n_thick * n_crowns * n_xb_per_crown
 
     xb_to_thin_id = np.zeros(total_xbs, dtype=np.int32)
     xb_to_thin_face = np.zeros(total_xbs, dtype=np.int32)
     xb_to_site_indices = np.zeros((total_xbs, max_sites_per_face), dtype=np.int32)
+    xb_valid = np.ones(total_xbs, dtype=bool)
 
     for xb_idx in range(total_xbs):
-        thick_idx = xb_idx // (n_crowns * 3)
-        local_idx = xb_idx % (n_crowns * 3)
-        crown_idx = local_idx // 3
-        xb_in_crown = local_idx % 3
+        thick_idx = xb_idx // (n_crowns * n_xb_per_crown)
+        local_idx = xb_idx % (n_crowns * n_xb_per_crown)
+        crown_idx = local_idx // n_xb_per_crown
+        xb_in_crown = local_idx % n_xb_per_crown
 
-        # Crown level based on thick_starts (1-indexed: 1, 2, 3)
-        crown_level = (crown_idx + thick_starts[thick_idx] - 1) % 3 + 1
-        face_idx = face_pattern[crown_level - 1, xb_in_crown]
+        if legacy_crown_geometry:
+            # Verbatim original table — bit-identical, only valid at n_xb_per_crown==3
+            crown_level = (crown_idx + thick_starts[thick_idx] - 1) % 3 + 1
+            face_idx = _LEGACY_FACE_PATTERN[crown_level - 1, xb_in_crown]
+            matched = True
+        else:
+            eff_crown = crown_idx + (thick_starts[thick_idx] - 1)
+            azimuth_deg = (xb_in_crown * (360.0 / n_xb_per_crown)
+                           + eff_crown * crown_rotation_deg) % 360.0
+            nearest_face = int(round(azimuth_deg / 60.0)) % 6
+            residual_deg = abs(azimuth_deg - nearest_face * 60.0)
+            residual_deg = min(residual_deg, 360.0 - residual_deg)
+            matched = residual_deg < crown_face_wiggle_deg
+            face_idx = nearest_face
 
-        # Get thin filament and face from thick_to_thin connectivity
-        thin_idx = thick_to_thin[thick_idx, face_idx, 0]
-        thin_face = thick_to_thin[thick_idx, face_idx, 1]
+        if matched:
+            # Get thin filament and face from thick_to_thin connectivity
+            thin_idx = thick_to_thin[thick_idx, face_idx, 0]
+            thin_face = thick_to_thin[thick_idx, face_idx, 1]
+        else:
+            thin_idx = -1  # no geometric partner this crown
+
+        # Record validity BEFORE the unconnected-face remap below — covers both
+        # causes uniformly (formula miss, or thick_to_thin itself being -1).
+        xb_valid[xb_idx] = thin_idx >= 0
 
         # Handle unconnected faces (thin_idx == -1)
         if thin_idx < 0:
@@ -1133,7 +1489,7 @@ def _compute_flat_index_maps_fixed_width(
         )
         xb_to_site_indices[xb_idx] = padded_indices
 
-    return xb_to_thin_id, xb_to_thin_face, xb_to_site_indices
+    return xb_to_thin_id, xb_to_thin_face, xb_to_site_indices, xb_valid
 
 
 # =============================================================================

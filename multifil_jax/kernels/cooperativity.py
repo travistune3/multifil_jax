@@ -1,19 +1,40 @@
 """
-Cooperativity Calculations for JAX Half-Sarcomere
+Tropomyosin cooperativity — the LEGACY tension-span model, plus a shared helper.
 
-This module handles tropomyosin cooperative activation.
-Key mechanism: Sites in state 2 (closed) activate neighboring sites,
-making them more likely to transition to permissive states. Note that 'neighboring' sites are face aware, meaning only sites on the same tm-chain are considered. 
+WHY COOPERATIVITY EXISTS IN THE MODEL
+-------------------------------------
+Calcium binding at one troponin does not regulate one binding site in isolation.
+Tropomyosin is a continuous strand lying along the actin filament, so when one
+stretch of it moves aside, the adjoining stretches are mechanically dragged
+toward moving too. This is what makes muscle force rise far more steeply with
+calcium than independent binding could explain — a measured Hill coefficient
+around 3, where independent sites would give 1.
 
-From current code:
-- hs.py: set_subject_to_cooperativity()
-- af.py: TmSite cooperativity logic
+Whatever the model, cooperativity is always between sites ON THE SAME
+TROPOMYOSIN STRAND. A thin filament carries two strands, one along each groove
+of the actin double helix, and they do not couple to each other. Every function
+here respects that.
 
-Key concepts:
-- Span: Distance over which cooperative effect acts
-- Force-dependent: Span decreases with force (tension turns off cooperativity)
-- State-dependent: Only sites in state 2 exert cooperative effect
-- Tropomyosin-chain: Every other binding site is considered on the same tm chain, and cooperativiy calculations are tm-chain aware.
+WHICH MODEL RUNS
+----------------
+The simulation has two cooperativity implementations, and this module serves
+both, though unequally:
+
+  DEFAULT — symmetric Ising coupling. Lives in kernels/transitions.py
+    (thin_transitions_ising). From this module it uses only
+    count_neighbor_states_split() at the bottom.
+
+  LEGACY — tension-dependent span, selected by run(legacy_coop=True). This is
+    everything else in this module: compute the tension carried along the thin
+    filament, convert it into a spatial span in nanometres, and mark every site
+    within that span of an active site as cooperatively activated.
+
+The legacy model is deprecated. It is retained so that parameter sets fitted
+under it remain reproducible. Its distinguishing feature — that cooperativity
+reaches a physical distance which grows with filament tension, rather than a
+fixed number of neighbours — makes it mechanically appealing but harder to
+reason about thermodynamically, since the resulting rate boost is applied to
+forward rates only.
 """
 
 import jax
@@ -53,8 +74,16 @@ def calculate_cooperative_span(tension: jnp.ndarray,
         - Saturation: Add upper limit on span
         - Hysteresis: Make span depend on previous state
 
-    Formula (from hs.py line 1623):
-        span = 0.5 * base * (1 + tanh(steep * (F50 + F)))
+    Formula:
+        span = 0.5 * span_base * (1 + tanh(span_steep * (span_force50 + tension)))
+
+    A tanh gives a smooth saturating switch: the span approaches zero at low
+    tension, span_base at high tension, and transitions around span_force50.
+    Smoothness matters for the solver — a hard threshold here would make force
+    a discontinuous function of position.
+
+    Note span_force50 is NEGATIVE by default (-8 pN), so the midpoint sits at a
+    compressive load and typical tensile loads land on the upper plateau.
     """
 
     span = 0.5 * span_base * (1.0 + jnp.tanh(span_steep * (span_force50 + tension)))
@@ -71,7 +100,8 @@ def get_site_tensions(thin_forces: jnp.ndarray) -> jnp.ndarray:
     Tension = sum of forces from this site to M-line (end of array).
     tensions[i] = sum of forces[i:]
 
-    This matches OOP: np.triu(np.ones(n)) @ forces
+    Equivalent to an upper-triangular matrix product, but computed as a
+    reversed cumulative sum, which is O(n) rather than O(n^2).
 
     Args:
         thin_forces: (n_thin, n_sites) forces on each site (pN)
@@ -204,26 +234,38 @@ def update_cooperativity(state: 'State',
                         constants: 'DynamicParams',
                         thin_forces: jnp.ndarray,
                         topology: 'SarcTopology' = None) -> 'State':
-    """Update which TM sites are subject to cooperative activation.
+    """Mark which sites fall inside a cooperative span — LEGACY path only.
 
-    This should be called before thin_transitions() to determine
-    which sites get the cooperative rate boost.
+    Must run before thin_transitions(), which consumes the flag this writes.
+    The default Ising path never calls this: it derives neighbour information
+    directly from tm_states, which is why the default kinetics phase can skip
+    both this step and the thin-filament force calculation feeding it.
+
+    Three stages:
+      1. Convert per-node spring forces into cumulative TENSION at each site
+         (get_site_tensions) — the load actually borne at that point along the
+         filament, which is the mechanically meaningful quantity for straining
+         tropomyosin.
+      2. Convert tension into a span in nanometres (calculate_cooperative_span).
+         Higher tension gives a longer reach.
+      3. Mark every site lying within its span of an activating site, staying
+         within each tropomyosin chain (find_cooperative_sites_with_chains).
+
+    Writes a boolean per site into state.thin.subject_to_coop. The magnitude of
+    the resulting rate boost is not decided here — that is tm_coop_magnitude,
+    applied in transitions.py.
 
     Args:
-        state: State NamedTuple (must have state.thin with tm_states, axial)
-        constants: DynamicParams object with attribute access for span parameters
-        thin_forces: (n_thin, n_sites) forces on thin filament sites
-        topology: SarcTopology with tm_chains (structural data)
+        state: Current State (reads thin.tm_states and thin.axial)
+        constants: DynamicParams with tm_span_base / tm_span_force50 /
+            tm_span_steep
+        thin_forces: (n_thin, n_sites) internal backbone spring forces, from
+            forces.calculate_thin_forces_for_cooperativity(). NOT crossbridge
+            forces — see that function for why the distinction matters.
+        topology: SarcTopology with tm_chains, assigning each site to a strand
 
     Returns:
-        new_state: State with updated 'subject_to_coop' field
-
-    How to modify:
-        - Per-filament parameters: Different span_base per thin filament
-        - Time dependence: Smooth transitions in/out of cooperative regions
-        - All-or-none: Sites are either fully cooperative or not
-
-    From hs.py set_subject_to_cooperativity() (lines 1585-1638)
+        new_state: State with subject_to_coop updated
     """
     tm_states = state.thin.tm_states      # (n_thin, n_sites)
     thin_axial = state.thin.axial         # (n_thin, n_sites)
@@ -265,65 +307,58 @@ def update_cooperativity(state: 'State',
 # SYMMETRIC ISING COOPERATIVITY — neighbor-state count helper
 # ============================================================================
 #
-# For each TM site, count same-chain neighbors within a fixed span that are in
-# state 2 (Ca-open) and state 3 (XB-bound) separately. Counts are capped at 2
-# per channel so the index space stays (3, 3) for Q-matrix gather.
-# The closed-neighbor count is derived in the transitions kernel as
-# n_closed = max(0, N_TYPICAL - n_2 - n_3), so this helper only returns the two
-# open-channel counts.
+# The one piece of this module the DEFAULT (Ising) path uses.
 #
-# Used by transitions.thin_transitions_ising when ising_coop=True is passed to run().
-# No state field is written — counts are consumed inline.
+# For each tropomyosin site, count how many of its same-chain neighbours are in
+# state 2 (Ca-open) and state 3 (crossbridge-bound), keeping the two counts
+# separate so they can carry different coupling strengths (J_C and J_M).
+#
+# NEIGHBOURS ARE STRUCTURAL, NOT SPATIAL. A site couples to its immediate
+# predecessor and successor in its own chain's axial ordering, precomputed once
+# when the topology is built (topology.tm_prev_neighbor / tm_next_neighbor).
+# There is no distance threshold and no length scale to tune, which is what
+# makes the coupling a genuine nearest-neighbour Ising chain rather than a
+# windowed approximation to one.
+#
+# Endpoints self-reference rather than carrying a sentinel index, so every
+# gather is valid and no masking is needed. A site therefore has at most two
+# real neighbours by construction, and the counts fall in {0, 1, 2} naturally —
+# the jnp.minimum(..., 2) below is defensive, kept because the downstream
+# Q-matrix gather assumes that range structurally.
+#
+# Nothing is written to state: the counts are consumed inline by
+# transitions.thin_transitions_ising().
 
 def count_neighbor_states_split(tm_states: jnp.ndarray,
-                                 tm_positions: jnp.ndarray,
-                                 span: float,
-                                 tm_chains: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Count same-chain neighbors in state 2, state 3, and closed (state 0/1)
-    within a fixed span. Each count is capped at 2 for tractable Q-matrix indexing.
+                                 tm_prev_neighbor: jnp.ndarray,
+                                 tm_next_neighbor: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Count same-chain neighbors in state 2, state 3, and closed (state 0/1),
+    using the fixed (<=2) topological same-chain neighbor set per site.
 
     Args:
-        tm_states:    (n_sites,) TM states (0-3)
-        tm_positions: (n_sites,) axial positions of TM sites (nm)
-        span:         scalar nm, fixed cooperative reach (radius)
-        tm_chains:    (n_sites,) chain assignment (0 or 1) for each site
+        tm_states:        (n_sites,) TM states (0-3)
+        tm_prev_neighbor: (n_sites,) nearest same-chain predecessor site index
+            (self-referencing at chain endpoints/padding)
+        tm_next_neighbor: (n_sites,) nearest same-chain successor site index
+            (self-referencing at chain endpoints/padding)
 
     Returns:
-        n_2:      (n_sites,) int32 same-chain state-2 neighbors, capped at 2
-        n_3:      (n_sites,) int32 same-chain state-3 neighbors, capped at 2
-        n_closed: (n_sites,) int32 same-chain state-{0,1} neighbors, capped at 2
+        n_2:      (n_sites,) int32 same-chain state-2 neighbors, in {0,1,2}
+        n_3:      (n_sites,) int32 same-chain state-3 neighbors, in {0,1,2}
+        n_closed: (n_sites,) int32 same-chain state-{0,1} neighbors, in {0,1,2}
     """
     n_sites = tm_states.shape[0]
-    max_window = 20  # JAX static-shape ceiling; physical filter is `span`
+    site_idx = jnp.arange(n_sites)
 
     is_2 = (tm_states == 2)
     is_3 = (tm_states == 3)
     is_closed = (tm_states == 0) | (tm_states == 1)
 
-    def count_site(i):
-        my_chain = tm_chains[i]
-        my_pos = tm_positions[i]
+    prev_real = (tm_prev_neighbor != site_idx)
+    next_real = (tm_next_neighbor != site_idx)
 
-        offsets = jnp.arange(-max_window, max_window + 1)
-        idx = jnp.clip(i + offsets, 0, n_sites - 1)
-        not_self = (offsets != 0)
+    n_2 = (is_2[tm_prev_neighbor] & prev_real).astype(jnp.int32) + (is_2[tm_next_neighbor] & next_real).astype(jnp.int32)
+    n_3 = (is_3[tm_prev_neighbor] & prev_real).astype(jnp.int32) + (is_3[tm_next_neighbor] & next_real).astype(jnp.int32)
+    n_c = (is_closed[tm_prev_neighbor] & prev_real).astype(jnp.int32) + (is_closed[tm_next_neighbor] & next_real).astype(jnp.int32)
 
-        nb_pos = tm_positions[idx]
-        nb_chain = tm_chains[idx]
-        nb_is_2 = is_2[idx]
-        nb_is_3 = is_3[idx]
-        nb_is_closed = is_closed[idx]
-
-        same_chain = (nb_chain == my_chain)
-        within = jnp.abs(nb_pos - my_pos) < span
-        mask = same_chain & within & not_self
-
-        n2 = jnp.sum(jnp.where(mask & nb_is_2, 1, 0))
-        n3 = jnp.sum(jnp.where(mask & nb_is_3, 1, 0))
-        nc = jnp.sum(jnp.where(mask & nb_is_closed, 1, 0))
-        return (jnp.minimum(n2, 2).astype(jnp.int32),
-                jnp.minimum(n3, 2).astype(jnp.int32),
-                jnp.minimum(nc, 2).astype(jnp.int32))
-
-    n_2_arr, n_3_arr, n_c_arr = jax.vmap(count_site)(jnp.arange(n_sites))
-    return n_2_arr, n_3_arr, n_c_arr
+    return jnp.minimum(n_2, 2), jnp.minimum(n_3, 2), jnp.minimum(n_c, 2)

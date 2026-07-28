@@ -42,11 +42,17 @@ def _configure_xla_for_cpu():
 
 
 def _configure_xla_for_gpu():
-    """Configure XLA flags for GPU.
+    """Configure XLA flags for GPU. Currently a deliberate no-op.
 
-    Note: autotune_level=2 was tried (Session 3→4) to reduce compile time
-    but may have contributed to a ~20x runtime regression. Reverted to
-    default (level 4) which lets XLA find optimal kernel variants.
+    XLA's defaults are what this model wants. In particular, do NOT lower the
+    autotuning level to shorten compile times: reduced autotuning lets XLA
+    settle for a poorer kernel variant for the simulation's inner loops, and the
+    runtime cost of that vastly outweighs the one-time compile saving. Compiled
+    kernels are cached across sessions anyway, so compile time is paid once per
+    configuration while runtime is paid on every step of every simulation.
+
+    Kept as a named hook so GPU-specific flags have an obvious home if one is
+    ever genuinely needed.
     """
     pass
 

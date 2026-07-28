@@ -1,19 +1,48 @@
 """
-Geometry Calculations for JAX Half-Sarcomere
+Crossbridge-to-binding-site geometry.
 
-This module handles spatial calculations:
-1. Nearest binding site for each crossbridge
-2. Distances between crossbridges and binding sites
-3. Connectivity-aware distance calculations
+Every timestep, after the filaments have moved, each myosin head has to work out
+where its nearest available actin binding site now is and how far away it is.
+Those distances are what make the kinetics mechanosensitive: the rate functions
+in rate_functions.py read them to decide how readily a head binds, strokes, or
+detaches. This module computes them.
 
-Optimizations:
-- Fixed-width arrays for GPU parallelization
-- Pre-computed flattened index maps from SarcTopology
-- Unified Gather operations via vmap
+WHICH SITES A HEAD MAY EVEN CONSIDER
+------------------------------------
+Not all of them. A head projects from its crown in one azimuthal direction and
+can only reach the thin filament it faces, and only the sites on the face of
+that filament pointing back at it. That candidate list is fixed by the lattice
+geometry, so it is precomputed once into topology.xb_to_site_indices rather than
+being searched each step. The search here is only over that short list.
 
-From current code:
-- hs.py: set_xb_nearest_binding_site()
-- mf.py: Crown.nearest property
+The list is stored at a FIXED WIDTH for every head, padded where a head has
+fewer candidates than the maximum. Fixed width is what allows the entire search
+to be one batched gather across every crossbridge in the lattice, instead of a
+ragged per-head loop that GPUs handle badly. Padding entries are masked out by
+comparing against each head's real candidate count.
+
+TWO GEOMETRIC SUBTLETIES
+------------------------
+The myosin head reaches. It projects roughly 13 nm axially from the crown it
+sits on, so the SEARCH for the nearest site uses the reaching head position —
+but the DISTANCE that gets stored, and that the rate functions consume, is
+measured from the crown base, because that is where the two-spring element is
+anchored. Using the same position for both would be wrong in opposite
+directions.
+
+Sites at or past the M-line are excluded outright. As filaments slide, thin
+filament sites can pass the M-line into the opposite half-sarcomere, and a head
+must not reach backwards across it to bind one. They are masked to infinite
+distance rather than clamped to the boundary: clamping would leave them as
+legitimate nearest neighbours sitting at an extreme strain, producing large
+spurious forces from heads near the M-line.
+
+WHAT "DISTANCE" MEANS HERE
+--------------------------
+xb_distances stores an (axial, radial) PAIR per head, not two candidate sites.
+Axial is the offset along the filament to the chosen site; radial is simply the
+current lattice spacing. Together they give the head's polar geometry, which is
+what the two-spring model needs.
 """
 
 import jax
@@ -35,13 +64,24 @@ def find_nearest_binding_sites_fixed_width(
     xb_to_site_indices: jnp.ndarray,
     n_sites_per_face_flat: jnp.ndarray,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Find nearest binding site using fixed-width Gather for GPU parallelization.
+    """Find each crossbridge's nearest reachable binding site.
 
-    KEY OPTIMIZATION: xb_to_site_indices has shape (n_xb, max_sites_per_face)
-    which is CONSTANT across all XBs. This enables:
-    - Single unified jnp.take Gather operation
-    - No dynamic-size slicing per XB
-    - Full GPU parallelization via vmap
+    One batched gather over the fixed-width candidate lists, then an argmin.
+    Two masks are applied before the argmin, and both matter:
+
+      count mask    padding entries beyond a head's real candidate count are
+                    excluded, since the fixed-width array is padded
+      visible mask  sites at or past the M-line (position <= 0) are excluded,
+                    so a head cannot bind across it into the opposite
+                    half-sarcomere
+
+    Masked candidates are set to infinite distance rather than removed, keeping
+    the array shape static for XLA. If every candidate is masked the argmin
+    still returns an index; such heads are gated out elsewhere by xb_valid or by
+    their target's permissiveness.
+
+    Positions passed in should be the REACHING head positions (crown base plus
+    the head's axial reach), not the crown bases — see the module docstring.
 
     Args:
         xb_positions: (n_xb,) axial positions of crossbridges
@@ -95,7 +135,17 @@ def calculate_xb_to_bs_distances(xb_base_positions: jnp.ndarray,
                                  nearest_thin: jnp.ndarray,
                                  nearest_site: jnp.ndarray,
                                  lattice_spacing: float) -> jnp.ndarray:
-    """Calculate (axial, radial) distance from XBs to their nearest BS.
+    """Axial and radial offset from each crossbridge to its chosen binding site.
+
+    Returns the pair the two-spring model needs: the axial offset along the
+    filament, and the radial separation, which is just the current lattice
+    spacing since thick and thin filaments run parallel.
+
+    Measured from the CROWN BASE, deliberately not from the reaching head
+    position used to find the site. The crown is where the head's springs are
+    anchored, so it is the correct origin for a strain; the 13 nm reach is a
+    property of the head's rest geometry and is already accounted for in the
+    spring rest lengths.
 
     Args:
         xb_base_positions: (n_xb,) XB base (crown) axial positions WITHOUT +13 offset
@@ -138,27 +188,39 @@ def update_nearest_neighbors(
     constants,
     topology: 'SarcTopology'
 ):
-    """Update nearest binding site for all crossbridges using topology.
+    """Recompute every crossbridge's nearest binding site and its distances.
 
-    Uses fixed-width xb_to_site_indices from topology for GPU efficiency.
+    Called once per timestep, before the transition kernels, because the
+    filaments moved during the previous equilibrium solve and the rates depend
+    on where everything now is.
+
+    Note that this updates the NEAREST site for all heads, attached or not. For
+    an attached head the stored distances describe its current strain; for a
+    detached one they describe the opportunity it is being offered.
 
     Args:
-        state: State NamedTuple with thick/thin sub-states.
-        constants: Constants NamedTuple with lattice_spacing.
-        topology: SarcTopology object with pre-computed index maps.
+        state: Current State (reads thick.axial and thin.axial)
+        constants: DynamicParams, for the current lattice_spacing
+        topology: SarcTopology with the precomputed candidate lists
 
     Returns:
-        new_state: State with updated nearest neighbor info
+        new_state: State with xb_nearest_bs and xb_distances updated
     """
     thick_axial = state.thick.axial
     thin_axial = state.thin.axial
 
     n_thick, n_crowns = thick_axial.shape
+    n_xb_per_crown = topology.n_xb_per_crown
 
-    # Flatten thick base positions (each crown has 3 XBs)
-    xb_base_positions = jnp.repeat(thick_axial, 3, axis=1).reshape(-1)
+    # Flatten thick base positions (each crown has n_xb_per_crown XBs)
+    xb_base_positions = jnp.repeat(thick_axial, n_xb_per_crown, axis=1).reshape(-1)
 
-    # For FINDING nearest binding site, use head position (+13 nm offset)
+    # The myosin head reaches ~13 nm axially from its crown, so the SEARCH is
+    # done from the reaching head position. The distance recorded below is
+    # measured from the crown base instead — see the module docstring.
+    # [G] 13.0 nm is an unsourced structural estimate of S1 reach, consistent
+    # with the head's rest length but not independently calibrated. It is also
+    # used, by reference, to bound the overlap zone in metrics_fn.py.
     xb_head_positions = xb_base_positions + 13.0
 
     # Pre-gather n_sites_per_face for each XB
@@ -185,8 +247,8 @@ def update_nearest_neighbors(
     )
 
     # Store site_idx only - thin filament is implicit from topology.xb_to_thin_id
-    nearest_reshaped = nearest_site.reshape(n_thick, n_crowns, 3)
-    distances_reshaped = distances.reshape(n_thick, n_crowns, 3, 2)
+    nearest_reshaped = nearest_site.reshape(n_thick, n_crowns, n_xb_per_crown)
+    distances_reshaped = distances.reshape(n_thick, n_crowns, n_xb_per_crown, 2)
 
     # 1. Update the inner ThickState NamedTuple
     new_thick = state.thick._replace(
