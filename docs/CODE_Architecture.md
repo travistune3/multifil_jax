@@ -614,13 +614,14 @@ Deprecated and slated for removal; kept only so old fits remain reproducible.
 ### `thick_transitions(state, constants, topology, rng_key, dt)`
 - 6-state XB Markov model (states 0–5, see §6)
 - Per-XB probabilities gathered from a **binned** matrix-exponential grid
-- Shared helper `compute_xb_transition_matrices()` → `(Q_all, P_all, P_abs_all)`,
-  each `(n_xb_total, 6, 6)`
+- Probabilities from `xb_step_probabilities()` → `P_all`, `(n_xb_total, 6, 6)`
 - Updates `xb_states` and `xb_bound_to` stochastically
 
 ### XB Q/P binning
 
-`compute_xb_transition_matrices()` is split into two stages:
+Rate construction is shared; exponentiation is not, because the sampling path and
+the metrics path need exponentials of *different* generators. One matrix
+exponential per caller, never two.
 
 - `_build_xb_Q_bins(state, constants, topology)` → `(Q_bins, key)`.
   Builds `(2 * n_xb_bins, 6, 6)` rate matrices — one block at permissiveness 0,
@@ -628,9 +629,18 @@ Deprecated and slated for removal; kept only so old fits remain reproducible.
   Each XB's `key` comes from `jnp.digitize(axial_dist, xb_bin_edges)` plus its
   permissiveness bit. The key depends only on geometry and permissiveness, never
   on rates, so it is shared across subpopulations.
-- `_xb_P_from_Q_bins(Q_bins, key, dt, eye_6)` — exponentiates the bins and gathers
-  per-XB. Also produces `P_abs` (row 4 zeroed, an absorbing Free_2) used by the
-  `atp_expected_p` metric.
+- `_xb_Q_resolved(...)` → `(Q_bins, key, labels)`. All subpopulation handling
+  (`mean_field` blends generators, `explicit` keeps them stacked), no
+  exponentials. This is the shared stage that guarantees sampling and metrics
+  cannot disagree about the physics of a step.
+- `xb_step_probabilities(...)` → `P_all`. One expm of the plain generator. Used
+  by `thick_transitions()`.
+- `xb_exit_probabilities(...)` → `P_abs_all`. One expm of a generator
+  with **rows 4 and 0 both zeroed**, making Free_2 and DRX absorbing. Trapping
+  both exits makes them mutually exclusive, so a single matrix reports two
+  disjoint fluxes: `P_abs[i,3,4]` = detachment that consumed an ATP
+  (`atp_expected_p`), `P_abs[i,3,0]` = detachment via the reverse route
+  `3→2→1→0` that consumed none (`xb_tear_expected`). Metrics only.
 
 This replaces one expm per crossbridge with `2 × n_xb_bins` — ~6× fewer expm calls
 at 4×4, where the step was ~71 % matrix exponential. Binning resolution is set by
@@ -787,7 +797,7 @@ no selection needed.
 | Displacement | `thick_displace_mean/max/min/std`, `thin_displace_mean/max/min/std` | 8 |
 | Energy | `thick_energy_first_avg`, `thick_energy_first_delta_avg`, `titin_energy_avg`, `titin_energy_delta_avg` | 4 |
 | Work | `work_thick`, `work_thick_mean` | 2 |
-| ATP expected | `atp_expected_p`, `atp_expected_q`, `work_per_atp` | 3 |
+| Detachment / ATP | `atp_expected_p`, `xb_tear_expected`, `work_per_atp` | 3 |
 | Solver | `newton_iters` | 1 |
 
 The **overlap-zone** group (`compute_overlap_tm_fractions()`) restricts the TM
@@ -800,10 +810,12 @@ sites. Prefer the `_overlap` variants whenever comparing across geometries — a
 filament-length change once moved the all-site metric 13.5 %→17.3 % almost
 entirely through that denominator while the true overlap value barely moved.
 
-`atp_expected_p` uses the absorbing-state `P_abs` (row 4 zeroed), correctly
-counting 3→4→0 paths within one step; `atp_expected_q` uses the Q-matrix
-branching ratio. `xb_subpop` is threaded through so each XB's ATP metrics use its
-own population's rates.
+Both come from the absorbing-state `P_abs` (rows 4 **and** 0 zeroed):
+`atp_expected_p` reads `P_abs[·,3,4]`, correctly counting 3→4→0 paths within one
+step, and `xb_tear_expected` reads `P_abs[·,{2,3},0]` — detachment via the
+reverse route, which spends no ATP. Trapping both exits makes them mutually
+exclusive, so one matrix exponential yields both. `xb_subpop` is threaded through
+so each XB's metrics use its own population's rates.
 
 ---
 
@@ -865,7 +877,7 @@ global scale, bit-for-bit, in every mode.
 | `multifil_jax/core/subpopulation.py` | `Subpopulation` dataclass + mask generation |
 | `multifil_jax/kernels/cooperativity.py` | `update_cooperativity()` (legacy), `count_neighbor_states_split()` (Ising) |
 | `multifil_jax/kernels/geometry.py` | `update_nearest_neighbors()` |
-| `multifil_jax/kernels/transitions.py` | `thin_transitions_ising()`, `thin_transitions()`, `thick_transitions()`, `compute_xb_transition_matrices()`, `expm_pade6_batch()` |
+| `multifil_jax/kernels/transitions.py` | `thin_transitions_ising()`, `thin_transitions()`, `thick_transitions()`, `xb_step_probabilities()`, `xb_exit_probabilities()`, `expm_pade6_batch()` |
 | `multifil_jax/kernels/forces.py` | `axial_force_at_mline()`, `compute_forces_vectorized()`, `_xb_radial_force_total()`, `_titin_radial_force_total()` |
 | `multifil_jax/kernels/solver.py` | `solve_equilibrium()` (unified fixed/dynamic LS), Thomas algorithm |
 | `multifil_jax/kernels/rate_functions.py` | Rate functions (absolute values, no multipliers) |

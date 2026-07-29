@@ -20,7 +20,7 @@ now. Taking the matrix exponential — rather than the cheaper Euler step
 P ~ I + Q*dt — matters here: it stays a valid probability matrix at any dt, and
 it correctly accounts for units that pass through an intermediate state within a
 single timestep. Metrics that count ATP consumption depend on exactly that (see
-the absorbing-state construction in _xb_P_from_Q_bins).
+the absorbing-state construction in xb_exit_probabilities).
 
 Each unit then samples its next state from its own row of P.
 
@@ -1039,111 +1039,160 @@ def _build_xb_Q_bins(
     return Q_bins, key
 
 
-def _xb_P_from_Q_bins(
-    Q_bins: jnp.ndarray,
-    key: jnp.ndarray,
-    dt: float,
-    eye_6: jnp.ndarray,
-) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Exponentiate the binned rate matrices and gather per crossbridge.
-
-    Returns three matrices per head:
-
-      Q     the rate matrix it was assigned (returned for metrics that need
-            instantaneous rates rather than step probabilities)
-      P     its transition probability matrix over dt
-      P_abs a second probability matrix computed from a MODIFIED generator with
-            row 4 zeroed, making Free_2 absorbing
-
-    WHY THE ABSORBING VARIANT EXISTS. Counting ATP consumption by comparing
-    states before and after a step undercounts: a head can pass 3 -> 4 -> 0
-    within one timestep, consuming an ATP but appearing to have gone 3 -> 0.
-    Zeroing row 4 traps any head that reaches Free_2, so P_abs[i, 3, 4] is the
-    probability of VISITING state 4 at any point during the step, not just of
-    ending there. That is the quantity the atp_expected_p metric needs.
-
-    Args:
-        Q_bins: (n_cells, 6, 6) rate matrices on the bin grid
-        key: (n_xb_total,) each head's index into the grid
-        dt: Timestep length (ms)
-        eye_6: (6, 6) identity, passed through to the exponential
-
-    Returns:
-        (Q_all, P_all, P_abs_all), each (n_xb_total, 6, 6)
-    """
-    P_bins = matrix_exponential_batch(Q_bins, dt, identity=eye_6)
-
-    # Absorbing variant: zero row 4 so a head reaching Free_2 cannot leave it
-    # within the step. See docstring — this is what makes the ATP metric count
-    # 3 -> 4 -> 0 traversals rather than missing them.
-    Q_abs_bins = Q_bins.at[:, 4, :].set(0.0)
-    P_abs_bins = matrix_exponential_batch(Q_abs_bins, dt, identity=eye_6)
-
-    return Q_bins[key], P_bins[key], P_abs_bins[key]
-
-
-def compute_xb_transition_matrices(
+def _xb_Q_resolved(
     state: 'State',
     constants: 'DynamicParams',
     topology: 'SarcTopology',
-    dt: float,
     xb_subpop=None,
-) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Per-crossbridge rate and probability matrices, via the binned grid.
+) -> Tuple[jnp.ndarray, jnp.ndarray, Optional[jnp.ndarray]]:
+    """Effective binned rate matrices, and how to gather them per head.
 
-    The single entry point used by both thick_transitions() (which samples new
-    states from P) and compute_all_metrics() (which needs Q and P_abs for ATP
-    accounting). Sharing it means those two never disagree about what the rates
-    were on a given step.
-
-    Evaluates 2 * n_xb_bins matrix exponentials instead of one per head — at a
-    4x4 lattice that is roughly a sixfold reduction in exponentials, in a step
-    that otherwise dominates the timestep cost.
+    Everything subpopulation-related lives here, and nothing else does. No
+    matrix exponentials are taken — that is deliberate, because the two callers
+    below need exponentials of DIFFERENT generators, and this is the part they
+    must share. Rates come from _build_xb_Q_bins in every branch, so the
+    sampling path and the metrics path cannot disagree about the physics of a
+    given step no matter how they diverge afterwards.
 
     Args:
         state: Current State NamedTuple
         constants: DynamicParams with physics values
         topology: SarcTopology with xb_bin_edges, xb_bin_centers, eye_6
-        dt: Timestep length (ms)
         xb_subpop: None for the standard single-population path, or a tuple
             (mode, constants_k, extra) for subpopulations. constants_k is a
             length-K list of DynamicParams (population 0 = WT). For
             mode=='mean_field', extra is a (K,) fractions vector and the K
-            binned generators are weight-summed before a single exp
-            (Q_eff = Σ f_k Q_k). For mode=='explicit', extra is a (n_xb_total,)
-            INT label array and each population is exponentiated then selected
-            per-XB by (label, bin). The gather key is shared across populations
-            (it depends on geometry/permissiveness, not rates).
+            binned generators are weight-summed into one effective generator
+            (Q_eff = Σ f_k Q_k) — averaging the GENERATORS before exponentiating
+            is the mathematically correct blend. For mode=='explicit', extra is
+            a (n_xb_total,) INT label array and the populations stay stacked so
+            each head can select its own afterwards. The gather key is shared
+            across populations (it depends on geometry/permissiveness, not
+            rates).
 
     Returns:
-        Q_all:    (n_xb_total, 6, 6) rate matrices per crossbridge
-        P_all:    (n_xb_total, 6, 6) transition probability matrices per crossbridge
-        P_abs_all:(n_xb_total, 6, 6) absorbing-state P (row 4 zeroed) for ATP metrics
+        Q_bins: (n_cells, 6, 6), or (K, n_cells, 6, 6) for mode=='explicit'
+        key:    (n_xb_total,) each head's index into the bin grid
+        labels: None, or (n_xb_total,) population index for mode=='explicit'
     """
     if xb_subpop is None:
         Q_bins, key = _build_xb_Q_bins(state, constants, topology)
-        return _xb_P_from_Q_bins(Q_bins, key, dt, topology.eye_6)
+        return Q_bins, key, None
 
     mode, constants_k, extra = xb_subpop
-    eye_6 = topology.eye_6
     built = [_build_xb_Q_bins(state, ck, topology) for ck in constants_k]
     key = built[0][1]  # shared across populations (geometry/permissiveness only)
 
     if mode == 'mean_field':
         fractions = extra  # (K,)
         Q_eff = sum(fractions[k] * built[k][0] for k in range(len(constants_k)))
-        return _xb_P_from_Q_bins(Q_eff, key, dt, eye_6)
+        return Q_eff, key, None
 
-    # explicit mixture: exponentiate each population, select per-XB by label
-    labels = extra  # (n_xb_total,) INT in [0, K)
-    Q_stack = jnp.stack([b[0] for b in built])          # (K, 2*n_bins, 6, 6)
-    K, nb2 = Q_stack.shape[0], Q_stack.shape[1]
-    P_stack = matrix_exponential_batch(
-        Q_stack.reshape(K * nb2, 6, 6), dt, identity=eye_6).reshape(K, nb2, 6, 6)
-    Q_abs = Q_stack.at[:, :, 4, :].set(0.0)
-    P_abs_stack = matrix_exponential_batch(
-        Q_abs.reshape(K * nb2, 6, 6), dt, identity=eye_6).reshape(K, nb2, 6, 6)
-    return Q_stack[labels, key], P_stack[labels, key], P_abs_stack[labels, key]
+    # explicit mixture: keep populations stacked, select per head after the exp
+    return jnp.stack([b[0] for b in built]), key, extra
+
+
+def _gather_per_xb(X: jnp.ndarray, key: jnp.ndarray,
+                   labels: Optional[jnp.ndarray]) -> jnp.ndarray:
+    """Bin-grid matrices -> per-head matrices, with or without subpopulations."""
+    return X[key] if labels is None else X[labels, key]
+
+
+def _expm_bins(Q: jnp.ndarray, dt: float, eye_6: jnp.ndarray) -> jnp.ndarray:
+    """One batched matrix exponential, shape-agnostic in the leading dims.
+
+    Accepts either (n_cells, 6, 6) or the stacked (K, n_cells, 6, 6) of an
+    explicit subpopulation run, and returns the same shape. Flattening here
+    rather than at each call site is what keeps the subpopulation modes from
+    each needing their own reshape bookkeeping.
+    """
+    shape = Q.shape
+    return matrix_exponential_batch(
+        Q.reshape(-1, 6, 6), dt, identity=eye_6).reshape(shape)
+
+
+def xb_step_probabilities(
+    state: 'State',
+    constants: 'DynamicParams',
+    topology: 'SarcTopology',
+    dt: float,
+    xb_subpop=None,
+) -> jnp.ndarray:
+    """Per-crossbridge transition probabilities over dt — what the sampler draws from.
+
+    P[i, j] is the probability that a head in state i is in state j after dt.
+    This is the ONLY thing thick_transitions needs, and taking a single
+    exponential of the plain generator is the whole job.
+
+    Evaluates 2 * n_xb_bins matrix exponentials instead of one per head — at a
+    4x4 lattice roughly a sixfold reduction, on the grid rather than per head,
+    so the cost does not grow with lattice size.
+
+    Args:
+        state: Current State NamedTuple
+        constants: DynamicParams with physics values
+        topology: SarcTopology with xb_bin_edges, xb_bin_centers, eye_6
+        dt: Timestep length (ms)
+        xb_subpop: see _xb_Q_resolved
+
+    Returns:
+        P_all: (n_xb_total, 6, 6) transition probability matrices per crossbridge
+    """
+    Q_bins, key, labels = _xb_Q_resolved(state, constants, topology, xb_subpop)
+    P_bins = _expm_bins(Q_bins, dt, topology.eye_6)
+    return _gather_per_xb(P_bins, key, labels)
+
+
+def xb_exit_probabilities(
+    state: 'State',
+    constants: 'DynamicParams',
+    topology: 'SarcTopology',
+    dt: float,
+    xb_subpop=None,
+) -> jnp.ndarray:
+    """Which way a crossbridge LEFT the cycle, not where it ended up. Metrics only.
+
+    The companion to xb_step_probabilities(): that one answers "what state is
+    this head in after dt", this one answers "did it leave, and by which route".
+
+    WHY AN ABSORBING VARIANT EXISTS. Counting detachment by comparing states
+    before and after a step undercounts: a head can pass 3 -> 4 -> 0 within one
+    timestep, consuming an ATP but appearing to have gone 3 -> 0. Zeroing a row
+    of the generator traps any head that reaches that state, so the resulting
+    matrix reports whether a state was VISITED during the step, not merely where
+    the head ended up.
+
+    BOTH EXITS ARE TRAPPED, and that is what makes one exponential enough. A
+    bound head can leave the cycle two ways, and they mean different things:
+
+        P_abs[i, 3, 4]   reached Free_2  -> detached by binding ATP
+        P_abs[i, 3, 0]   reached DRX     -> backed out via 3 -> 2 -> 1 -> 0,
+                                            NO ATP spent (see xb_rate_21, which
+                                            is the strain-gated route for a
+                                            badly-positioned head to give up)
+
+    Trapping both makes the two outcomes mutually exclusive, so a single
+    absorbing generator reports the ATP-consuming and non-ATP-consuming
+    detachment fluxes at once. These feed atp_expected_p and xb_tear_expected in
+    metrics_fn. The cost is one .at[].set() on the bin grid, not an extra
+    exponential.
+
+    Args:
+        state: Current State NamedTuple
+        constants: DynamicParams with physics values
+        topology: SarcTopology with xb_bin_edges, xb_bin_centers, eye_6
+        dt: Timestep length (ms)
+        xb_subpop: see _xb_Q_resolved
+
+    Returns:
+        P_abs_all: (n_xb_total, 6, 6) probabilities from the generator with rows
+                   4 and 0 zeroed
+    """
+    Q_bins, key, labels = _xb_Q_resolved(state, constants, topology, xb_subpop)
+    # Ellipsis indexing covers both the plain and the stacked (subpopulation)
+    # layouts, so neither mode needs its own branch here.
+    Q_abs_bins = Q_bins.at[..., 4, :].set(0.0).at[..., 0, :].set(0.0)
+    return _gather_per_xb(_expm_bins(Q_abs_bins, dt, topology.eye_6), key, labels)
 
 
 def thick_transitions(state: 'State',
@@ -1163,9 +1212,9 @@ def thick_transitions(state: 'State',
     (see thin_transitions_ising) and what lets forces.py know where to apply
     crossbridge force.
 
-    Rates come from compute_xb_transition_matrices(), which evaluates them on a
-    distance grid rather than per head; see there and in _build_xb_Q_bins for
-    how that works and what it costs in accuracy.
+    Rates come from xb_step_probabilities(), which evaluates them on a distance
+    grid rather than per head; see there and in _build_xb_Q_bins for how that
+    works and what it costs in accuracy.
 
     Heads flagged invalid by topology.xb_valid are held at permissiveness 0
     throughout, so they can never enter a bound state and never claim a site.
@@ -1179,8 +1228,8 @@ def thick_transitions(state: 'State',
         random_values: Optional pre-drawn uniforms, for deterministic testing
         xb_subpop: Optional (mode, constants_k, extra) for mixed populations;
             None runs the single-population path verbatim, at zero cost. See
-            compute_xb_transition_matrices() for the tuple contract and
-            core/subpopulation.py for how these are built.
+            _xb_Q_resolved() for the tuple contract and core/subpopulation.py
+            for how these are built.
 
     Returns:
         new_state: State with updated xb_states, xb_bound_to, and thin bound_to
@@ -1193,8 +1242,8 @@ def thick_transitions(state: 'State',
     xb_states_flat = xb_states.reshape(-1)  # (n_thick * n_crowns * n_xb_per_crown,)
     n_xb_total = xb_states_flat.shape[0]
 
-    # Compute per-XB Q/P matrices via shared helper (subpop-aware)
-    _Q_all, P_all, _P_abs = compute_xb_transition_matrices(
+    # Per-XB transition probabilities via shared helper (subpop-aware)
+    P_all = xb_step_probabilities(
         state, constants, topology, dt, xb_subpop=xb_subpop)
 
     # Sample new states (same logic as thin_transitions)

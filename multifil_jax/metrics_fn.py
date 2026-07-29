@@ -26,19 +26,34 @@ over every site on the filament; the `*_overlap` variants average only over
 sites a crossbridge could reach. Prefer the latter when comparing across
 geometries — see compute_overlap_tm_fractions() for why the difference bites.
 
-ATP consumption is reported three ways, which will not agree, and should not:
+ATP consumption is reported two ways, which will not agree exactly, and should
+not:
 
+    atp_expected_p   the expected number, from transition probabilities. Smooth,
+                     and correctly counts heads that passed through detachment
+                     and out again within one timestep. PREFER THIS.
     atp_consumed     a stochastic count of heads observed to detach this step.
-                     Unbiased but noisy, and it is what actually happened.
-    atp_expected_p   the expected number, from transition probabilities.
-                     Smooth, and correctly counts heads that passed through
-                     detachment and out again within one timestep.
-    atp_expected_q   the expected number from a rate-branching argument.
+                     Noisy, and it undercounts multi-hop traversals (measured
+                     ~5% low at dt = 1 ms against a dt = 0.1 ms reference).
 
-For rates and efficiencies prefer the expected values, whose variance is far
-lower; for event counting use the stochastic one. Disagreement between
-atp_expected_p and atp_expected_q at large dt is a signal that the timestep is
-too long for the kinetics.
+Use atp_expected_p for rates and efficiencies, atp_consumed only when you
+specifically want realised events.
+
+NOT EVERY DETACHMENT COSTS AN ATP. A strongly bound head can back down the cycle,
+3 -> 2 -> 1 -> 0, without ever reaching Free_2, and pay nothing. That route is
+strain-gated at 2 -> 1 (see xb_rate_21) — it is how a badly-positioned head gives
+up rather than completing a cycle it cannot afford. xb_tear_expected counts it.
+atp_expected_p already excludes it, so the two are disjoint and their sum is
+total detachment of strongly bound heads. Measured on the cardiac preset, tearing
+is ~0.1% of detachments isometrically but 14-19% during imposed lengthening, so
+it is negligible for isometric work and emphatically not for work loops.
+
+(A third metric, atp_expected_q, was removed in Session 108. It capped each
+head's detachment rate at its zero-load value, which silently encoded a DIFFERENT
+model — "load-accelerated detachment is mechanical, not ATP-driven" — that this
+model does not hold: xb_rate_34 is a slip bond where load accelerates the same
+ATP-consuming step. Its documented use as a timestep-adequacy check was also
+wrong; the p/q gap tracked load, not dt.)
 
 Usage:
     from multifil_jax.metrics_fn import compute_all_metrics
@@ -52,7 +67,7 @@ import jax.numpy as jnp
 from typing import Dict, TYPE_CHECKING
 
 from multifil_jax.kernels.forces import axial_force_at_mline
-from multifil_jax.kernels.transitions import compute_xb_transition_matrices
+from multifil_jax.kernels.transitions import xb_exit_probabilities
 from multifil_jax.core.state import Drivers, resolve_value, MetricsDict
 
 if TYPE_CHECKING:
@@ -279,7 +294,7 @@ def compute_all_metrics(
         xb_subpop_r = (_mode,
                        [ck.with_drivers(pCa_val, z_line, lattice_spacing) for ck in _constants_k],
                        _extra)
-    Q_all, P_all, P_abs_all = compute_xb_transition_matrices(
+    P_abs_all = xb_exit_probabilities(
         old_state, resolved_constants, topology, dt, xb_subpop=xb_subpop_r
     )
 
@@ -291,27 +306,33 @@ def compute_all_metrics(
     # The naive quantity, P[3,4], is the probability of ENDING the step in
     # Free_2, which undercounts: a head can go 3 -> 4 -> 0 within one timestep,
     # spending an ATP but ending where a before/after comparison sees no
-    # detachment at all. P_abs comes from a generator with state 4 made
+    # detachment at all. P_abs comes from a generator with states 4 and 0 made
     # absorbing, so P_abs[3,4] is the probability of VISITING Free_2 at any
     # point during the step — the quantity actually wanted. The error grows with
     # dt and with detachment rate, so it is not negligible at the fast rates of
     # skeletal myosin.
     atp_expected_p = jnp.sum(mask_state3 * P_abs_all[:, 3, 4])
 
-    # Q-matrix branching ratio method
-    k_total = Q_all[:, 3, 4]  # rate 3->4 per XB (Tight_2 -> Free_2)
-    # Independent estimate of the same quantity, from rate branching rather than
-    # from the matrix exponential. A head in Tight_2 leaves at total rate
-    # Q[3,4]; the fraction of those departures that represent genuine
-    # ATP-consuming detachment is estimated by the ratio of the unloaded
-    # detachment rate to the actual (load-accelerated) one.
+    # Expected NON-ATP detachment ("tearing"), from the same absorbing matrix.
     #
-    # k_min is r34 at zero load: the Bell factor exp(f*delta/kT) is 1 at f = 0,
-    # leaving just the pre-exponential coefficient.
-    k_min = constants.xb_r34_coeff
-    ratio = jnp.where(k_total > 1e-10, k_min / k_total, 1.0)
-    ratio = jnp.clip(ratio, 0.0, 1.0)  # clip handles XBs doing positive work (k_total < k_min possible)
-    atp_expected_q = jnp.sum(mask_state3 * k_total * dt * ratio)
+    # A strongly bound head has a second way out: back down the cycle,
+    # 3 -> 2 -> 1 -> 0, without ever reaching Free_2 and so without spending an
+    # ATP. That route is strain-gated at the 2 -> 1 step (see xb_rate_21), which
+    # is how a badly-positioned head gives up rather than completing a cycle it
+    # cannot afford. Because state 0 is absorbing in the same generator that
+    # traps state 4, P_abs[i, 0] is the probability of reaching DRX WITHOUT
+    # passing through Free_2 — mutually exclusive with the ATP route above, and
+    # free of any extra matrix exponential.
+    #
+    # Restricted to the strongly bound states 2 and 3 on purpose: a state-1
+    # (Loose) head falling off is an ordinary failed weak attachment, not a
+    # load-driven tear, and pooling them would obscure both.
+    mask_strong = ((old_xb_flat == 2) | (old_xb_flat == 3)).astype(jnp.float32)
+    xb_tear_expected = jnp.sum(
+        mask_strong * jnp.take_along_axis(
+            P_abs_all[:, :, 0], old_xb_flat[:, None].astype(jnp.int32), axis=1
+        )[:, 0]
+    )
 
     # Work per ATP
     work_per_atp = jnp.where(atp_expected_p > 0.01, work_thick / atp_expected_p, 0.0)
@@ -388,7 +409,7 @@ def compute_all_metrics(
 
         # ATP expected metrics
         'atp_expected_p': atp_expected_p,
-        'atp_expected_q': atp_expected_q,
+        'xb_tear_expected': xb_tear_expected,
         'work_per_atp': work_per_atp,
 
         # Solver diagnostics

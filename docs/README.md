@@ -361,8 +361,10 @@ changed: one filament-length correction moved `frac_tm_state_3` from 13.5 % to
   (state 0 → state 1)
 - `'atp_expected_p'` — expected ATP consumption using the P-matrix method
   (a smoother, expected-value estimate rather than stochastic count)
-- `'atp_expected_q'` — expected ATP consumption using Q-matrix branching
-  ratio method
+- `'xb_tear_expected'` — expected NON-ATP detachments: strongly bound heads that
+  back down the cycle (3→2→1→0) without reaching Free_2. Disjoint from
+  `atp_expected_p`, so the two sum to total detachment of bound heads. ~0.1% of
+  detachments isometrically, 14–19% during imposed lengthening.
 
 **Displacement statistics** — how far filament nodes are from their rest positions:
 - `'thick_displace_mean'`, `'thick_displace_max'`, `'thick_displace_min'`,
@@ -1070,7 +1072,7 @@ and "active" only during specific steps.
 | `multifil_jax/core/subpopulation.py` | `Subpopulation` — mixed motor populations |
 | `multifil_jax/kernels/cooperativity.py` | Legacy tension-span cooperativity; Ising neighbor counting |
 | `multifil_jax/kernels/geometry.py` | `update_nearest_neighbors()` — XB-to-BS distances |
-| `multifil_jax/kernels/transitions.py` | `thin_transitions_ising()`, `thin_transitions()`, `thick_transitions()`, `compute_xb_transition_matrices()` |
+| `multifil_jax/kernels/transitions.py` | `thin_transitions_ising()`, `thin_transitions()`, `thick_transitions()`, `xb_step_probabilities()`, `xb_exit_probabilities()` |
 | `multifil_jax/kernels/forces.py` | `axial_force_at_mline()`, `compute_forces_vectorized()`, `_xb_radial_force_total()`, `_titin_radial_force_total()` |
 | `multifil_jax/kernels/solver.py` | `solve_equilibrium()` (unified fixed/dynamic LS), Thomas algorithm |
 | `multifil_jax/kernels/rate_functions.py` | Crossbridge rate functions (geometry-dependent) |
