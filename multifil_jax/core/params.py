@@ -158,13 +158,30 @@ _DYNAMIC_DEFAULTS = {
     #     weak:   r=19.93 nm, theta=47.2 deg  ->  axial 13.55 nm, radial 14.61 nm
     #     strong: r=16.47 nm, theta=73.2 deg  ->  axial  4.76 nm, radial 15.77 nm
     #
-    # i.e. an ~8.8 nm axial working stroke, within the measured 5-11 nm range
-    # (Huxley & Simmons 1971 Nature 233:533; Piazzesi 2002 Biophys J 82:3118).
+    # i.e. an ~8.8 nm separation between the rest configurations. There are only
+    # TWO of them, so the whole stroke is on the weak->strong isomerization
+    # (state 1 -> 2); states 2 and 3 share the strong configuration and the
+    # 2 -> 3 transition moves nothing. See kernels/rate_functions.py.
     #
-    # A consequence worth knowing: the rest configurations are only exactly
-    # reachable at their own natural radial distance. At the default d = 14 nm the
-    # strong state's force zero sits at x ~ 8.3 nm, not 4.76 nm, and the local
-    # axial stiffness is ~1.3 pN/nm rather than g_k = 5. THIS is why single-head
+    # 8.8 nm is NOT the stroke the mechanics delivers. A rest configuration is a
+    # point in (r, theta) and is only reachable at its own natural radial
+    # distance; at a fixed lattice spacing only x can vary, so what matters is
+    # where f_axial = 0 along that line. At the default d = 14 nm:
+    #
+    #     weak   force zero at x ~ 14.15 nm   (rest config says 13.55)
+    #     strong force zero at x ~  8.30 nm   (rest config says  4.76)
+    #
+    # so the EFFECTIVE axial working stroke is ~5.85 nm, not 8.8 — both zeros
+    # move, and the weak one moves the other way, so the stroke shrinks. 5.85 nm
+    # sits comfortably in the measured 5-11 nm range (Huxley & Simmons 1971
+    # Nature 233:533; Piazzesi 2002 Biophys J 82:3118) and matches the ~6 nm
+    # usually quoted for beta-cardiac (Sung 2015 Nat Commun 6:7931; Woody 2019
+    # eLife 8:e49266). Quote 5.85, not 8.8, as this model's working stroke — and
+    # note it is lattice-spacing dependent, which is the mechanism by which
+    # lattice spacing feeds back into crossbridge kinetics.
+    #
+    # Also at d = 14 nm the local axial stiffness of the strong state is
+    # ~1.3-1.4 pN/nm rather than g_k = 5. THIS is why single-head
     # stiffness measurements (~1-3 pN/nm, Kaya & Bhatt 2020 eLife 9:e55368) must
     # be compared against the projected two-spring stiffness, never against g_k
     # directly — and it is also the mechanism by which lattice spacing feeds back
@@ -172,7 +189,9 @@ _DYNAMIC_DEFAULTS = {
     #
     # Rest positions [G]: inherited from an earlier parameterization of this model
     # and unsourced individually (the 5-significant-figure precision is spurious).
-    # What is defensible is the ~8.8 nm working stroke they jointly encode.
+    # What is defensible is the ~5.85 nm effective working stroke they jointly
+    # encode at d = 14 nm (see above) — not the 8.8 nm rest-configuration
+    # separation, which is not what the mechanics delivers.
     #
     # Stiffnesses:
     # c_k_strong [I]: Chase 2004 Ann Biomed Eng; Tanner 2007 Biophys J;

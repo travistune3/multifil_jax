@@ -32,14 +32,50 @@ THE CROSSBRIDGE CYCLE (6 states)
 --------------------------------
     0  DRX      disordered relaxed; head is free, ATP hydrolysed, ready to bind
     1  Loose    weakly bound to actin, pre-power-stroke
-    2  Tight_1  strongly bound, pre-power-stroke (phosphate released)
-    3  Tight_2  strongly bound, post-power-stroke (work has been done)
+    2  Tight_1  strongly bound, post-stroke, phosphate released
+    3  Tight_2  strongly bound, ADP-release-competent
     4  Free_2   just detached after ADP release; ATP has bound
     5  SRX      super-relaxed; head folded back against the thick filament
 
 The force-producing path is 0 -> 1 -> 2 -> 3 -> 4 -> 0, consuming one ATP per
-lap. States 1 and 4 use the weak spring configuration; 2 and 3 use the strong
-one. The transition 2 -> 3 is the working stroke.
+lap. State 1 uses the weak spring configuration and states 2 and 3 use the
+strong one; 0, 4 and 5 are detached and carry no spring at all.
+
+WHERE THE WORKING STROKE ACTUALLY IS
+------------------------------------
+On 1 -> 2. NOT on 2 -> 3, despite the Tight_1/Tight_2 naming.
+
+There are only two spring configurations in the model, weak and strong, so the
+entire rest-position change — and therefore all of the work — happens when a
+head isomerizes from Loose to Tight_1. States 2 and 3 share one rest
+configuration AND one pair of spring constants (see forces.py, where
+`is_strong = (state == 2) | (state == 3)` selects a single parameter set). The
+2 -> 3 transition therefore moves nothing, does no work, and changes no force.
+It is a purely chemical step. What separates the two states is the ~6 kT free
+energy drop that makes the stroke effectively one-way, and the fact that only
+state 3 can release ADP and detach.
+
+This is a deliberate design, not an oversight. Fibre mechanics and X-ray
+modelling both argue that ONE force-bearing conformation plus one low-force
+attached conformation is sufficient: Knupp & Squire 2020 (Biology 9:464) fit
+length-step transients, isotonic shortening and the M3 reflection with exactly
+that, and could not find parameters for variants carrying two force-producing
+attached states; Eakins 2016 (Biology 5:41) concludes from X-ray that "no more
+than two main attached structural states are necessary and sufficient", with
+the weak state contributing ~4% of tension. In that mapping state 1 is the
+low-force attached state and states 2+3 together are the single force-bearing
+one.
+
+The known omission is the second, much smaller lever swing that accompanies ADP
+release: ~16 degrees / ~1.5 nm in cardiac myosin (Doran 2023 JGP 155:e202213267
+by cryo-EM; Woody 2019 eLife 8:e49266 measures 1-1.5 nm by single molecule),
+essentially absent in fast skeletal myosin (Gollub, Cremo & Cooke 1996 Nat
+Struct Biol 3:796). Its structural role is argued to be strain sensing rather
+than force generation, and in this model it appears only as the Bell distance
+of the detachment step (xb_delta_34), not as a displacement. Note the dissenting
+view: Offer & Ranatunga 2013 (Biophys J 105:1767) require TWO tension-generating
+steps of 5.6 and 4.6 nm and reject single-step models on efficiency and on
+lengthening force-velocity.
 
 SRX is not part of that cycle — it is a reserve. Heads parked in SRX have very
 low ATPase and cannot bind at all; calcium recruits them out (xb_rate_50).
@@ -57,11 +93,35 @@ Two distinct mechanisms, easy to conflate:
   geometry, so a head positioned where the strong state is favourable
   isomerizes faster. Reverse rates follow by detailed balance.
 
+  THIS is the mechanism that carries the working stroke's load dependence, since
+  1 -> 2 is the transition that carries the stroke (above). E_diff is a genuine
+  free-energy difference, so both the forward rate AND the equilibrium constant
+  respond to strain — the textbook Eyring treatment of a strained lever swing,
+  and consistent with Caremani 2025 (Front. Physiol.), who find the working
+  stroke rate constant depends solely on load.
+
   Bell / load-dependent — used for 2->3 and 3->4. The rate depends on the FORCE
   the head is currently carrying, via exp(+/- f*delta/kT), where delta is the
-  distance to the transition state. Resisting load slows the working stroke
-  (2->3) and, for fast skeletal myosin, accelerates detachment (3->4). The
-  opposite signs are essential, not cosmetic.
+  distance to the transition state.
+
+  A CAVEAT ON delta_23. Because states 2 and 3 are mechanically identical, the
+  net displacement across 2 -> 3 is zero, so the elastic terms cancel in the
+  reverse rate and K_23 = r23/r32 is LOAD-INDEPENDENT. That is thermodynamically
+  required, not an approximation. But it also means a non-zero delta_23 describes
+  a reaction coordinate that travels out and returns to the same place: load
+  slows BOTH directions equally and never shifts the population. For a chemical
+  isomerization that is tolerable; for a lever-arm swing it has no structural
+  referent. The self-consistent choices are (a) delta_23 = 0 with 2 and 3
+  mechanically identical, or (b) give state 3 its own rest configuration, in
+  which case 0 < delta_23 < the net displacement and K_23 becomes load-dependent
+  on its own. The current pairing (identical mechanics, delta_23 = 1.0 nm) is
+  neither, and it is not inert: at the ~1.8 pN mean strong-state force it
+  suppresses r23 by ~35%, and since state 2 has no detachment exit, that acts as
+  a load-gated retention in the pre-ADP-release state — the only place in the
+  model where load slows the forward cycle.
+
+  For 3 -> 4 the sign is positive: load accelerates detachment. See xb_rate_34
+  for why that sign is contested for cardiac myosin.
 
 Reverse rates are derived from forward rates and free-energy differences rather
 than being free parameters, so the cycle cannot violate detailed balance and
@@ -301,10 +361,24 @@ def xb_rate_10(r01, U_DRX, U_loose):
 
 
 def xb_rate_12(A12, E_diff):
-    """Rate 1->2: weak-to-strong isomerization (phosphate release).
+    """Rate 1->2: weak-to-strong isomerization (phosphate release) — THE WORKING STROKE.
 
     Biologically this is Pi release converting a loosely tethered head into a
     strongly bound one. It is the step that commits a head to force production.
+
+    Mechanically it is also the ONLY transition in the model that moves the
+    spring rest configuration, so it carries the entire lever swing and does all
+    of the work. The state names suggest the stroke happens later, at 2 -> 3; it
+    does not (module docstring).
+
+    Note that lumping the stroke with Pi release side-steps an unsettled
+    question rather than answering it: whether the lever swing precedes or
+    follows Pi release is actively contested (Debold 2021 Cytoskeleton 78:2 for
+    the review; Woody 2019 finds the stroke rate unaffected by 10 mM Pi;
+    Caremani 2025 Front. Physiol. argue Pi release is "orthogonal" to the
+    progression of the stroke). Because this model has no explicit Pi state, it
+    takes no position, which is closer to the current functional consensus than
+    an explicitly sequential treatment would be.
 
     Rate law: r12 = A12 * exp(E_diff / 2), where E_diff = E_weak - E_strong is
     how much elastic energy the head sheds by switching configurations at its
@@ -365,32 +439,46 @@ def xb_rate_21(r12, U_loose, U_tight_1):
 
 
 def xb_rate_23(A23, f_strong, delta23, k_t):
-    """Rate 2->3: the working stroke (lever-arm swing).
+    """Rate 2->3: chemical transition between the two strongly-bound states.
 
-    The force-generating event. The lever arm rotates, and because the head is
-    already attached to actin, that rotation pulls the thin filament toward the
-    M-line.
+    NOT the working stroke, despite the state names. The stroke is on 1 -> 2 —
+    see the module docstring. Tight_1 and Tight_2 share one spring configuration
+    and one pair of spring constants, so this transition produces no
+    displacement, does no work, and changes no force. What it does is commit the
+    head to the ~6 kT drop that makes the stroke effectively irreversible, and
+    move it into the only state from which ADP release and detachment are
+    possible.
 
-    Bell model: r23 = A23 * exp(-f * delta_23 / kT). A load resisting the stroke
-    (f > 0) slows it; an assisting load speeds it up. Physically, external load
-    tilts the energy landscape against the transition state, and delta_23 is how
-    far along the reaction coordinate that transition state sits.
+    Bell model: r23 = A23 * exp(-f * delta_23 / kT). A load resisting the head
+    (f > 0) slows it. Physically, external load tilts the energy landscape
+    against the transition state, and delta_23 is how far along the reaction
+    coordinate that transition state sits.
 
-    Note the MINUS sign in the exponent, opposite to xb_rate_34. That contrast is
-    the model's mechanochemistry: load holds the stroke back but hurries
-    detachment along.
+    Because there is no net displacement, the same factor appears in the reverse
+    rate (xb_rate_32), so K_23 is load-independent and load never redistributes
+    heads between the pre- and post-ADP-release states. The consequence is that
+    the Huxley-Simmons load-dependent redistribution between attached states is
+    absent from THIS leg; in this model it lives on 1 -> 2, via E_diff. See the
+    module docstring's caveat on delta_23 before changing this parameter.
 
-    Unlike r12, there is no E_diff term here — Tight_1 and Tight_2 share the same
-    spring configuration, so the elastic energy is unchanged by the transition
-    and only the load term matters.
+    Unlike r12, there is no E_diff term here — the elastic energy is unchanged by
+    the transition, so only the load term matters.
 
     Args:
         A23: Zero-load rate (ms^-1) - params.xb_r23_coeff.
-             [I] Calibrated to ~70-100 s^-1 unloaded (Millar & Homsher 1990).
+             [G] The usual citation for this value (Millar & Homsher 1990,
+             ~70-100 s^-1) measured k_Pi from caged-phosphate photolysis, i.e.
+             Pi release coupled to force generation. In this model that is the
+             1 -> 2 step, not this one, so the citation does not apply here.
+             Treat as unsourced pending a value for the chemical transition
+             between the two strongly-bound states.
         f_strong: Force carried in the strong state (pN); positive = resisting
         delta23: Transition-state distance (nm) - params.xb_delta_23.
-                 [M] 1.0 nm; Pate & Cooke 1989 JMRCM 10:181; Huxley & Simmons
-                 1971 Nature 233:533 report 1-2 nm.
+                 [G] 1.0 nm. Pate & Cooke 1989 JMRCM 10:181 and Huxley & Simmons
+                 1971 Nature 233:533 (1-2 nm) describe the transition state of
+                 the LEVER SWING, which in this model is on 1 -> 2. With zero net
+                 displacement across 2 -> 3 this parameter has no structural
+                 referent — see the module docstring's caveat.
         k_t: Thermal energy kT (pN*nm)
 
     Returns:
@@ -406,18 +494,23 @@ def xb_rate_23(A23, f_strong, delta23, k_t):
 
 
 def xb_rate_32(r23, U_tight_1, U_tight_2):
-    """Rate 3->2: reverse working stroke.
+    """Rate 3->2: reverse of the Tight_1 <-> Tight_2 chemical transition.
+
+    Not a reverse working stroke — nothing moved on the forward step (see
+    xb_rate_23).
 
     Detailed balance: r32 = r23 * exp(U_tight_2 - U_tight_1). At the default free
-    energies (U_tight_1 = -15 kT, U_tight_2 = -21 kT) the 6 kT drop across the
-    stroke gives r32 ~ exp(-6) ~ 0.0025 * r23, so the stroke is effectively
-    one-way. That asymmetry is what makes the cycle productive: heads that have
-    stroked stay stroked long enough to bear load, rather than rattling back and
-    forth and averaging to zero work.
+    energies (U_tight_1 = -15 kT, U_tight_2 = -21 kT) the 6 kT drop gives
+    r32 ~ exp(-6) ~ 0.0025 * r23, so the step is effectively one-way. That
+    asymmetry is what keeps heads in the ADP-release-competent state long enough
+    to bear load and complete the cycle, rather than rattling back and forth.
 
     Both free energies include the same elastic term (Tight_1 and Tight_2 share a
-    spring configuration), so it cancels in the difference — this rate is
-    strain-independent, unlike its forward partner.
+    spring configuration), so it cancels in the difference. Two consequences:
+    this rate is strain-independent, and K_23 = r23/r32 is load-independent, so
+    load cannot shift the 2/3 population in either direction. Note that r32
+    nonetheless inherits r23's exp(-f*delta_23/kT) factor, so load slows both
+    directions equally — see the module docstring's caveat on delta_23.
 
     Args:
         r23: Forward working-stroke rate (ms^-1)
@@ -620,8 +713,16 @@ def compute_xb_energies(r, theta, g_k_weak, g_r_weak, c_k_weak, c_r_weak,
     subtraction loses most of its significant digits in float32 — and E_diff then
     goes straight into an exponential, where that error is amplified.
 
-    In state terms: the weak configuration applies to states 1 (Loose) and
-    4 (Free_2); the strong configuration to states 2 (Tight_1) and 3 (Tight_2).
+    In state terms: the weak configuration applies to state 1 (Loose) and the
+    strong configuration to states 2 (Tight_1) and 3 (Tight_2). States 0, 4 and
+    5 are detached; forces.py bears no force for them and no rate reads a free
+    energy for state 4, so no spring configuration applies to them at all.
+
+    Because states 2 and 3 share the strong configuration, ONE E_strong serves
+    both — which is why the 2 -> 3 transition is mechanically silent. If state 3
+    is ever given its own rest configuration (the ~1.5 nm ADP-linked lever swing
+    of cardiac myosin; see the module docstring), this function is where the
+    third energy would be computed.
 
     Args:
         r: Head length, sqrt(axial^2 + lattice_spacing^2) (nm) — NOT the radial
