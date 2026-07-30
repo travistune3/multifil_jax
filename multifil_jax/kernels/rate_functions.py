@@ -506,11 +506,14 @@ def xb_rate_32(r23, U_tight_1, U_tight_2):
     to bear load and complete the cycle, rather than rattling back and forth.
 
     Both free energies include the same elastic term (Tight_1 and Tight_2 share a
-    spring configuration), so it cancels in the difference. Two consequences:
-    this rate is strain-independent, and K_23 = r23/r32 is load-independent, so
-    load cannot shift the 2/3 population in either direction. Note that r32
-    nonetheless inherits r23's exp(-f*delta_23/kT) factor, so load slows both
-    directions equally — see the module docstring's caveat on delta_23.
+    spring configuration), so it cancels IN THE DIFFERENCE. What that makes
+    strain-independent is the RATIO, not this rate: K_23 = r23/r32 is fixed at
+    exp(-(U_tight_2 - U_tight_1)) everywhere, so load cannot shift the 2/3
+    population in either direction. r32 ITSELF is strongly strain-dependent,
+    because it inherits r23's exp(-f*delta_23/kT) factor — measured over
+    x in [-4, 21.5] nm it varies by ~8.5e5-fold. Load therefore slows both
+    directions of this transition equally, which is the anomaly described in the
+    module docstring's caveat on delta_23.
 
     Args:
         r23: Forward working-stroke rate (ms^-1)

@@ -168,15 +168,15 @@ _DYNAMIC_DEFAULTS = {
     # distance; at a fixed lattice spacing only x can vary, so what matters is
     # where f_axial = 0 along that line. At the default d = 14 nm:
     #
-    #     weak   force zero at x ~ 14.15 nm   (rest config says 13.55)
-    #     strong force zero at x ~  8.30 nm   (rest config says  4.76)
+    #     weak   force zero at x = 14.126 nm  (rest config says 13.55)
+    #     strong force zero at x =  8.288 nm  (rest config says  4.76)
     #
-    # so the EFFECTIVE axial working stroke is ~5.85 nm, not 8.8 — both zeros
-    # move, and the weak one moves the other way, so the stroke shrinks. 5.85 nm
+    # so the EFFECTIVE axial working stroke is 5.84 nm, not 8.8 — both zeros
+    # move, and the weak one moves the other way, so the stroke shrinks. 5.84 nm
     # sits comfortably in the measured 5-11 nm range (Huxley & Simmons 1971
     # Nature 233:533; Piazzesi 2002 Biophys J 82:3118) and matches the ~6 nm
     # usually quoted for beta-cardiac (Sung 2015 Nat Commun 6:7931; Woody 2019
-    # eLife 8:e49266). Quote 5.85, not 8.8, as this model's working stroke — and
+    # eLife 8:e49266). Quote 5.84, not 8.79, as this model's working stroke — and
     # note it is lattice-spacing dependent, which is the mechanism by which
     # lattice spacing feeds back into crossbridge kinetics.
     #
@@ -189,8 +189,8 @@ _DYNAMIC_DEFAULTS = {
     #
     # Rest positions [G]: inherited from an earlier parameterization of this model
     # and unsourced individually (the 5-significant-figure precision is spurious).
-    # What is defensible is the ~5.85 nm effective working stroke they jointly
-    # encode at d = 14 nm (see above) — not the 8.8 nm rest-configuration
+    # What is defensible is the 5.84 nm effective working stroke they jointly
+    # encode at d = 14 nm (see above) — not the 8.79 nm rest-configuration
     # separation, which is not what the mechanics delivers.
     #
     # Stiffnesses:
