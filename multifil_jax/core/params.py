@@ -87,11 +87,11 @@ _DYNAMIC_DEFAULTS = {
     # Whole-filament axial stiffness = thick_k / n_segments. Model has 52 crowns
     # → 52 segments (M-line + 51 inter-crown) over ~730 nm.
     #
-    # Brunello et al. 2014 J Physiol 593:3525 (PMC4192709, skeletal X-ray interferometry):
+    # Brunello et al. 2014 J Physiol 592:3881 (PMC4192709, skeletal X-ray interferometry):
     #     specific compliance c_M = 17.5 nm·MPa⁻¹·µm⁻¹, half-sarc thick length l_M = 0.8 µm.
     #     Per-thick cross-section area A_M = (√3/2)·d_{thick-thick}² ≈ 1754 nm² (d_{TT}≈45.9 nm).
     #     k_whole = A_M / (c_M · l_M) = 1754 / (17.5 × 0.8) = 125 pN/nm.
-    # Mijailovich et al. 2020 PMC7852458 Table 1 (cardiac MUSICO model):
+    # Mijailovich et al. 2021 PMC7852458 Table 1 (cardiac MUSICO model):
     #     AE_m = 132 nN, l_m = 0.8 µm → k_whole = AE_m / l_m = 165 pN/nm.
     # Lit consensus midpoint ≈ 145 pN/nm whole-filament.
     # Conversion to per-segment: thick_k = k_whole × n_segments = 145 × 52 ≈ 7540 → round to 7500.
@@ -108,14 +108,14 @@ _DYNAMIC_DEFAULTS = {
     # → 90 segments over ~1077 nm. The node count is NOT a constant of the model:
     # it follows from actin_half_pitch, mono_per_poly and target_zone_wiggle.
     #
-    # Brunello et al. 2014 J Physiol 593:3525:
+    # Brunello et al. 2014 J Physiol 592:3881:
     #     specific compliance c_A = 14.3 nm·MPa⁻¹·µm⁻¹, half-sarc thin length l_A = 0.975 µm.
     #     Per-thin area A_A = A_M / 2 = 877 nm² (1:2 thick:thin stoichiometry, vertebrate).
     #     k_whole = A_A / (c_A · l_A) = 877 / (14.3 × 0.975) = 63 pN/nm.
     #   (Note: do NOT use Brunello's overlap-corrected C_A = 6.9 — that removes the
     #    non-overlap segment from the load path; our uniform model spring of length l_A
     #    represents the whole filament, so use c × L without the correction.)
-    # Mijailovich et al. 2020 Table 1: AE_a = 65 nN, l_a = 1.1 µm → k_whole = 59 pN/nm.
+    # Mijailovich et al. 2021 Table 1: AE_a = 65 nN, l_a = 1.1 µm → k_whole = 59 pN/nm.
     # Lit consensus ≈ 60 pN/nm whole-filament (Brunello and Mij agree).
     # Conversion: thin_k = k_whole × n_segments = 60 × 90 = 5400 → round to 5500.
     # Thin is ~2× more compliant per length than thick (consistent with smaller cross-
@@ -182,27 +182,55 @@ _DYNAMIC_DEFAULTS = {
     #
     # Also at d = 14 nm the local axial stiffness of the strong state is
     # ~1.3-1.4 pN/nm rather than g_k = 5. THIS is why single-head
-    # stiffness measurements (~1-3 pN/nm, Kaya & Bhatt 2020 eLife 9:e55368) must
+    # stiffness measurements (~2-3 pN/nm; Woody 2019 eLife 8:e49266 report >=2.3
+    # pN/nm for beta-cardiac) must
     # be compared against the projected two-spring stiffness, never against g_k
     # directly — and it is also the mechanism by which lattice spacing feeds back
     # into crossbridge kinetics, since strain-dependent rates read this geometry.
     #
-    # Rest positions [G]: inherited from an earlier parameterization of this model
-    # and unsourced individually (the 5-significant-figure precision is spurious).
-    # What is defensible is the 5.84 nm effective working stroke they jointly
-    # encode at d = 14 nm (see above) — not the 8.79 nm rest-configuration
-    # separation, which is not what the mechanics delivers.
+    # PROVENANCE — this is the 2sXB head of Williams CD, Regnier M & Daniel TL
+    # 2010, "Axial and Radial Forces of Cross-Bridges Depend on Lattice Spacing",
+    # PLoS Comput Biol 6(12):e1001018. Its Table 1 gives, for the 2sXB model:
     #
-    # Stiffnesses:
-    # c_k_strong [I]: Chase 2004 Ann Biomed Eng; Tanner 2007 Biophys J;
-    #   Williams 2010 Biophys J. 40 pN*nm/rad is at the low end of that lineage.
-    # c_k_weak, g_k_weak [I]: Kaya & Bhatt 2020 (eLife 9:e55368) measure pre-stroke
-    #   head stiffness ~5-10x lower than post-stroke (~0.2-0.4 pN/nm vs
-    #   ~2.5-3.5 pN/nm total). How that softening partitions between the linear and
-    #   angular springs is NOT measured; both weak stiffnesses are reduced ~5x
-    #   proportionally, which is an assumption, not a result.
-    # g_k_strong [I]: ~5 pN/nm for the globular domain alone; the angular spring in
-    #   series brings the projected total into the measured range (see above).
+    #       spring                    rest      k            this module
+    #       h   converter, pre        47 deg    40 pN/rad    xb_c_rest_weak
+    #       h'  converter, post       73 deg    40 pN/rad    xb_c_rest_strong
+    #       r   linear, pre           20 nm      2 pN/nm     xb_g_rest_weak
+    #       r'  linear, post          16 nm      2 pN/nm     xb_g_rest_strong
+    #
+    # The five-figure rest values here are not spurious precision: the paper's
+    # Table 1 caption states the 2sXB rests are computed from the 4sXB geometry so
+    # that both models' heads rest in the same place, and the table rounds them.
+    # Upstream measurements behind that geometry: the 125 -> 70 deg lever rotation
+    # is Taylor et al. 1999; the light-chain-domain rest length is from Houdusse
+    # et al. 2000 (structure 1DFK); the S2 angle range is Liu et al. 2006. The
+    # lineage that reuses this head: Daniel, Trimble & Chase 1998 Biophys J
+    # 74:1611; Chase, Macpherson & Daniel 2004 Ann Biomed Eng 32:1559; Tanner,
+    # Daniel & Regnier 2007 PLoS Comput Biol 3(7):e115; Williams et al. 2013
+    # Proc R Soc B 280:20130697.
+    #
+    # STIFFNESSES
+    # c_k_strong = 40 pN*nm/rad [I]: as Williams 2010 (via Taylor 1999).
+    # c_k_weak = 8.0, g_k_weak = 0.4 [G]: a 5x softening of the weak state relative
+    #   to Williams 2010, which uses one stiffness per spring across both states
+    #   (40 pN/rad, 2 pN/nm). State-dependent softening is physically motivated —
+    #   a weakly bound, non-stereospecific head should bear less load than a
+    #   stereospecifically bound one — but the factor of 5 is a modelling choice
+    #   with no measurement behind it, and how any softening partitions between the
+    #   linear and angular springs is not measured either.
+    #   KNOWN MISMATCH: at these values the weak state carries ~28% of total
+    #   crossbridge tension. The X-ray decomposition of Eakins et al. 2016
+    #   (Biology 5:41) puts it at ~4%, while this model matches that study's state
+    #   POPULATIONS well (24%/32.5% here vs 20%/32% there). So the weak state is
+    #   roughly 7x too load-bearing, and moving toward Williams 2010's stiffer
+    #   values would worsen it. Treat both as open, and see section 5 of
+    #   .claude/lit_reviews/state_scheme_rate_function_audit.md before fitting them.
+    # g_k_strong = 5.0 pN/nm [G]: taken from the 4sXB "c" spring of the same paper
+    #   (5 pN/nm, Houdusse 2000) rather than the 2sXB r' value of 2 pN/nm. What
+    #   matters mechanically is the projected two-spring stiffness, not g_k alone
+    #   (see above): that projection is ~1.33 pN/nm at d = 14 nm, which agrees
+    #   closely with the single crossbridge stiffness of 1.3 pN/nm used by MUSICO
+    #   (Mijailovich et al. 2021 JGP 153:e202012604, after Duke 1999).
     # --------------------------------------------------------------------------
     'xb_c_rest_weak':   0.82309,   # [G] rad — pre-stroke converter angle
     'xb_c_rest_strong': 1.27758,   # [G] rad — post-stroke converter angle
@@ -264,7 +292,7 @@ _DYNAMIC_DEFAULTS = {
     # range is a modelling decision as much as a measurement.
     # ==========================================================================
     'tm_k_01': 100000.0,   # [M] M⁻¹ms⁻¹ Ca binding; Robertson 1981 (5e7–2e8 M⁻¹s⁻¹)
-    'tm_k_12': 1.0,        # [I] ms⁻¹ blocking→closed; Fraser & Bhatt 2019,
+    'tm_k_12': 1.0,        # [I] ms⁻¹ blocking→closed; Fraser & Marston 1995,
                            #     Geeves & Lehrer 1994 give 20–1000 s⁻¹ — a 50-fold
                            #     range, so 1000 s⁻¹ is a choice within it, not a fit
     'tm_k_23': 0.1,        # [I] ms⁻¹ closed→open; centre of a reported 50–200 s⁻¹
@@ -272,7 +300,18 @@ _DYNAMIC_DEFAULTS = {
                            #     Dominates relaxation kinetics — see rate_functions.tm_rate_30
 
     # Equilibrium constants. These set every reverse rate (k_reverse = k_forward / Keq).
-    'tm_Keq_01': 500000.0,     # [M] M⁻¹; skeletal TnC Kd ~2 µM; Potter & Gergely 1975
+    'tm_Keq_01': 500000.0,     # [G] M⁻¹, i.e. Kd 2 µM for the regulatory site.
+                               #     Potter & Gergely 1975 JBC 250:4628 measure the
+                               #     Ca-specific sites of isolated skeletal troponin at
+                               #     5×10⁶ M⁻¹ (Kd 0.2 µM), and the high-affinity Ca/Mg
+                               #     sites at 5×10⁸ M⁻¹ falling to 2×10⁶ M⁻¹ under Mg²⁺
+                               #     competition. This value is ~10× weaker than the
+                               #     isolated-protein figure, on the reasoning that
+                               #     regulatory-site affinity is lower in an intact thin
+                               #     filament — plausible but not sourced here, so [G].
+                               #     Note the model's Ca sensitivity is dominated by the
+                               #     SRX gate, not by this constant: a 5× change moves
+                               #     force pCa50 by ~0.02 units
     'tm_Keq_12': 130.0,        # [G] dimensionless; no source located. Strongly favours
                                #     the closed state once Ca is bound, which is
                                #     qualitatively right, but the magnitude is a choice
@@ -321,26 +360,52 @@ _DYNAMIC_DEFAULTS = {
     # detailed balance survives. Boosting only forward rates would not.
     # The one-way cycle-closing rate k_30 is deliberately left unscaled.
     #
-    # tm_J_C (coupling to Ca-open neighbours) is empirically inert here and
-    # defaults to 0, consistent with theory predicting that only one of the two
-    # couplings governs the transition (Saadat 2026).
+    # WHAT THE TWO COUPLINGS COUNT (see kernels/cooperativity.py,
+    # count_neighbor_states_split): tm_J_C counts a site's neighbours in STATE 2,
+    # which this scheme calls closed; tm_J_M counts neighbours in STATE 3 (open),
+    # whether or not a crossbridge is attached to them; n_closed counts states 0
+    # and 1 together, i.e. the two blocking states.
     #
-    # tm_J_M (coupling to crossbridge-bound neighbours) is the live knob. It has
+    # So tm_J_M is a tropomyosin-to-tropomyosin strand coupling, not a
+    # myosin-binding coupling: it operates with no crossbridges present at all
+    # (with binding disabled it still lifts the Hill coefficient from 1.01 to
+    # 1.54). Myosin-induced cooperativity does enter, but indirectly — an attached
+    # head locks its site in state 3, and that site then contributes to its
+    # neighbours' field. At pCa 4.0 roughly 47% of open sites carry a crossbridge
+    # and 53% do not, so the two contributions are of comparable size.
+    #
+    # tm_J_C is empirically inert in this model and defaults to 0. That is an
+    # observation here, not a theoretical result. Saadat et al. 2026
+    # (arXiv:2603.03866, Ising Models of Cooperativity in Muscle Contraction) do
+    # treat thin-filament activation with two parameters — one for calcium, one for
+    # motor force — but those are FIELDS rather than nearest-neighbour couplings,
+    # so they do not map onto tm_J_C/tm_J_M.
+    #
+    # tm_J_M is the live knob. It has
     # no direct measurement — it is [F], tuned so the model reproduces an
     # observed Hill coefficient, and it is NOT transferable: its meaning depends
     # on the chain's discretization, so it must be re-tuned after any change to
     # how tropomyosin neighbours are defined or how many sites a filament has.
     #
-    # HONEST STATUS OF 2.70: this value was obtained from a cardiac force-pCa
-    # calibration that is not independently confirmed. The run that produced it
-    # is known to have been affected by a parameter-plumbing issue that can
-    # silently substitute skeletal kinetics for cardiac ones, so the reported
-    # agreement with a measured cardiac Hill coefficient (~3.15) should NOT be
-    # relied upon. Both presets currently share this value. Treat 2.70 as an
-    # unverified starting point and re-fit before quoting any Hill coefficient.
+    # CALIBRATING tm_J_M. The structural handle is the correlation length of the
+    # open/closed state along the chain, which is measurable directly from a
+    # tm_states snapshot and needs no fitting loop. Measured here (chain driven
+    # alone, no crossbridges; 1 chain site ~ 4.35 actin monomers at the vertebrate
+    # site spacing):
+    #
+    #       tm_J_M   1.50   2.00   2.25   2.50   2.70   3.00
+    #       xi (mon) 2.53   4.11   5.14   6.52   7.84   9.98
+    #
+    # Saadat et al. 2026 (arXiv:2603.03866) report a correlation length of 2-7
+    # actin monomers, which brackets tm_J_M ~ 1.5-2.5. The shipped 2.70 sits just
+    # above that window; it came from a cardiac force-pCa calibration whose
+    # kinetics could not be confirmed, so it is [F] and should be re-derived rather
+    # than quoted. Both presets currently share it. Prefer the correlation-length
+    # route over tuning to a Hill coefficient — nH is dominated by the SRX gate,
+    # not by this coupling.
     # ------------------------------------------------------------------------
-    'tm_J_C': 0.0,   # [I] kT, coupling to Ca-open neighbours; empirically inert
-    'tm_J_M': 2.70,  # [F] kT, coupling to XB-bound neighbours; calibration UNVERIFIED
+    'tm_J_C': 0.0,   # [I] kT, coupling to closed (state-2) neighbours; inert here
+    'tm_J_M': 2.70,  # [F] kT, coupling to open (state-3) neighbours; see above
 
     # ==========================================================================
     # CROSSBRIDGE KINETICS
@@ -382,7 +447,7 @@ _DYNAMIC_DEFAULTS = {
     'xb_r40': 0.1,           # [G] ms⁻¹ recovery stroke. Unsourced, inherited as a
                              #     hardcoded constant from an earlier version.
                              #     Caps the maximum cycling rate
-    'xb_r04': 0.01,          # [M] ms⁻¹ reverse recovery; Mijailovich 2020
+    'xb_r04': 0.01,          # [M] ms⁻¹ reverse recovery; Mijailovich 2021
                              #     PMC7852458 (k−H = 10 s⁻¹). With r40 this gives
                              #     a hydrolysis equilibrium constant of 10
     'xb_r05': 0.007,         # [I] ms⁻¹ DRX→SRX sequestration; gives ~50% SRX at
@@ -394,34 +459,69 @@ _DYNAMIC_DEFAULTS = {
     # around the cycle is ΔG_ATP ≈ -22 to -24 kT at 37 °C — the energy available
     # from one ATP, and therefore the ceiling on the work one crossbridge can do.
     #
-    # Partitioning follows Howard 2001 (Mechanics of Motor Proteins, Fig 14.6);
-    # Pate & Cooke 1989 JMRCM 10:181; Månsson 2016 JMRCM 37:181;
-    # Offer & Ranatunga 2013 Biophys J 105:1767:
-    #   ATP binding + dissociation:  -8 to -10 kT
-    #   Hydrolysis on myosin:        ~0 to -2 kT
-    #   Weak actin binding:          -1 to -3 kT
-    #   Pi release + power stroke:   -8 to -13 kT  (ΔG loose→tight_1 = -10 to -12)
-    #   ADP release:                 -2 to -4 kT   (ΔG tight_1→tight_2 = -4 to -6)
-    # The individual values sit inside those ranges but their exact placement
-    # within them is a choice; what is constrained is the sum and the ordering.
+    # The reference set is Howard 2001, Mechanics of Motor Proteins and the
+    # Cytoskeleton (Sinauer), Table 14.2 "Actin-myosin hydrolysis cycle (rabbit
+    # skeletal muscle)", p. 235, which gives state free energies in kT at
+    # [ATP] = 2 mM, [Pi] = 2 mM, [ADP] = 20 µM:
+    #
+    #   attached   A.M.T (+8)   A.M.D.P (0)   A.M.D (-12)   A.M (-15)   A.M.T (-17)
+    #   detached   M.T (0)      M.D.P (-2)    M.D (-8)      M (-6)      M.T (-25)
+    #
+    # How this model maps onto it, and where it differs:
+    #   xb_U_DRX     -2.3  <->  M.D.P    -2    close
+    #   xb_U_loose   -4.3  <->  A.M.D.P   0    4.3 kT lower here
+    #   xb_U_tight_1 -15.0 <->  A.M.D   -12    3 kT lower here
+    #   xb_U_tight_2 -21.0 <->  (no counterpart — see below)
+    #
+    # Howard has ONE strongly-bound A.M.D state. This model splits it into
+    # tight_1 and tight_2, so xb_U_tight_2 has no direct equivalent; the 6 kT gap
+    # between them is what suppresses the reverse transition to ~0.25% of the
+    # forward rate and makes the cycle effectively one-way. It is a modelling
+    # choice, not a measured free energy.
+    # Where the sources align:
+    #   DRX -> loose     -2.0 kT here. Pate & Cooke 1989 JMRCM 10:181 put the first
+    #                    bound state "only 2 RT below that of the detached M.D.P
+    #                    state" — an exact match.
+    #   Pi release      -10.7 kT here; -12 kT in Howard; 14 RT in Pate & Cooke
+    #                    (from K34 = 1.89e-4 M^-1 at 3 mM Pi). All inside the -8 to
+    #                    -13 kT range of Månsson 2016 JMRCM 37:181 and Offer &
+    #                    Ranatunga 2013 Biophys J 105:1767.
+    #   cycle total     -23 RT in Pate & Cooke, -25 kT in Howard.
+    #
+    # KNOWN IMBALANCE: the return path (tight_2 -> free_2 -> DRX) is only ~-2.3 kT
+    # net in these base energies, against -8 to -10 kT expected for ATP binding
+    # alone. It does not corrupt the forward cycle because r34 is a Bell rate and
+    # r40 a constant — neither is set by detailed balance — but the reverse-path
+    # thermodynamics are not self-consistent, and the total around the cycle falls
+    # short of Howard's -25 kT.
     'xb_U_DRX':     -2.3,    # [I] kT — M.ATP / M.ADP.Pi, detached
     'xb_U_loose':   -4.3,    # [I] kT — AM.ADP.Pi, weakly bound
-    'xb_U_tight_1': -15.0,   # [I] kT — AM.ADP pre-stroke; Pi release ΔG ≈ -10.7 kT
-    'xb_U_tight_2': -21.0,   # [I] kT — AM.ADP post-stroke; stroke ΔG ≈ -6 kT.
-                             #     That 6 kT gap is what suppresses the reverse
-                             #     stroke to ~0.25% of the forward rate
+    'xb_U_tight_1': -15.0,   # [I] kT — AM.ADP; Pi release ΔG ≈ -10.7 kT
+    'xb_U_tight_2': -21.0,   # [G] kT — second strongly-bound substate; the 6 kT
+                             #     gap is a modelling choice, not a measurement
 
     # SRX -> DRX recruitment (see rate_functions.xb_rate_50). Thick-filament
     # activation: the Hill exponent here contributes much of the model's calcium
     # sensitivity, independently of tropomyosin.
     'xb_srx_k0':   0.007,    # [I] ms⁻¹ basal rate at zero Ca. Equal to xb_r05 by
                              #     construction, which is what puts ~50% of heads
-                             #     in SRX at rest; Mijailovich 2020 (kPS0 = 5 s⁻¹)
-    'xb_srx_kmax': 0.4,      # [M] ms⁻¹ saturating rate; Mijailovich 2020 (400 s⁻¹)
-    'xb_srx_b':    5.0,      # [M] Hill exponent; Mijailovich 2020, consistent with
-                             #     the sharp recruitment in Linari 2015 Nature 528:276
-    'xb_srx_ca50': 1e-6,     # [G] M — half-recruitment at pCa 6. A round number in
-                             #     the physiological range, not a measurement
+                             #     in SRX at rest; Mijailovich 2021 (kPS0 = 5 s⁻¹)
+    'xb_srx_kmax': 0.4,      # [M] ms⁻¹ saturating rate; Mijailovich 2021 (400 s⁻¹)
+    'xb_srx_b':    5.0,      # [G] Hill exponent. Mijailovich 2021 Table 1 uses b = 5
+                             #     and marks it "Assumed" — a shape parameter chosen
+                             #     inside a model, not a measurement, hence [G].
+                             #     Note this gate is a calcium PROXY for what is
+                             #     believed to be a mechanosensitive process: Linari
+                             #     2015 Nature 528:276 and Fusi 2016 Nat Commun 7:13281
+                             #     show thick-filament activation tracks filament
+                             #     STRESS and is independent of [Ca²⁺]. The proxy is
+                             #     more defensible for cardiac, where stress-dependent
+                             #     activation does require thin-filament activation
+                             #     (PNAS 2021 doi:10.1073/pnas.2023706118), than for
+                             #     skeletal. It carries much of the model's calcium
+                             #     sensitivity, so treat it as a fitting knob
+    'xb_srx_ca50': 1e-6,     # [G] M — half-recruitment at pCa 6, as Mijailovich 2021
+                             #     Table 1 ([Ca²⁺]50 = 1 µM, also marked "Assumed")
 
     # ==========================================================================
     # SIMULATION PARAMETERS
@@ -775,9 +875,10 @@ def get_skeletal_params() -> Tuple[StaticParams, DynamicParams]:
     Every value, with its citation and confidence tier, is in _DYNAMIC_DEFAULTS
     at module level — that dict is the authority, not this docstring. In brief,
     the crossbridge spring constants come from the Daniel-group two-spring
-    lineage (Chase 2004; Tanner 2007; Williams 2010) with the weak-state
-    softening from Kaya & Bhatt 2020; filament stiffnesses from Brunello 2014 and
-    Mijailovich 2020; free energies partitioned per Howard 2001. Two of the
+    lineage (Chase 2004; Tanner 2007; Williams 2010); the weak-state softening is
+    unsourced and measurably too stiff — see the xb_c_k_weak/xb_g_k_weak entry.
+    Filament stiffnesses from Brunello 2014
+    and Mijailovich 2021; free energies referenced to Howard 2001 Table 14.2. Two of the
     kinetic coefficients (xb_r01_coeff, xb_r40) are inherited placeholders with
     no literature source at all — see their entries before trusting them.
 
@@ -835,19 +936,19 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams]:
     without re-fitting.
 
     Overrides applied to the skeletal baseline:
-        tm_k_12  = 0.5 ms⁻¹      — Cardiac TM dynamics slower; Lehrer & Morris 1982
+        tm_k_12  = 0.5 ms⁻¹      — [G] unsourced; the Lehrer & Morris 1982 attribution does not hold (see dict)
         tm_k_01  = 80000 M⁻¹ms⁻¹ — Robertson 1981: 4–8×10⁷ M⁻¹s⁻¹
-        tm_Keq_01    = 750000 M⁻¹    — Cardiac TnC Kd ~1.3 µM; Pinto 2011 JBC 286:2007 (1–2 µM)
-        tm_k_30  = 0.04 ms⁻¹     — Cardiac Ca²⁺ off-rate ~40 s⁻¹; Davis 2007 Biophys J 92:20
+        tm_Keq_01    = 750000 M⁻¹    — Cardiac TnC Kd ~1.3 µM; Pinto 2011 JBC 286:1005 (1–2 µM)
+        tm_k_30  = 0.04 ms⁻¹     — Cardiac Ca²⁺ off-rate ~40 s⁻¹; Davis 2007 Biophys J 92:3195
         tm_coop_magnitude = 1.0   — no rate-coop boost. Cardiac Hill steepness arises
-                                    from SRX gate (Hill b=5) per Mijailovich 2020 (PMC7852458);
+                                    from SRX gate (Hill b=5) per Mijailovich 2021 (PMC7852458);
                                     rate-coop > 1 causes low-Ca cascade and flattens force-pCa.
         xb_r12_coeff = 0.175 ms⁻¹ — Process B 3–4× slower (2πb ~ 5–15 s⁻¹);
                                      Kawai et al. 1993 Circ Res 73:35
         xb_r23_coeff = 0.065 ms⁻¹ — Lever arm rate ~2× slower (cardiac beta-MHC);
-                                     Deacon et al. 2012 J Mol Biol 421:173
+                                     Deacon et al. 2012 Cell Mol Life Sci 69:2261
         xb_r34_coeff = 0.065 ms⁻¹ — Cardiac ADP release ~65 s⁻¹; Siemankowski & White 1984 JBC
-        xb_r05   = 0.2 ms⁻¹     — DRX→SRX (k−PS in Mijailovich 2020 PMC7852458 Table 1).
+        xb_r05   = 0.2 ms⁻¹     — DRX→SRX (k−PS in Mijailovich 2021 PMC7852458 Table 1).
                                    200 s⁻¹ matches Mijailovich cardiac canonical model;
                                    with kPSmax=400, k0=5, Hill b=5, gives 97.5% SRX at
                                    rest (Ca→0) and ~33% SRX at pCa 4.5 — close to Linari
@@ -868,18 +969,24 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams]:
         dynamic = dynamic.copy(tm_Keq_01=1e6)
     """
     cardiac_overrides = {
-        'tm_k_12': 0.5,           # Cardiac TM dynamics slower; Lehrer & Morris 1982
+        'tm_k_12': 0.5,           # [G] ms⁻¹ blocking→closed, half the skeletal value.
+                                  #   No cardiac-specific measurement of this transition
+                                  #   has been located; the halving encodes the general
+                                  #   expectation that cardiac thin-filament transitions
+                                  #   are slower. Geeves & Lehrer 1994 Biophys J 67:273
+                                  #   bound this class of transition at 20–1000 s⁻¹, wide
+                                  #   enough that any value inside it is a choice
         'tm_k_01': 80000.0,       # Robertson 1981: 4–8×10⁷ M⁻¹s⁻¹
-        'tm_Keq_01': 750000.0,        # Cardiac TnC Kd ~1.3 µM; Pinto 2011 JBC 286:2007
-        'tm_k_30': 0.04,          # Cardiac Ca²⁺ off-rate ~40 s⁻¹; Davis 2007 Biophys J 92:20
+        'tm_Keq_01': 750000.0,        # Cardiac TnC Kd ~1.3 µM; Pinto 2011 JBC 286:1005
+        'tm_k_30': 0.04,          # Cardiac Ca²⁺ off-rate ~40 s⁻¹; Davis 2007 Biophys J 92:3195
         'tm_coop_magnitude': 1.0,  # legacy path only; 1.0 = no boost. Values >1 seed a
                                    #   low-Ca activation cascade that flattens force-pCa
                                    #   instead of steepening it. Cardiac steepness is meant
                                    #   to come from the SRX gate plus the Ising coupling
         'xb_r12_coeff': 0.175,    # Process B 3–4× slower; Kawai et al. 1993 Circ Res 73:35
-        'xb_r23_coeff': 0.065,    # Lever arm ~2× slower; Deacon et al. 2012 J Mol Biol 421:173
+        'xb_r23_coeff': 0.065,    # Lever arm ~2× slower; Deacon et al. 2012 Cell Mol Life Sci 69:2261
         'xb_r34_coeff': 0.065,    # ADP release ~65 s⁻¹; Siemankowski & White 1984 JBC
-        'xb_r05': 0.2,            # DRX→SRX; Mijailovich 2020 (PMC7852458 Table 1) k−PS=200 s⁻¹
+        'xb_r05': 0.2,            # DRX→SRX; Mijailovich 2021 (PMC7852458 Table 1) k−PS=200 s⁻¹
         'xb_srx_k0': 0.005,       # Empirically calibrated (kPS0=5 s⁻¹)
         'titin_a': 55.0,          # N2B stiffer than N2A; Granzier & Labeit 2004 Circ Res 94:284
         'titin_b': 0.008,         # Powers 2018 cardiac-like stiffness (8 µm⁻¹)

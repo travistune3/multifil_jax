@@ -340,8 +340,8 @@ State(
 |-------|------|---------|
 | 0 | DRX | disordered relaxed, detached |
 | 1 | Loose | weakly bound |
-| 2 | Tight_1 | strongly bound, pre-power-stroke |
-| 3 | Tight_2 | strongly bound, post-power-stroke |
+| 2 | Tight_1 | strongly bound, post-stroke, phosphate released |
+| 3 | Tight_2 | strongly bound, ADP-release-competent |
 | 4 | Free_2 | just detached, post-ATP |
 | 5 | SRX | super-relaxed / parked |
 
@@ -520,7 +520,7 @@ order.
 
 Current defaults are literature-anchored, not the old pre-3.0 values:
 `thick_k=7500` (whole-filament ≈ 144 pN/nm) and `thin_k=5500` (≈ 61 pN/nm), per
-Brunello 2014 / Mijailovich 2020 — these replace the uncited 2020/1743.
+Brunello 2014 / Mijailovich 2021 — these replace the uncited 2020/1743.
 
 **Drivers fast path** — creates new DynamicParams with only the 3 driver fields updated:
 ```python

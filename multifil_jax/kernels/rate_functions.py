@@ -195,7 +195,7 @@ def tm_rate_12(k_12_base, coop_factor):
 
     Args:
         k_12_base: Rate constant (ms^-1) - params.tm_k_12.
-                   1.0 skeletal / 0.5 cardiac; Fraser & Bhatt 2019;
+                   1.0 skeletal / 0.5 cardiac; Fraser & Marston 1995;
                    Geeves & Lehrer 1994 report 20-1000 s^-1 for this class of
                    transition, a range wide enough that the choice within it is
                    effectively a modelling decision.
@@ -308,6 +308,13 @@ def xb_rate_01(permissiveness, r01_coeff, E_weak):
                       Heads far from their unstrained geometry bind
                       exponentially more slowly, which is what confines binding
                       to a narrow axial window around each head's rest position.
+
+    Since E_weak is quadratic in the head's offset, that second factor is a
+    Gaussian window centred on the weak rest position. It is the same form Pate &
+    Cooke 1989 JMRCM 10:181 use for attachment in Table 2,
+    R23(x) = 5 + 500*exp[-0.8*(x - 7.5)^2] s^-1 — a Gaussian of comparable width
+    (their elastic constant 0.56 RT/nm^2 gives exp[-0.56*(x - 7.5)^2]) centred on
+    their weakly-bound state's free-energy minimum at x = 7.5 nm.
 
     Args:
         permissiveness: 0 or 1, whether the target site is open (from TM state)
@@ -556,9 +563,40 @@ def xb_rate_34(A34, f_strong, delta34, k_t):
     Returns:
         Rate r34 (ms^-1), capped at 10000 ms^-1
 
+    THE SIGN IS CONTESTED, AND THIS MODEL'S OWN LINEAGE TAKES THE OTHER ONE.
+    Pate & Cooke 1989 JMRCM 10:181, Table 2, make ADP release a decreasing
+    function of strain — 2 s^-1 for a highly strained force-producing bridge
+    (x >= 3.7 nm) rising to 750 s^-1 once it is dragging (x < 0), a 375-fold
+    catch bond. They state the reasoning directly: "we assume that Mg2+ADP release
+    is slow for highly strained crossbridges in the A.M.D state, limiting the
+    isometric ATPase. For values of x < 0, any crossbridge which remains attached
+    produces a force which inhibits filament sliding, decreasing efficiency."
+    That is the classical Huxley g(x): hold on while doing work, let go when
+    resisting.
+
+    Two single-molecule studies measure the same sign: Sung 2015 Nat Commun 6:7931
+    (human beta-cardiac, harmonic force spectroscopy, delta = 0.8 +/- 0.1 nm,
+    k0 = 87 s^-1) find resisting load SLOWS detachment, and Wang 2024 Small
+    (beta-cardiac and slow skeletal, delta = 0.97 nm) report explicit catch-bond
+    behaviour of the ADP-bound state. Both also put delta near 0.9 nm, not 0.5.
+
+    The likely resolution is that two detachment routes are being conflated: a
+    slow, ADP-release-limited exit from the post-stroke state, which is a catch
+    bond (Sung 2015; Wang 2024; and Veigel 2005 Nat Cell Biol 7:861 for myosin-V,
+    where resisting load slows ADP release), and a fast premature detachment from
+    early force-generating states, which is a slip bond (Woody 2019; Capitanio
+    2006 PNAS 103:87; Caremani 2025). This model already has the second route as
+    the strain-gated 3->2->1->0 path, so this rate is the first one.
+
+    Because delta_34 is a sweepable field, a NEGATIVE value is exactly a catch
+    bond, and the question can be explored without editing code. Note it is not
+    separable from delta_23: with the current slip sign, setting delta_23 to zero
+    costs 77% of active force, but with a catch bond it costs only 22%. See
+    section 4 of .claude/lit_reviews/state_scheme_rate_function_audit.md.
+
     References:
-        Bell 1978 Science 200:618; Veigel 2005 Nat Cell Biol 7:861;
-        Capitanio 2006 PNAS 103:87; Prodanovic 2019 J Gen Physiol 151:1013.
+        Bell 1978 Science 200:618 (the functional form); Siemankowski & White 1984
+        JBC 259:5045 (the zero-load rates); Prodanovic 2019 J Gen Physiol 151:1013.
     """
     upper = 10000.0
     r34 = A34 * jnp.exp(f_strong * delta34 / k_t)
@@ -613,7 +651,7 @@ def xb_rate_04(r04_rate):
 
     Args:
         r04_rate: Rate constant (ms^-1) - params.xb_r04.
-                  [M] 0.01; Mijailovich 2020 PMC7852458 reports k_-H = 10 s^-1.
+                  [M] 0.01; Mijailovich 2021 PMC7852458 reports k_-H = 10 s^-1.
                   Paired with xb_r40 = 0.1 this gives an equilibrium constant of
                   10 for hydrolysis, matching the classical measurement that
                   hydrolysis on myosin is only modestly favourable.
@@ -646,13 +684,17 @@ def xb_rate_50(ca_conc, k0, kmax, b, ca50):
     Args:
         ca_conc: Calcium concentration (M)
         k0: Basal rate at zero calcium (ms^-1) - params.xb_srx_k0.
-            [I] 0.007 skeletal / 0.005 cardiac; Mijailovich 2020 PMC7852458
+            [I] 0.007 skeletal / 0.005 cardiac; Mijailovich 2021 PMC7852458
             reports kPS0 = 5 s^-1.
         kmax: Saturating rate at high calcium (ms^-1) - params.xb_srx_kmax.
-              [M] 0.4; Mijailovich 2020 kPSmax = 400 s^-1.
+              [M] 0.4; Mijailovich 2021 kPSmax = 400 s^-1.
         b: Hill exponent - params.xb_srx_b.
-           [M] 5.0; Mijailovich 2020; consistent with the sharp myosin
-           recruitment in Linari 2015 Nature 528:276.
+           [G] 5.0. Mijailovich 2021 Table 1 lists b = 5 but marks it "Assumed" —
+           a shape parameter chosen inside a model, not a measurement, so [G] not
+           [M]. This gate is a calcium proxy for what is believed to be a
+           mechanosensitive process: Linari 2015 Nature 528:276 and Fusi 2016
+           Nat Commun 7:13281 show thick-filament activation tracks filament
+           STRESS and is independent of calcium.
         ca50: Calcium for half-maximal recruitment (M) - params.xb_srx_ca50.
               [G] 1e-6 (pCa 6) is a round number in the physiological range,
               not a measured value for this transition.
@@ -680,7 +722,7 @@ def xb_rate_05(r05_rate):
     Args:
         r05_rate: Rate constant (ms^-1) - params.xb_r05.
                   [M] skeletal 0.007 (~50% SRX at rest; Stewart 2010 PNAS
-                  107:430); cardiac 0.2, matching Mijailovich 2020's
+                  107:430); cardiac 0.2, matching Mijailovich 2021's
                   k_-PS = 200 s^-1. 200 s^-1 is the literature ceiling for this
                   rate, not a floor to stay under.
 

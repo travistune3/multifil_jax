@@ -150,7 +150,7 @@ def _find_cooperative_sites_single_chain(chain_states: jnp.ndarray,
 
     # State 2 (Ca²⁺-activated, no XB) and state 3 (XB-bound) both activate neighbors.
     # State 3 units are physically held open by the XB and propagate cooperativity at
-    # least as strongly as Ca²⁺-only units (McKillop & Geeves 1993; Mijailovich 2020).
+    # least as strongly as Ca²⁺-only units (McKillop & Geeves 1993; Mijailovich 2021).
     is_activator = (chain_states == 2) | (chain_states == 3)
 
     # Cooperative if any activator site in this chain is within span
@@ -193,7 +193,7 @@ def find_cooperative_sites_with_chains(tm_states: jnp.ndarray,
 
     # State 2 (Ca²⁺-activated, no XB) and state 3 (XB-bound) both activate neighbors.
     # State 3 units are physically held open by the XB and propagate cooperativity at
-    # least as strongly as Ca²⁺-only units (McKillop & Geeves 1993; Mijailovich 2020).
+    # least as strongly as Ca²⁺-only units (McKillop & Geeves 1993; Mijailovich 2021).
     is_chain_0 = (tm_chains == 0)
     is_chain_1 = (tm_chains == 1)
     is_activator = (tm_states == 2) | (tm_states == 3)

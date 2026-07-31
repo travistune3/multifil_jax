@@ -319,8 +319,8 @@ The six crossbridge states are indexed 0–5:
 |-------|-----------|---------|
 | 0 | `'n_xb_drx'` | disordered relaxed — available but detached |
 | 1 | `'n_xb_loose'` | weakly bound to actin |
-| 2 | `'n_xb_tight_1'` | strongly bound, before the power stroke |
-| 3 | `'n_xb_tight_2'` | strongly bound, after the power stroke |
+| 2 | `'n_xb_tight_1'` | strongly bound, post-stroke, phosphate released |
+| 3 | `'n_xb_tight_2'` | strongly bound, ADP-release-competent |
 | 4 | `'n_xb_free_2'` | just detached, post-ATP |
 | 5 | `'n_xb_srx'` | super-relaxed — parked, not recruitable |
 
