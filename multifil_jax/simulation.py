@@ -52,9 +52,8 @@ Free: any DynamicParams value, the number of replicates, K_lat and nu, and the
 number of sweep points within a bucket.
 
 Not free: the topology (it defines every array shape), StaticParams solver
-settings, the duration, switching between fixed and dynamic lattice spacing, the
-cooperativity model, and the SHAPE of a subpopulation configuration — though not
-its values.
+settings, the duration, switching between fixed and dynamic lattice spacing, and
+the SHAPE of a subpopulation configuration — though not its values.
 
 Usage:
     from multifil_jax.simulation import run
@@ -513,7 +512,7 @@ def _resolve_explicit_masks(subpops, topology, total_batch, idx, fractions_b):
 
 
 def _resolve_subpopulation(subpopulation, topology, total_batch, flat_idx,
-                           is_list_axis, legacy_coop):
+                           is_list_axis):
     """Resolve a Subpopulation (single object or list) into static flags and
     per-sim batched arrays for the kernel.
 
@@ -554,12 +553,6 @@ def _resolve_subpopulation(subpopulation, topology, total_batch, flat_idx,
     subpop_has_xb = any(f.startswith('xb_') for f in scaled_field_names)
     subpop_has_tm = any(f.startswith('tm_') for f in scaled_field_names)
 
-    if (not legacy_coop) and subpop_has_tm:
-        raise NotImplementedError(
-            "TM subpopulation scales are not supported on the default Ising path "
-            "(legacy_coop=False)"
-        )
-
     # Per-variant scale/fraction tables → gather (or broadcast) per sim.
     scale_variants = jnp.stack([sp.scale_array(scaled_field_names) for sp in subpops])  # (V,K,F)
     frac_variants = jnp.stack([sp.fractions for sp in subpops])                          # (V,K)
@@ -589,7 +582,7 @@ def _resolve_subpopulation(subpopulation, topology, total_batch, flat_idx,
 # =============================================================================
 
 @partial(jax.jit, static_argnames=[
-    'dt', 'unroll', 'is_dynamic_ls', 'n_cg_steps', 'n_newton_steps', 'legacy_coop',
+    'dt', 'unroll', 'is_dynamic_ls', 'n_cg_steps', 'n_newton_steps',
     'is_subpop_active', 'is_mean_field', 'subpop_has_xb', 'subpop_has_tm',
     'scaled_field_names', 'n_pops'])
 def _run_sim_kernel(
@@ -606,7 +599,6 @@ def _run_sim_kernel(
     nu_batched: jnp.ndarray = None,
     n_cg_steps: int = 6,
     n_newton_steps: int = 16,
-    legacy_coop: bool = False,
     subpop_arrays=None,
     is_subpop_active: bool = False,
     is_mean_field: bool = False,
@@ -711,7 +703,6 @@ def _run_sim_kernel(
                 n_newton_steps=n_newton_steps,
                 precond_params=precond_params,
                 prefactored_precond=prefactored_precond,
-                legacy_coop=legacy_coop,
                 xb_subpop=xb_subpop,
                 tm_subpop=tm_subpop,
             )
@@ -776,7 +767,6 @@ def run(
     unroll: int = 1,
     minibatch_size: Optional[int] = "auto",
     verbose: bool = False,
-    legacy_coop: bool = False,
     subpopulation=None,
 ) -> SimulationResult:
     """Run a muscle simulation with the given topology.
@@ -805,6 +795,21 @@ def run(
                         Cartesian-producted with other sweep axes. Useful for batching CMA-ES
                         population evaluations: run(topo, z_line=traces, dynamic_params=[dp0..dpN])
                         gives result shape (N, n_freq, replicates, time).
+
+                        CAUTION — WHICH BASELINE THE UNSWEPT FIELDS COME FROM.
+                        None and the DICT form both build on a bare, SKELETAL
+                        DynamicParams(). They do NOT inherit the preset the
+                        topology was built with: SarcTopology.create() consumes
+                        dynamic_params for geometry and does not retain it, so
+                        run() has no way to recover a cardiac or IFM preset from
+                        the topology. Passing dynamic_params={'tm_J_M': [...]}
+                        against a cardiac topology therefore sweeps tm_J_M with
+                        SKELETAL kinetics everywhere else, silently. To sweep one
+                        field of a non-skeletal preset, use the candidate-LIST
+                        form instead:
+                            run(topo, dynamic_params=[dynamic.copy(tm_J_M=v)
+                                                      for v in values])
+                        (This has already invalidated one cardiac calibration.)
         replicates: Number of statistical replicates per sweep point
         rng_seed: Base random seed
         unroll: Scan unrolling factor
@@ -1021,7 +1026,6 @@ def run(
      scaled_field_names, n_pops, subpop_arrays) = _resolve_subpopulation(
         subpopulation, topology, total_batch, flat_idx,
         is_list_axis=isinstance(subpopulation, list),
-        legacy_coop=legacy_coop,
     )
 
     # Generate unique RNG keys
@@ -1061,7 +1065,6 @@ def run(
         is_dynamic_ls=is_dynamic_ls,
         n_cg_steps=static_params.n_cg_steps,
         n_newton_steps=static_params.n_newton_steps,
-        legacy_coop=legacy_coop,
         is_subpop_active=is_subpop_active,
         is_mean_field=is_mean_field,
         subpop_has_xb=subpop_has_xb,

@@ -318,29 +318,9 @@ _DYNAMIC_DEFAULTS = {
     'tm_Keq_23': 0.1,          # [M] dimensionless; McKillop & Geeves 1993 Biophys J
                                #     65:693 report K_T = 0.09 without Ca²⁺. <1 means
                                #     closed is favoured at rest, as it should be
-    'tm_Keq_30': 0.0,          # UNUSED — the 3→0 step is one-way, so it has no
-                               #     equilibrium constant. Retained only to keep the
-                               #     Keq naming symmetric with the rate naming
 
     # ------------------------------------------------------------------------
-    # LEGACY cooperativity — only read when run(legacy_coop=True).
-    # Tension along the thin filament sets a spatial "span" in nm, and sites
-    # within that span of an active site are boosted. Superseded by the Ising
-    # coupling below, which is the default; kept so older parameter sets remain
-    # reproducible. All four values are [G]: they are shape parameters of an
-    # empirical span function, with no independent measurement behind them.
-    # tm_coop_magnitude in particular is a sensitive knob — large values let
-    # crossbridge binding seed a self-sustaining activation cascade at resting
-    # calcium, flattening the force-pCa curve instead of steepening it. The
-    # cardiac preset sets it to 1.0 (i.e. off) for that reason.
-    # ------------------------------------------------------------------------
-    'tm_coop_magnitude': 100.0,  # [G] boost factor on forward TM rates
-    'tm_span_base':      62.0,   # [G] nm, span at zero tension
-    'tm_span_force50':   -8.0,   # [G] pN, tension at half-maximal span
-    'tm_span_steep':     1.0,    # [G] steepness of the tension response
-
-    # ------------------------------------------------------------------------
-    # SYMMETRIC ISING COOPERATIVITY — the default cooperativity path.
+    # SYMMETRIC ISING COOPERATIVITY — the tropomyosin cooperativity model.
     #
     # Tropomyosin is a continuous strand, not a set of independent switches:
     # opening one stretch mechanically strains its neighbours toward opening
@@ -360,7 +340,7 @@ _DYNAMIC_DEFAULTS = {
     # detailed balance survives. Boosting only forward rates would not.
     # The one-way cycle-closing rate k_30 is deliberately left unscaled.
     #
-    # WHAT THE TWO COUPLINGS COUNT (see kernels/cooperativity.py,
+    # WHAT THE TWO COUPLINGS COUNT (see kernels/transitions.py,
     # count_neighbor_states_split): tm_J_C counts a site's neighbours in STATE 2,
     # which this scheme calls closed; tm_J_M counts neighbours in STATE 3 (open),
     # whether or not a crossbridge is attached to them; n_closed counts states 0
@@ -375,11 +355,16 @@ _DYNAMIC_DEFAULTS = {
     # and 53% do not, so the two contributions are of comparable size.
     #
     # tm_J_C is empirically inert in this model and defaults to 0. That is an
-    # observation here, not a theoretical result. Saadat et al. 2026
-    # (arXiv:2603.03866, Ising Models of Cooperativity in Muscle Contraction) do
-    # treat thin-filament activation with two parameters — one for calcium, one for
-    # motor force — but those are FIELDS rather than nearest-neighbour couplings,
-    # so they do not map onto tm_J_C/tm_J_M.
+    # observation here, not a theoretical result — but Saadat et al. 2026
+    # (arXiv:2603.03866, Ising Models of Cooperativity in Muscle Contraction)
+    # give a reason to expect it. Their Hamiltonian is the standard
+    # H = -sum(J s_i s_{i+1} + h s_i): calcium enters as the FIELD h and motor
+    # force sets the nearest-neighbour COUPLING J (their Eq. 4, h = 1/2 log(c)
+    # and J = 1/2 log(n_H); their Fig. 3a plots J against motor force F_0). So
+    # their J is the direct analogue of tm_J_M, not of a field. Their §III result
+    # is that force-pCa data alone cannot determine more than two parameters —
+    # meaning a SECOND coupling is unidentifiable from that observable, which is
+    # exactly what tm_J_C's observed inertness looks like from inside the model.
     #
     # tm_J_M is the live knob. It has
     # no direct measurement — it is [F], tuned so the model reproduces an
@@ -387,22 +372,33 @@ _DYNAMIC_DEFAULTS = {
     # on the chain's discretization, so it must be re-tuned after any change to
     # how tropomyosin neighbours are defined or how many sites a filament has.
     #
-    # CALIBRATING tm_J_M. The structural handle is the correlation length of the
-    # open/closed state along the chain, which is measurable directly from a
-    # tm_states snapshot and needs no fitting loop. Measured here (chain driven
-    # alone, no crossbridges; 1 chain site ~ 4.35 actin monomers at the vertebrate
-    # site spacing):
+    # tm_J_M IS NOT CURRENTLY CALIBRATED. The natural structural handle is the
+    # correlation length of the open/closed state along the chain, measurable
+    # straight from a tm_states snapshot with no fitting loop. Measured here
+    # (chain driven alone, crossbridge binding DISABLED; 1 chain site ~ 4.35
+    # actin monomers at the vertebrate site spacing):
     #
     #       tm_J_M   1.50   2.00   2.25   2.50   2.70   3.00
     #       xi (mon) 2.53   4.11   5.14   6.52   7.84   9.98
     #
-    # Saadat et al. 2026 (arXiv:2603.03866) report a correlation length of 2-7
-    # actin monomers, which brackets tm_J_M ~ 1.5-2.5. The shipped 2.70 sits just
-    # above that window; it came from a cardiac force-pCa calibration whose
-    # kinetics could not be confirmed, so it is [F] and should be re-derived rather
-    # than quoted. Both presets currently share it. Prefer the correlation-length
-    # route over tuning to a Hill coefficient — nH is dominated by the SRX gate,
-    # not by this coupling.
+    # These numbers are real, but they do NOT currently anchor to a literature
+    # target, and an earlier reading of this table that put tm_J_M at 1.5-2.5 has
+    # been WITHDRAWN. Saadat et al.'s correlation length of 2-7 is in REGULATORY
+    # UNITS, not actin monomers (their §IV B: "correlation length between
+    # neighboring regulatory units"; their Eq. 9 indexes spins, and one spin is
+    # one RU = 7 monomers). That is 14-49 monomers — above, not below, the range
+    # tabulated here, so the correction reverses direction. Two further
+    # mismatches block a naive comparison even after the unit fix: their spin
+    # requires an ATTACHED MOTOR whereas the rows above were measured with
+    # binding disabled, and their discretization is 7 monomers per spin against
+    # this model's ~4.35 per site.
+    #
+    # The shipped 2.70 came from a cardiac force-pCa calibration whose kinetics
+    # could not be confirmed, so it is [F] and should be re-derived rather than
+    # quoted. Both presets currently share it. If re-deriving, prefer a
+    # correlation-length route over tuning to a Hill coefficient — nH is
+    # dominated by the SRX gate, not by this coupling — but fix the observable
+    # and the discretization first.
     # ------------------------------------------------------------------------
     'tm_J_C': 0.0,   # [I] kT, coupling to closed (state-2) neighbours; inert here
     'tm_J_M': 2.70,  # [F] kT, coupling to open (state-3) neighbours; see above
@@ -916,13 +912,8 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams]:
     parked in skeletal. Calcium then recruits them. That reserve is where much of
     cardiac contractile reserve and its steep calcium sensitivity come from, and
     it is why cardiac force-pCa curves can be steep without needing a large
-    tropomyosin cooperativity term — the cardiac preset turns the legacy
-    cooperativity boost off entirely (tm_coop_magnitude = 1.0).
-
-    A caution on that: setting tm_coop_magnitude above 1 in cardiac tends to
-    FLATTEN the force-pCa curve rather than steepen it, because crossbridge
-    binding at resting calcium seeds a self-sustaining activation cascade. The
-    steepness has to come from the SRX gate, not from rate cooperativity.
+    tropomyosin cooperativity term. Steepness here is meant to come from the SRX
+    gate, not from the tropomyosin coupling.
 
     OPERATING POINT: cardiac sarcomeres work short, 900-1100 nm z-line
     (SL 1.8-2.2 µm):
@@ -940,9 +931,6 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams]:
         tm_k_01  = 80000 M⁻¹ms⁻¹ — Robertson 1981: 4–8×10⁷ M⁻¹s⁻¹
         tm_Keq_01    = 750000 M⁻¹    — Cardiac TnC Kd ~1.3 µM; Pinto 2011 JBC 286:1005 (1–2 µM)
         tm_k_30  = 0.04 ms⁻¹     — Cardiac Ca²⁺ off-rate ~40 s⁻¹; Davis 2007 Biophys J 92:3195
-        tm_coop_magnitude = 1.0   — no rate-coop boost. Cardiac Hill steepness arises
-                                    from SRX gate (Hill b=5) per Mijailovich 2021 (PMC7852458);
-                                    rate-coop > 1 causes low-Ca cascade and flattens force-pCa.
         xb_r12_coeff = 0.175 ms⁻¹ — Process B 3–4× slower (2πb ~ 5–15 s⁻¹);
                                      Kawai et al. 1993 Circ Res 73:35
         xb_r23_coeff = 0.065 ms⁻¹ — Lever arm rate ~2× slower (cardiac beta-MHC);
@@ -979,10 +967,6 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams]:
         'tm_k_01': 80000.0,       # Robertson 1981: 4–8×10⁷ M⁻¹s⁻¹
         'tm_Keq_01': 750000.0,        # Cardiac TnC Kd ~1.3 µM; Pinto 2011 JBC 286:1005
         'tm_k_30': 0.04,          # Cardiac Ca²⁺ off-rate ~40 s⁻¹; Davis 2007 Biophys J 92:3195
-        'tm_coop_magnitude': 1.0,  # legacy path only; 1.0 = no boost. Values >1 seed a
-                                   #   low-Ca activation cascade that flattens force-pCa
-                                   #   instead of steepening it. Cardiac steepness is meant
-                                   #   to come from the SRX gate plus the Ising coupling
         'xb_r12_coeff': 0.175,    # Process B 3–4× slower; Kawai et al. 1993 Circ Res 73:35
         'xb_r23_coeff': 0.065,    # Lever arm ~2× slower; Deacon et al. 2012 Cell Mol Life Sci 69:2261
         'xb_r34_coeff': 0.065,    # ADP release ~65 s⁻¹; Siemankowski & White 1984 JBC

@@ -17,7 +17,7 @@ coupled — the sarcomeres share filaments and must be equilibrated together. Th
 requires running all the kinetics first, then one joint solve, which this
 structure permits without modification.
 
-STEP ORDER (default, Ising cooperativity)
+STEP ORDER
 
     1. resolve drivers        merge per-step pCa / z_line / lattice_spacing over
                               the constant defaults
@@ -30,10 +30,10 @@ STEP ORDER (default, Ising cooperativity)
     --- kinetics_step() returns here ---
     5. solve equilibrium      Newton-CG until net force on every node vanishes
 
-With legacy_coop=True two extra steps precede 2: the thin filament's internal
-spring tension is computed, and that tension sets each site's cooperative span.
-The default path needs neither, because Ising coupling reads neighbour states
-directly.
+Note that no step of the kinetics phase reads z_line. Ising cooperativity takes
+its neighbour information straight from tm_states, so nothing here depends on
+filament tension — which is what lets a multi-sarcomere extension run every
+sarcomere's chemistry independently before one joint solve.
 
 A NOTE ON Z-LINE CHANGES. When z_line moves between steps, the thin filament
 node positions are shifted before this function is called (see simulation.py's
@@ -47,15 +47,9 @@ import jax
 import jax.numpy as jnp
 from typing import Tuple, Optional, TYPE_CHECKING
 
-from multifil_jax.kernels.cooperativity import update_cooperativity
 from multifil_jax.kernels.geometry import update_nearest_neighbors
-from multifil_jax.kernels.transitions import (
-    thin_transitions, thick_transitions, thin_transitions_ising,
-)
+from multifil_jax.kernels.transitions import thin_transitions, thick_transitions
 from multifil_jax.kernels.solver import solve_equilibrium
-from multifil_jax.kernels.forces import (
-    calculate_thin_forces_for_cooperativity,
-)
 from multifil_jax.core.state import Drivers, resolve_value
 
 if TYPE_CHECKING:
@@ -75,7 +69,6 @@ def kinetics_step(state: 'State',
                   rng_key: jnp.ndarray,
                   *,
                   dt: float,
-                  legacy_coop: bool = False,
                   xb_subpop=None,
                   tm_subpop=None) -> Tuple['State', jnp.ndarray, 'DynamicParams']:
     """Run the stochastic half of a timestep: everything except the force solve.
@@ -118,39 +111,17 @@ def kinetics_step(state: 'State',
     xb_subpop_r = _resolve_subpop(xb_subpop)
     tm_subpop_r = _resolve_subpop(tm_subpop)
 
-    if legacy_coop:
-        # Legacy tension-span cooperativity. Deprecated, kept so parameter sets
-        # fitted under it stay reproducible.
-        #
-        # Note this is the only kinetics path that depends on z_line: the
-        # cooperative span is driven by filament tension, and tension depends on
-        # where the Z-line is. That coupling is what a multi-sarcomere extension
-        # would have to thread through, and its absence on the default path is
-        # one reason the default is preferable going forward.
-        # Step 1: Calculate INTERNAL thin filament forces for cooperativity
-        thin_internal_forces = calculate_thin_forces_for_cooperativity(state, resolved_constants, topology)
+    # Step 1: Update nearest binding sites using topology
+    state = update_nearest_neighbors(state, resolved_constants, topology)
 
-        # Step 2: Update cooperativity based on INTERNAL filament tension
-        state = update_cooperativity(state, resolved_constants, thin_internal_forces, topology)
+    # Step 2: Thin filament transitions. Neighbour states are counted inside
+    # thin_transitions from the current tm_states, so there is nothing to
+    # precompute here.
+    rng_key, thin_key = jax.random.split(rng_key)
+    state, _P_thin = thin_transitions(state, resolved_constants, topology, thin_key, dt,
+                                      tm_subpop=tm_subpop_r)
 
-        # Step 3: Update nearest binding sites using topology
-        state = update_nearest_neighbors(state, resolved_constants, topology)
-
-        # Step 4: Thin filament transitions
-        rng_key, thin_key = jax.random.split(rng_key)
-        state, _P_thin = thin_transitions(state, resolved_constants, topology, thin_key, dt,
-                                          tm_subpop=tm_subpop_r)
-    else:
-        # Default path: symmetric Ising TM cooperativity. Skip the tension-based
-        # subject_to_coop update; neighbors are computed inside
-        # thin_transitions_ising from current tm_states. Nearest binding sites
-        # are still updated; thin internal forces are unused.
-        state = update_nearest_neighbors(state, resolved_constants, topology)
-
-        rng_key, thin_key = jax.random.split(rng_key)
-        state, _P_thin = thin_transitions_ising(state, resolved_constants, topology, thin_key, dt)
-
-    # Step 5: Thick filament transitions
+    # Step 3: Thick filament transitions
     rng_key, thick_key = jax.random.split(rng_key)
     state = thick_transitions(state, resolved_constants, topology, thick_key, dt,
                               xb_subpop=xb_subpop_r)
@@ -176,7 +147,6 @@ def timestep(state: 'State',
              n_newton_steps: int = 16,
              precond_params=None,
              prefactored_precond=None,
-             legacy_coop: bool = False,
              xb_subpop=None,
              tm_subpop=None) -> Tuple['State', jnp.ndarray, jnp.ndarray, float, int]:
     """Execute one timestep of the half-sarcomere simulation.
@@ -212,7 +182,7 @@ def timestep(state: 'State',
             where the solve is struggling.
     """
     state, rng_key, resolved_constants = kinetics_step(
-        state, constants, drivers, topology, rng_key, dt=dt, legacy_coop=legacy_coop,
+        state, constants, drivers, topology, rng_key, dt=dt,
         xb_subpop=xb_subpop, tm_subpop=tm_subpop,
     )
 

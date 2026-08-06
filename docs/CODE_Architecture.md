@@ -66,7 +66,6 @@ result = run(
     unroll=1,
     minibatch_size="auto",  # "auto" | int | None
     verbose=False,
-    legacy_coop=False,   # True = old tension-span coop; default is Ising
     subpopulation=None,  # Subpopulation | list[Subpopulation]
 )
 ```
@@ -204,7 +203,7 @@ This is the vmapped+scanned simulation kernel:
 
 ```python
 @partial(jax.jit, static_argnames=[
-    'dt', 'unroll', 'is_dynamic_ls', 'n_cg_steps', 'n_newton_steps', 'legacy_coop',
+    'dt', 'unroll', 'is_dynamic_ls', 'n_cg_steps', 'n_newton_steps',
     'is_subpop_active', 'is_mean_field', 'subpop_has_xb', 'subpop_has_tm',
     'scaled_field_names', 'n_pops'])
 def _run_sim_kernel(
@@ -220,7 +219,6 @@ def _run_sim_kernel(
     nu_batched=None,      # (batch,) Poisson exponent
     n_cg_steps=6,         # static — from StaticParams
     n_newton_steps=16,    # static — from StaticParams (run() passes 4)
-    legacy_coop=False,    # static — selects legacy vs Ising TM cooperativity
     subpop_arrays=None,   # dict of (batch, ...) arrays, or None
     is_subpop_active=False, is_mean_field=False,   # static subpop flags
     subpop_has_xb=False, subpop_has_tm=False,
@@ -230,8 +228,8 @@ def _run_sim_kernel(
 
 `is_dynamic_ls` is a JIT static arg — fixed LS and dynamic LS compile to separate
 kernels. `K_lat` and `nu` are traced (not static), so different stiffness values
-share the same compiled kernel. The solver knobs, `legacy_coop`, and every
-subpopulation *shape* flag are static too: changing any of them recompiles,
+share the same compiled kernel. The solver knobs and every subpopulation *shape*
+flag are static too: changing any of them recompiles,
 while the subpopulation *scale values* and masks ride the batch axis and do not.
 
 Scan carry is `(state, rng_key, current_ls)` — the third element tracks the
@@ -257,12 +255,11 @@ Two public functions:
 ```python
 state, rng_key, resolved_constants = kinetics_step(
     state, constants, drivers, topology, rng_key, dt=dt,
-    legacy_coop=False, xb_subpop=None, tm_subpop=None,
+    xb_subpop=None, tm_subpop=None,
 )
 ```
 
-Performs driver resolution, cooperativity, nearest neighbors, and stochastic
-TM/XB transitions. Returns `resolved_constants` with driver values baked in.
+Performs driver resolution, nearest neighbors, and stochastic TM/XB transitions. Returns `resolved_constants` with driver values baked in.
 
 Separated from the mechanical solve to support future FE coupling: run kinetics
 across all coupled sarcomeres, then perform a coupled equilibration.
@@ -275,7 +272,7 @@ new_state, new_key, residual, new_ls, n_iters = timestep(
     K_lat=None, d_ref=None,
     solver_tol=None, n_cg_steps=6, n_newton_steps=16,
     precond_params=None, prefactored_precond=None,
-    legacy_coop=False, xb_subpop=None, tm_subpop=None,
+    xb_subpop=None, tm_subpop=None,
 )
 ```
 
@@ -283,26 +280,18 @@ Returns a 5-tuple. `K_lat is None` selects fixed LS mode (resolved at trace time
 no runtime branch). When `K_lat` is not None, passes `K_lat` and `d_ref` to
 `solve_equilibrium()` which handles the augmented (n+1)-DOF dynamic LS solve.
 
-**Workflow (default Ising path):**
+**Workflow:**
 
 1. **resolve_value** — merge Drivers (Tier 3) with Constants (Tier 2) via `with_drivers()`
 2. **update_nearest_neighbors** — per-XB geometry (axial/radial distance to nearest site)
-3. **thin_transitions_ising** — TM 4-state Markov transitions, 27 unique Q matrices
+3. **thin_transitions** — TM 4-state Markov transitions, 27 unique Q matrices
 4. **thick_transitions** — XB 6-state Markov transitions (binned Q → gather)
 5. **solve_equilibrium** — Newton-CG solver (unified fixed/dynamic LS)
 
 Steps 1–4 are `kinetics_step()`. Step 5 is the mechanical solve.
 
-**`legacy_coop=True`** inserts the old tension-span cooperativity ahead of step 2
-and swaps step 3 for `thin_transitions()`:
-
-1. `calculate_thin_forces_for_cooperativity` — internal thin filament spring forces
-2. `update_cooperativity` — tension-dependent cooperative span → `subject_to_coop`
-3. `update_nearest_neighbors`
-4. `thin_transitions` — 2 unique Q matrices (coop / non-coop)
-5. `thick_transitions`, 6. `solve_equilibrium`
-
-This is the only path that reads the resolved `z_line` during the kinetics phase.
+No step of the kinetics phase reads the resolved `z_line` — cooperativity is
+derived from neighbouring TM states, not from filament tension.
 It is deprecated and slated for removal.
 
 `xb_subpop`/`tm_subpop` are `(mode, constants_k, extra)` tuples or `None`;
@@ -326,7 +315,6 @@ State(
     thin = ThinState(
         axial,           # (n_thin, n_sites) site positions (nm)
         tm_states,       # (n_thin, n_sites) TM states (0-3), int8
-        subject_to_coop, # (n_thin, n_sites) bool — legacy_coop path only
         bound_to,        # (n_thin, n_sites) XB address (-1=unbound)
         # rests: moved to SarcTopology (Tier 1)
         # permissiveness: derived inline as (tm_states == 3).astype(float32)
@@ -532,13 +520,15 @@ Avoids ~46 redundant identity-copy XLA ops per timestep.
 
 ## 9. Cooperativity
 
-Two mutually exclusive TM cooperativity models, selected by `run(legacy_coop=...)`.
+One TM cooperativity model: a symmetric Ising chain. (A second, tension-dependent
+span model was removed 2026-08-05, together with its selector kwarg, its `State`
+field, its module, and four `DynamicParams` entries. Full symbol list and the
+reproducibility consequences: `.claude/legacy_coop_removal_local_projects.md`.)
 
-### Default: symmetric Ising (`legacy_coop=False`)
-
-**File:** `multifil_jax/kernels/transitions.py` — `thin_transitions_ising()`,
-`_compute_unique_tm_Q_matrices_ising()`; neighbor counting in
-`cooperativity.py::count_neighbor_states_split()`.
+**File:** `multifil_jax/kernels/transitions.py` — `thin_transitions()`,
+`_compute_unique_tm_Q_matrices()`, `count_neighbor_states_split()`. Rate laws
+themselves live in `kernels/rate_functions.py` (`tm_rate_01` … `tm_rate_30`) and
+are called by the builder, not inlined.
 
 Each site's field comes from its two **topological** same-chain neighbors
 (`topology.tm_prev_neighbor` / `tm_next_neighbor` — one up, one down its own
@@ -559,20 +549,14 @@ cascades).
 - The old `tm_span_ising_nm` window parameter was **retired** when coupling became
   topological — a literal nearest-neighbor chain is intrinsically sharper than the
   windowed version, so `tm_J_M` was re-fit downward.
+- `tm_J_M` is **not currently calibrated**: the shipped 2.70 came from an
+  unconfirmed cardiac force-pCa fit, and the correlation-length target that once
+  bracketed it at 1.5–2.5 has been withdrawn (unit and observable mismatch — see
+  the `tm_J_M` entry in `core/params.py`).
 
-### Legacy: tension-dependent span (`legacy_coop=True`)
-
-**File:** `multifil_jax/kernels/cooperativity.py`
-
-`update_cooperativity(state, constants, thin_forces, topology)` → updated `State`
-
-- Computes force on each TM site (via thin filament spring chain)
-- Force-dependent cooperative span: `span = 0.5*base*(1 + tanh(steep*(F50 + F)))`
-- Sites within span of a "coop-active" site inherit cooperative activation
-- Updates `subject_to_coop`, consumed by `thin_transitions()` (2 unique Q matrices)
-- Driven by `tm_coop_magnitude` / `tm_span_base` / `tm_span_force50` / `tm_span_steep`
-
-Deprecated and slated for removal; kept only so old fits remain reproducible.
+Cooperativity reaches the rate functions as a single `mod` multiplier: `exp(+h/2)`
+to the forward rates, `exp(-h/2)` to their reverses. `tm_rate_30` takes no `mod`
+argument, making the anti-cooperative mistake structurally unrepresentable.
 
 ---
 
@@ -599,17 +583,15 @@ Deprecated and slated for removal; kept only so old fits remain reproducible.
 
 **File:** `multifil_jax/kernels/transitions.py`
 
-### `thin_transitions_ising(state, constants, topology, rng_key, dt)` — default
+### `thin_transitions(state, constants, topology, rng_key, dt, tm_subpop=None)`
 - 4-state TM chain Markov model with symmetric Ising coupling (§9)
 - 27 unique Q matrices indexed by `(n_2, n_3, n_closed)`, each capped at 2
 - One batched `expm_pade6_batch` call, then a per-site gather by config index
-- Sites in state 3 **and** bound to an XB are locked (probability `[0,0,0,1]`)
-- Updates `tm_states` stochastically; does not read `subject_to_coop`
-
-### `thin_transitions(state, constants, topology, rng_key, dt)` — legacy
-- Same 4-state model, 2 unique Q matrices (cooperative / non-cooperative)
-- Consumes `state.thin.subject_to_coop` produced by `update_cooperativity()`
-- Reached only via `legacy_coop=True`
+- Sites in state 3 **and** bound to an XB are locked (probability `[0,0,0,1]`),
+  applied after the exponential so the 27-matrix reduction survives
+- Neighbor counts come from `count_neighbor_states_split()` in this same module
+- `tm_subpop` supports mean-field (`Q_eff = Σ f_k Q_k`, one exponential) and
+  explicit per-site label select (`(K, 27, 4, 4)` → gather)
 
 ### `thick_transitions(state, constants, topology, rng_key, dt)`
 - 6-state XB Markov model (states 0–5, see §6)
@@ -851,7 +833,6 @@ result = run(topo, pCa=4.5, subpopulation=[sp_a, sp_b, sp_c])   # sweep axis
 **Constraints (all enforced, not conventions):**
 - Scale keys must be `xb_*` or `tm_*` fields — mechanics/forces always use the WT
   base, only transition rates scale. Anything else raises.
-- `tm_*` scales require `legacy_coop=True`; the Ising path raises `NotImplementedError`.
 - A `subpopulation` list is a sweep axis, mutually exclusive with a
   `dynamic_params` candidate list. All entries must share one mode and one K; a
   swept `random` list must share one `seed` (fraction/severity may vary).
@@ -875,9 +856,8 @@ global scale, bit-for-bit, in every mode.
 | `multifil_jax/core/params.py` | `StaticParams`, `DynamicParams`/`Constants`, `_DYNAMIC_DEFAULTS`, the four species presets |
 | `multifil_jax/core/sarc_geometry.py` | `SarcTopology` — PyTree topology, `create()`, `valid_xb_targets()` |
 | `multifil_jax/core/subpopulation.py` | `Subpopulation` dataclass + mask generation |
-| `multifil_jax/kernels/cooperativity.py` | `update_cooperativity()` (legacy), `count_neighbor_states_split()` (Ising) |
 | `multifil_jax/kernels/geometry.py` | `update_nearest_neighbors()` |
-| `multifil_jax/kernels/transitions.py` | `thin_transitions_ising()`, `thin_transitions()`, `thick_transitions()`, `xb_step_probabilities()`, `xb_exit_probabilities()`, `expm_pade6_batch()` |
+| `multifil_jax/kernels/transitions.py` | `thin_transitions()`, `thick_transitions()`, `count_neighbor_states_split()`, `xb_step_probabilities()`, `xb_exit_probabilities()`, `expm_pade6_batch()` |
 | `multifil_jax/kernels/forces.py` | `axial_force_at_mline()`, `compute_forces_vectorized()`, `_xb_radial_force_total()`, `_titin_radial_force_total()` |
 | `multifil_jax/kernels/solver.py` | `solve_equilibrium()` (unified fixed/dynamic LS), Thomas algorithm |
 | `multifil_jax/kernels/rate_functions.py` | Rate functions (absolute values, no multipliers) |

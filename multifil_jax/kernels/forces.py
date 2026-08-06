@@ -39,10 +39,6 @@ dynamic lattice spacing mode, where the spacing itself is solved as an unknown.
 FORCE TYPE OVERVIEW:
 ====================
 
-INTERNAL FORCES (from filament backbone springs, NOT crossbridges):
-    - thin_filament_internal_forces() - Spring forces within thin filament backbone
-    - calculate_thin_forces_for_cooperativity() - Wrapper for cooperativity updates
-
 EXTERNAL FORCES (from crossbridge attachments):
     - crossbridge_force_single() - Force from one XB (reference implementation)
     - compute_xb_forces_vectorized() - All XB forces (vectorized, used by solver)
@@ -63,7 +59,6 @@ OUTPUT METRICS (for measurements):
 
 USAGE BY MODULE:
 ================
-    timestep.py - Uses calculate_thin_forces_for_cooperativity() for cooperativity
     solver.py - Uses compute_forces_vectorized() for Newton solver
     diagnostics - Uses axial_force_at_mline() for force measurements
     debugging - Uses calculate_crossbridge_forces_on_thin() for XB force analysis
@@ -273,99 +268,6 @@ def compute_thin_passive_forces_vectorized(
     forces = jax.vmap(compute_fn)(positions_thin, rests_thin)
 
     return forces
-
-
-# ============================================================================
-# INTERNAL THIN FILAMENT FORCES (for cooperativity)
-# ============================================================================
-
-def thin_filament_internal_forces(axial_positions: jnp.ndarray,
-                                   rest_spacings: jnp.ndarray,
-                                   k: float,
-                                   z_line: float) -> jnp.ndarray:
-    """Net axial force on each thin filament node, from the backbone springs only.
-
-    The thin filament is anchored at the Z-line and runs inward toward the
-    M-line, so the chain here is the mirror image of the thick filament's: the
-    Z-line is the fixed end, appended as the final node.
-
-    Net force on a node is the difference between the springs on either side of
-    it. Taking a running sum of these from one end gives the cumulative TENSION
-    borne at each point along the filament, which is what the legacy
-    cooperativity model reads.
-
-    Crossbridge forces are deliberately excluded — see
-    calculate_thin_forces_for_cooperativity().
-
-    Args:
-        axial_positions: (n_thin, n_sites) binding site positions (nm)
-        rest_spacings: (n_thin, n_sites) rest spacings between sites (nm)
-        k: Thin filament spring constant (pN/nm)
-        z_line: Z-line position (nm)
-
-    Returns:
-        net_forces: (n_thin, n_sites) NET force on each binding site node (pN)
-    """
-    n_thin, n_sites = axial_positions.shape
-
-    # Step 1: Append z_line to axial positions
-    z_line_col = jnp.full((n_thin, 1), z_line)
-    axial_with_zline = jnp.concatenate([axial_positions, z_line_col], axis=1)
-
-    # Step 2: Calculate distances between consecutive positions
-    dists = jnp.diff(axial_with_zline, axis=1)
-
-    # Step 3: Calculate spring forces for ALL n springs
-    spring_forces = (dists - rest_spacings) * k
-
-    # Step 4: Prepend zero (first node has no spring to M-line side)
-    padded_springs = jnp.concatenate([
-        jnp.zeros((n_thin, 1)),
-        spring_forces
-    ], axis=1)
-
-    # Step 5: Net force on each node = diff of padded spring forces
-    net_forces = jnp.diff(padded_springs, axis=1)
-
-    return net_forces
-
-
-def calculate_thin_forces_for_cooperativity(
-    state: 'State',
-    constants: 'DynamicParams',
-    topology: 'SarcTopology',
-) -> jnp.ndarray:
-    """Internal thin filament tension, for the legacy cooperativity model.
-
-    Used only on the legacy cooperativity path (run(legacy_coop=True)), where
-    the cooperative span depends on how much tension the filament is carrying.
-    The default Ising path does not call this at all.
-
-    THESE ARE BACKBONE SPRING FORCES ONLY, NOT CROSSBRIDGE FORCES, and the
-    distinction is load-bearing rather than pedantic. The quantity the model
-    wants is the strain transmitted ALONG the actin filament, which is what
-    physically deforms tropomyosin and biases neighbouring sites. Passing
-    crossbridge forces here instead would be measuring the wrong thing: those
-    are the loads applied TO the filament, not the tension carried within it.
-
-    Args:
-        state: State NamedTuple containing thin.axial: (n_thin, n_sites) positions
-        constants: DynamicParams with thin_k and z_line
-        topology: SarcTopology with binding_rests (n_thin, n_sites)
-
-    Returns:
-        forces: (n_thin, n_sites) internal spring forces on each binding site (pN)
-
-    See Also:
-        - thin_filament_internal_forces() - The underlying calculation
-        - calculate_crossbridge_forces_on_thin() - EXTERNAL forces (different purpose)
-    """
-    return thin_filament_internal_forces(
-        state.thin.axial,
-        topology.binding_rests,
-        constants.thin_k,
-        constants.z_line
-    )
 
 
 # ============================================================================

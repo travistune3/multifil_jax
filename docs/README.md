@@ -22,7 +22,7 @@ minimal.
 10. [Batch Bucketing: Why JIT Cares About Array Sizes](#10-batch-bucketing-why-jit-cares-about-array-sizes)
 11. [What Can Be Swept (vmapped) and What Cannot](#11-what-can-be-swept-vmapped-and-what-cannot)
 12. [What Happens Inside Each Timestep](#12-what-happens-inside-each-timestep)
-13. [Tropomyosin Cooperativity: Two Models](#13-tropomyosin-cooperativity-two-models)
+13. [Tropomyosin Cooperativity](#13-tropomyosin-cooperativity)
 14. [Subpopulations: Mixed Motor Populations](#14-subpopulations-mixed-motor-populations)
 15. [Dynamic Lattice Spacing](#15-dynamic-lattice-spacing)
 16. [The Tiered Architecture: State, Topology, Constants, Drivers](#16-the-tiered-architecture-state-topology-constants-drivers)
@@ -707,9 +707,6 @@ because `is_dynamic_ls` is a JIT static argument. However, different `K_lat`
 values within dynamic LS mode share the same compiled kernel (K_lat is traced,
 not static).
 
-Switching the **cooperativity model** (`legacy_coop`) recompiles, since the two
-models run structurally different kinetics code.
-
 For **subpopulations**, the split is more subtle. The *shape* of the
 configuration — how many populations, which fields they scale, whether it is
 mean-field or mask-based — is static and recompiles. The *values* (scale factors,
@@ -752,7 +749,7 @@ the crown base. And binding sites that have crossed past the M-line (position
 ≤ 0) are masked out entirely rather than clamped, so crossbridges near the M-line
 cannot bind behind it.
 
-**Step 2: Thin filament (tropomyosin) transitions.** `thin_transitions_ising()`
+**Step 2: Thin filament (tropomyosin) transitions.** `thin_transitions()`
 (`multifil_jax/kernels/transitions.py`) applies a four-state stochastic Markov
 model to the tropomyosin chain on each thin filament. The four states represent
 different positions of the tropomyosin strand relative to actin, ranging from
@@ -801,11 +798,10 @@ state and `resolved_constants`. This separation exists to support future
 finite-element coupling: run kinetics across all coupled sarcomeres independently,
 then perform a coupled mechanical equilibration.
 
-With `legacy_coop=True` the kinetics phase gains two extra steps ahead of Step 1
-— computing internal thin filament spring tension via
-`calculate_thin_forces_for_cooperativity()`, then `update_cooperativity()` to set
-each site's tension-dependent cooperative span — and Step 2 uses
-`thin_transitions()` instead. See section 13.
+Note that no step of the kinetics phase reads the z-line position. Cooperativity
+is derived from neighbouring tropomyosin states directly, so nothing here depends
+on filament tension — which is what makes the independent-kinetics-then-joint-solve
+split above possible.
 
 After all steps complete, the new state, solver residual, emergent lattice
 spacing, and iteration count are returned. The scan loop in `run_single_sim`
@@ -816,7 +812,7 @@ accumulated as arrays across time and returned as `result.metrics`.
 
 ---
 
-## 13. Tropomyosin Cooperativity: Two Models
+## 13. Tropomyosin Cooperativity
 
 Calcium alone does not explain how steeply muscle force rises with calcium
 concentration. Real muscle has a Hill coefficient around 3, meaning force turns
@@ -824,10 +820,9 @@ on far more sharply than independent calcium binding would predict. Something
 couples neighboring regions of the thin filament together: when one stretch of
 tropomyosin swings open, its neighbors become more likely to follow.
 
-The codebase implements two models of that coupling, selected by the
-`legacy_coop` argument to `run()`.
-
-### The default: a symmetric Ising chain
+The model of that coupling is a **symmetric Ising chain**, and it is the only one.
+(An older tension-dependent-span model was removed in August 2026; results fitted
+under it at a cooperativity magnitude other than 1.0 are not reproducible.)
 
 Each tropomyosin site looks at its two neighbors **along its own tropomyosin
 strand** — one up, one down. Those neighbors are precomputed structurally, stored
@@ -864,22 +859,18 @@ force–pCa curve to a measured Hill coefficient — and it must be recalibrated
 after any change to the chain's structure, since a chain that couples only to
 immediate neighbors behaves differently from one coupling over a fixed distance.
 
-### The legacy model: tension-dependent span
+### Where the rate laws live
 
-The older model (`run(..., legacy_coop=True)`) works differently: it computes the
-mechanical tension along each thin filament, converts that into a cooperative
-*span* in nanometers, and marks every site within that span of an active site as
-cooperatively activated. Higher tension gives a longer span. The relevant
-parameters are `tm_coop_magnitude`, `tm_span_base`, `tm_span_force50`, and
-`tm_span_steep`.
+The seven tropomyosin rates are defined once, in
+`multifil_jax/kernels/rate_functions.py` (`tm_rate_01` … `tm_rate_30`), and the
+generator builder calls them — exactly as `xb_rate_matrix` calls the twelve
+`xb_rate_*` functions. Editing a function body there changes the rate law the
+simulation actually runs.
 
-This path is deprecated. It is kept so that older fitted parameter sets remain
-reproducible, and it is the only code path that reads the z-line position during
-the kinetics phase — a detail that matters for future multi-sarcomere coupling.
-New work should use the default.
-
-The two models are not interchangeable: a parameter set fitted under one will not
-reproduce the same force–calcium curve under the other.
+Cooperativity reaches those functions through a single `mod` argument: the builder
+passes `exp(+h/2)` to the forward rates and `exp(−h/2)` to their reverses.
+`tm_rate_30` has no `mod` argument at all, which is how the model makes "boost the
+one-way cycle-closing step" unrepresentable rather than merely discouraged.
 
 ---
 
@@ -926,8 +917,6 @@ modes.
 - Scale factors must name `xb_*` or `tm_*` fields. Mechanical parameters always
   use the wild-type value; only transition rates can differ between populations.
   A population with different spring stiffness is not supported.
-- `tm_*` scaling requires `legacy_coop=True`; it is not implemented on the
-  default Ising path.
 - Passing a *list* of subpopulations makes them a sweep axis. All entries must
   share the same mode and the same number of populations, and swept `random`
   entries must share one seed (fractions and severities may vary freely).
@@ -1070,9 +1059,8 @@ and "active" only during specific steps.
 | `multifil_jax/core/params.py` | `StaticParams`, `DynamicParams`, and the four species presets |
 | `multifil_jax/core/sarc_geometry.py` | `SarcTopology.create()` — topology builder; `valid_xb_targets()` |
 | `multifil_jax/core/subpopulation.py` | `Subpopulation` — mixed motor populations |
-| `multifil_jax/kernels/cooperativity.py` | Legacy tension-span cooperativity; Ising neighbor counting |
 | `multifil_jax/kernels/geometry.py` | `update_nearest_neighbors()` — XB-to-BS distances |
-| `multifil_jax/kernels/transitions.py` | `thin_transitions_ising()`, `thin_transitions()`, `thick_transitions()`, `xb_step_probabilities()`, `xb_exit_probabilities()` |
+| `multifil_jax/kernels/transitions.py` | `thin_transitions()`, `thick_transitions()`, `count_neighbor_states_split()`, `xb_step_probabilities()`, `xb_exit_probabilities()` |
 | `multifil_jax/kernels/forces.py` | `axial_force_at_mline()`, `compute_forces_vectorized()`, `_xb_radial_force_total()`, `_titin_radial_force_total()` |
 | `multifil_jax/kernels/solver.py` | `solve_equilibrium()` (unified fixed/dynamic LS), Thomas algorithm |
 | `multifil_jax/kernels/rate_functions.py` | Crossbridge rate functions (geometry-dependent) |

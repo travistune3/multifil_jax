@@ -24,9 +24,13 @@ enters as a genuine rate rather than a switch. Only state 3 permits binding.
 
 The cycle closes 3 -> 0 rather than running backwards through 1: calcium
 dissociates from the open state directly. A site with a crossbridge attached is
-locked in state 3 (both 3->2 and 3->0 are gated off) — the bound head physically
-holds tropomyosin out of the way, which is the structural basis for crossbridge
-binding being self-reinforcing.
+locked in state 3 — the bound head physically holds tropomyosin out of the way,
+which is the structural basis for crossbridge binding being self-reinforcing.
+That lock is NOT expressed in the rates below: whether a site is locked changes
+every timestep while the rate matrices do not, so it is applied afterwards as a
+[0, 0, 0, 1] override on the locked site's probability vector (see
+transitions.thin_transitions). Gating 3->2 and 3->0 in the rates would give the
+same result, at the cost of the 27-matrix reduction.
 
 THE CROSSBRIDGE CYCLE (6 states)
 --------------------------------
@@ -130,10 +134,23 @@ one-way: they are the irreversible, ATP-consuming part of the cycle.
 
 CUSTOMIZING
 -----------
-Each function takes explicit scalar arguments rather than a parameter object, so
-dependencies are visible in the signature. To change a rate law, either sweep
-the DynamicParams values these read, or write a replacement with the same
-signature.
+Every rate the simulation uses is defined here and nowhere else. The two
+generator builders in transitions.py — _compute_unique_tm_Q_matrices and
+xb_rate_matrix — call these functions and do nothing but assemble the results
+into a matrix, so editing a function body here changes the rate law the
+simulation actually runs. Each takes explicit scalar arguments rather than a
+parameter object, so dependencies are visible in the signature.
+
+Both TM and crossbridge builders evaluate these on a small set of DISTINCT
+configurations rather than once per unit (27 neighbour compositions;
+n_xb_bins x 2 geometries), so the arguments arrive as arrays and every function
+here must stay elementwise.
+
+The TM functions take a ``mod`` multiplier, which is where cooperativity enters:
+the Ising coupling passes exp(+h/2) to the forward rates and exp(-h/2) to their
+reverses, so the equilibrium constant shifts by exactly exp(h). Any rate law that
+should respond to a site's neighbours reads it; a rate that should not — k_30 —
+simply has no such argument.
 
 Naming: ``tm_rate_XY`` / ``xb_rate_XY`` is the rate for state X -> state Y, with
 state indices as listed above.
@@ -145,7 +162,7 @@ import jax.numpy as jnp
 # TROPOMYOSIN RATE FUNCTIONS
 # =============================================================================
 
-def tm_rate_01(ca_conc, k_01_base, coop_factor):
+def tm_rate_01(ca_conc, k_01_base, mod):
     """Rate 0->1: calcium binds troponin C.
 
     The only step in the whole model that reads calcium concentration directly.
@@ -159,15 +176,15 @@ def tm_rate_01(ca_conc, k_01_base, coop_factor):
     Args:
         ca_conc: Calcium concentration (M), i.e. 10**(-pCa)
         k_01_base: Second-order rate constant (M^-1 ms^-1) - params.tm_k_01
-        coop_factor: Cooperativity multiplier (1.0 when not cooperative)
+        mod: Cooperativity multiplier, exp(+h/2) on the Ising path (1.0 = none)
 
     Returns:
         Rate k_01 (ms^-1)
     """
-    return k_01_base * ca_conc * coop_factor
+    return k_01_base * ca_conc * mod
 
 
-def tm_rate_10(k_01_base, Keq_01):
+def tm_rate_10(k_01_base, Keq_01, mod=1.0):
     """Rate 1->0: calcium dissociates from troponin C.
 
     Fixed by detailed balance rather than being an independent parameter:
@@ -179,14 +196,17 @@ def tm_rate_10(k_01_base, Keq_01):
     Args:
         k_01_base: Second-order forward rate constant (M^-1 ms^-1)
         Keq_01: Association equilibrium constant (M^-1)
+        mod: Cooperativity multiplier, exp(-h/2) on the Ising path (1.0 = none).
+            The reverse of what tm_rate_01 receives, so the pair shifts Keq_01
+            by exactly exp(h) and detailed balance survives.
 
     Returns:
         Rate k_10 (ms^-1)
     """
-    return k_01_base / Keq_01
+    return (k_01_base / Keq_01) * mod
 
 
-def tm_rate_12(k_12_base, coop_factor):
+def tm_rate_12(k_12_base, mod):
     """Rate 1->2: tropomyosin shifts from blocking to closed.
 
     The mechanical consequence of calcium binding: troponin's grip on
@@ -199,15 +219,15 @@ def tm_rate_12(k_12_base, coop_factor):
                    Geeves & Lehrer 1994 report 20-1000 s^-1 for this class of
                    transition, a range wide enough that the choice within it is
                    effectively a modelling decision.
-        coop_factor: Cooperativity multiplier
+        mod: Cooperativity multiplier, exp(+h/2) on the Ising path (1.0 = none)
 
     Returns:
         Rate k_12 (ms^-1)
     """
-    return k_12_base * coop_factor
+    return k_12_base * mod
 
 
-def tm_rate_21(k_12_base, Keq_12):
+def tm_rate_21(k_12_base, Keq_12, mod=1.0):
     """Rate 2->1: tropomyosin rolls back to the blocking position.
 
     Detailed balance: k_21 = k_12_base / Keq_12.
@@ -215,14 +235,15 @@ def tm_rate_21(k_12_base, Keq_12):
     Args:
         k_12_base: Forward rate constant (ms^-1)
         Keq_12: Equilibrium constant (dimensionless)
+        mod: Cooperativity multiplier, exp(-h/2) on the Ising path (1.0 = none)
 
     Returns:
         Rate k_21 (ms^-1)
     """
-    return k_12_base / Keq_12
+    return (k_12_base / Keq_12) * mod
 
 
-def tm_rate_23(k_23_base, coop_factor):
+def tm_rate_23(k_23_base, mod):
     """Rate 2->3: tropomyosin opens, exposing the binding site.
 
     The step that actually gates myosin. Sites in state 3 are the only ones a
@@ -230,38 +251,37 @@ def tm_rate_23(k_23_base, coop_factor):
 
     Args:
         k_23_base: Rate constant (ms^-1) - params.tm_k_23
-        coop_factor: Cooperativity multiplier
+        mod: Cooperativity multiplier, exp(+h/2) on the Ising path (1.0 = none)
 
     Returns:
         Rate k_23 (ms^-1)
     """
-    return k_23_base * coop_factor
+    return k_23_base * mod
 
 
-def tm_rate_32(k_23_base, Keq_23, can_leave):
+def tm_rate_32(k_23_base, Keq_23, mod=1.0):
     """Rate 3->2: tropomyosin closes again.
 
-    Detailed balance, times a gate. ``can_leave`` is 0 when a crossbridge is
-    attached at this site: an attached head physically obstructs tropomyosin's
-    return, so the site cannot close underneath it. This is a hard lock, not a
-    slowdown, and it is one of the two ways binding reinforces itself (the other
-    being cooperative coupling to neighbours).
+    Detailed balance against tm_rate_23. Note Keq_23 < 1 at rest, so the closed
+    state is favoured in the absence of calcium — the open state is the
+    excursion, not the resting condition.
 
-    Note Keq_23 < 1 at rest, so the closed state is favoured in the absence of
-    calcium — the open state is the excursion, not the resting condition.
+    There is no crossbridge gate here. A site with a head attached cannot close
+    underneath it, but that lock is applied downstream as a probability-vector
+    override rather than as a factor on this rate; see the module docstring.
 
     Args:
         k_23_base: Forward rate constant (ms^-1)
         Keq_23: Equilibrium constant (dimensionless)
-        can_leave: 1.0 if the site is free, 0.0 if a crossbridge is bound
+        mod: Cooperativity multiplier, exp(-h/2) on the Ising path (1.0 = none)
 
     Returns:
         Rate k_32 (ms^-1)
     """
-    return (k_23_base / Keq_23) * can_leave
+    return (k_23_base / Keq_23) * mod
 
 
-def tm_rate_30(k_30_base, can_leave):
+def tm_rate_30(k_30_base):
     """Rate 3->0: calcium dissociates directly from the open state.
 
     This is what closes the tropomyosin cycle. Rather than retracing 3->2->1->0,
@@ -275,19 +295,20 @@ def tm_rate_30(k_30_base, can_leave):
         detailed balance. That is deliberate, but it means cooperativity must
         NOT be applied here: boosting the cycle-closing step along with the
         forward steps produces runaway anti-cooperative behaviour rather than
-        sharper activation. The Ising path leaves this rate at its base value
-        for exactly that reason.
-      - ``can_leave`` gates it to 0 while a crossbridge is attached, same as
-        tm_rate_32: a bound head prevents the site from deactivating.
+        sharper activation. Hence the missing ``mod`` argument — alone among the
+        TM rates, this one cannot be modulated, which makes the mistake
+        unrepresentable rather than merely warned against.
+      - A bound crossbridge prevents the site from deactivating through this
+        step, but that lock lives in the probability-vector override downstream,
+        not here; see the module docstring.
 
     Args:
         k_30_base: Rate constant (ms^-1) - params.tm_k_30
-        can_leave: 1.0 if the site is free, 0.0 if a crossbridge is bound
 
     Returns:
         Rate k_30 (ms^-1)
     """
-    return k_30_base * can_leave
+    return k_30_base
 
 
 # =============================================================================

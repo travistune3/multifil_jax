@@ -91,7 +91,6 @@ class ThinState(NamedTuple):
     """
     axial: jnp.ndarray           # (n_thin, n_sites) binding site axial positions
     tm_states: jnp.ndarray       # (n_thin, n_sites) tropomyosin states (0-3), int8
-    subject_to_coop: jnp.ndarray # (n_thin, n_sites) cooperative status (bool)
     bound_to: jnp.ndarray        # (n_thin, n_sites) XB bound to this site (-1 if unbound)
 
 
@@ -242,13 +241,11 @@ def realize_state(
     # =========================================================================
     thin_axial = z_line - topology.binding_offsets
     tm_states = jnp.zeros((n_thin, n_sites), dtype=jnp.int8)
-    subject_to_coop = jnp.zeros((n_thin, n_sites), dtype=jnp.bool_)
     bound_to = jnp.full((n_thin, n_sites), -1, dtype=jnp.int32)
 
     thin_state = ThinState(
         axial=thin_axial,
         tm_states=tm_states,
-        subject_to_coop=subject_to_coop,
         bound_to=bound_to,
     )
 

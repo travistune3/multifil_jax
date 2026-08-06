@@ -32,12 +32,9 @@ observation: although every unit has its own rate matrix in principle, the rates
 depend on only a few DISCRETE quantities, so there are far fewer distinct
 matrices than there are units.
 
-  Tropomyosin, Ising path (thin_transitions_ising): a site's rates depend only on
-    how many of its two chain neighbours are in each state. That is 27
-    combinations, so 27 matrices serve every site on every filament.
-
-  Tropomyosin, legacy path (thin_transitions): rates depend only on whether the
-    site is cooperatively activated — 2 matrices.
+  Tropomyosin (thin_transitions): a site's rates depend only on how many of its
+    two chain neighbours are in each state. That is 27 combinations, so 27
+    matrices serve every site on every filament.
 
   Crossbridges (thick_transitions): rates depend on the head's axial distance to
     its target (continuous) and on whether that target is open (binary). The
@@ -339,199 +336,7 @@ def matrix_exponential_batch(
 
 
 # ============================================================================
-# TROPOMYOSIN TRANSITIONS
-# ============================================================================
-
-def _compute_unique_tm_Q_matrices(ca_concentration: float,
-                                   coop_magnitude: float,
-                                   params) -> jnp.ndarray:
-    """Build the 2 distinct rate matrices of the LEGACY cooperativity model.
-
-    On the legacy path a site's rates depend on exactly one binary property:
-    whether it currently falls inside the cooperative span of an active
-    neighbour, as determined earlier by kernels/cooperativity.py. So the entire
-    filament population reduces to two rate matrices:
-
-        Q_unique[0]  not cooperatively activated (boost factor 1.0)
-        Q_unique[1]  cooperatively activated     (boost factor coop_magnitude)
-
-    The boost multiplies the three forward rates and leaves the reverse rates
-    alone. That asymmetry is deliberate in this model but does break detailed
-    balance — cooperativity here changes the equilibrium as well as the kinetics,
-    without an explicit free-energy justification. The Ising path
-    (_compute_unique_tm_Q_matrices_ising) was introduced to address exactly that.
-
-    Sites locked by a bound crossbridge are NOT a third configuration; they are
-    handled by overriding their probability vector in thin_transitions().
-
-    Args:
-        ca_concentration: Calcium concentration (M)
-        coop_magnitude: Forward-rate multiplier for activated sites
-        params: DynamicParams with the tm_* rate constants
-
-    Returns:
-        Q_unique: (2, 4, 4) — index 0 non-cooperative, index 1 cooperative
-    """
-    # Get rate constants from params (attribute access)
-    Keq_01 = params.tm_Keq_01
-    Keq_12 = params.tm_Keq_12
-    Keq_23 = params.tm_Keq_23
-    k_01_base = params.tm_k_01
-    k_12_base = params.tm_k_12
-    k_23_base = params.tm_k_23
-    k_30_base = params.tm_k_30
-
-    # Per-config cooperativity factors (index 0 = non-coop, 1 = coop)
-    coop = jnp.array([1.0, coop_magnitude], dtype=jnp.float32)
-
-    # Forward rates (per-config)
-    k_01 = k_01_base * ca_concentration * coop
-    k_12 = k_12_base * coop
-    k_23 = k_23_base * coop
-    k_30 = jnp.broadcast_to(k_30_base, (2,))  # not coop-modulated
-
-    # Backward rates (detailed balance, identical across configs)
-    k_10 = jnp.broadcast_to(k_01_base / Keq_01, (2,))
-    k_21 = jnp.broadcast_to(k_12_base / Keq_12, (2,))
-    k_32 = jnp.broadcast_to(k_23_base / Keq_23, (2,))
-
-    # Diagonal rates
-    k_00 = -k_01
-    k_11 = -(k_10 + k_12)
-    k_22 = -(k_21 + k_23)
-    k_33 = -(k_30 + k_32)
-
-    return _build_tm_Q_matrix_optimized(
-        k_00, k_01, k_10, k_11, k_12,
-        k_21, k_22, k_23, k_30, k_32, k_33,
-    )
-
-
-def thin_transitions(state: 'State',
-                    constants: 'DynamicParams',
-                    topology: 'SarcTopology',
-                    rng_key: jax.random.PRNGKey,
-                    dt: float,
-                    random_values: Optional[jnp.ndarray] = None,
-                    tm_subpop=None) -> Tuple['State', jnp.ndarray]:
-    """Advance every tropomyosin site one timestep — LEGACY cooperativity path.
-
-    Reached only when run(legacy_coop=True). The default path is
-    thin_transitions_ising(); this one is retained so that parameter sets fitted
-    under the older cooperativity model remain reproducible.
-
-    Requires state.thin.subject_to_coop to have been filled in first by
-    kernels/cooperativity.py — unlike the Ising path, which derives its
-    neighbour information itself.
-
-    Only 2 distinct probability matrices exist (cooperative and not), so the
-    whole filament population is served by one 2-matrix exponential plus a
-    gather, rather than one exponential per site.
-
-    LOCKED SITES. A site in state 3 with a crossbridge attached cannot leave:
-    its probability vector is overridden to [0, 0, 0, 1]. Physically the bound
-    head holds tropomyosin out of the way, so the site cannot close underneath
-    it. This is applied after the matrix exponential rather than by zeroing
-    rates, because whether a site is locked changes every timestep while the
-    rate matrices do not — folding it into Q would defeat the 2-matrix
-    reduction.
-
-    Args:
-        state: Current State (reads tm_states, subject_to_coop, bound_to)
-        constants: DynamicParams with pCa and the tm_* rates
-        topology: SarcTopology, for the eye_4 identity
-        rng_key: JAX random key for sampling
-        dt: Timestep length (ms)
-        random_values: Optional pre-drawn uniforms, for deterministic testing
-        tm_subpop: Optional (mode, constants_k, extra) for mixed populations;
-            None runs the single-population path verbatim. 'mean_field'
-            weight-sums the per-population rate matrices before one exponential;
-            'explicit' exponentiates each population and selects per site by
-            integer label. See core/subpopulation.py.
-
-    Returns:
-        new_state: State with updated tm_states
-        P_unique: the distinct probability matrices used, for validation
-    """
-    tm_states = state.thin.tm_states
-    is_cooperative = state.thin.subject_to_coop
-    bound_to = state.thin.bound_to
-    eye_4 = topology.eye_4
-
-    is_bound = bound_to >= 0  # (n_thin, n_sites)
-    n_thin, n_sites = tm_states.shape
-    n_sites_total = n_thin * n_sites
-
-    # Flatten for processing
-    tm_states_flat = tm_states.reshape(-1)
-    is_coop_flat = is_cooperative.reshape(-1)
-    is_bound_flat = is_bound.reshape(-1)
-
-    # Calculate ca_concentration from pCa (pCa is the user-facing variable)
-    ca_conc = 10.0 ** (-constants.pCa)
-
-    # Map each site to its config (0 = non-coop, 1 = coop)
-    config_idx = is_coop_flat.astype(jnp.int32)  # (n_sites_total,)
-
-    if tm_subpop is None:
-        # OPTIMIZATION: Compute only 2 unique Q matrices, then P = exp(Q*dt)
-        Q_unique = _compute_unique_tm_Q_matrices(ca_conc, constants.tm_coop_magnitude, constants)
-        P_unique = expm_pade6_batch(Q_unique * dt, identity=eye_4)  # (2, 4, 4)
-        P_indexed = P_unique[config_idx]  # (n_sites_total, 4, 4)
-    else:
-        mode, constants_k, extra = tm_subpop
-        # Per-population unique-Q matrices (each (2, 4, 4)); coop magnitude is
-        # per-population so a subpop may scale tm_coop_magnitude too.
-        Q_k = [_compute_unique_tm_Q_matrices(ca_conc, ck.tm_coop_magnitude, ck)
-               for ck in constants_k]
-        if mode == 'mean_field':
-            fractions = extra  # (K,)
-            Q_eff = sum(fractions[k] * Q_k[k] for k in range(len(constants_k)))
-            P_unique = expm_pade6_batch(Q_eff * dt, identity=eye_4)  # (2, 4, 4)
-            P_indexed = P_unique[config_idx]
-        else:  # explicit mixture: per-site label select
-            labels = extra  # (n_sites_total,) INT in [0, K)
-            Q_stack = jnp.stack(Q_k)  # (K, 2, 4, 4)
-            Kp = Q_stack.shape[0]
-            P_unique = expm_pade6_batch(
-                Q_stack.reshape(Kp * 2, 4, 4) * dt, identity=eye_4).reshape(Kp, 2, 4, 4)
-            P_indexed = P_unique[labels, config_idx]  # (n_sites_total, 4, 4)
-
-    # Get probability vectors for current states
-    current_states = tm_states_flat.astype(jnp.int32)
-    prob_vectors = jax.vmap(lambda P, s: P[s])(P_indexed, current_states)  # (n_sites_total, 4)
-
-    # CRITICAL: Apply locked mask
-    # Locked = in state 3 AND bound to crossbridge
-    locked_mask = (tm_states_flat == 3) & is_bound_flat  # (n_sites_total,)
-
-    # Locked sites: probability = [0, 0, 0, 1] (100% stay in state 3)
-    locked_prob = jnp.array([0.0, 0.0, 0.0, 1.0])
-    prob_vectors = jnp.where(locked_mask[:, None], locked_prob, prob_vectors)
-
-    # Sample new states from categorical distribution
-    if random_values is None:
-        rng_key, subkey = jax.random.split(rng_key)
-        random_values = jax.random.uniform(subkey, shape=(n_sites_total,))
-
-    # Standard categorical sampling: cumsum + argmax
-    cum_probs = jnp.cumsum(prob_vectors, axis=1)
-    new_states = jnp.argmax(random_values[:, None] < cum_probs, axis=1)
-
-    # Reshape back — cast to int8 to match ThinState.tm_states dtype
-    new_tm_states = new_states.reshape(n_thin, n_sites).astype(jnp.int8)
-
-    # Update state with _replace
-    new_thin = state.thin._replace(
-        tm_states=new_tm_states,
-    )
-    new_state = state._replace(thin=new_thin)
-
-    return new_state, P_unique
-
-
-# ============================================================================
-# SYMMETRIC ISING TROPOMYOSIN COOPERATIVITY — the default path
+# TROPOMYOSIN TRANSITIONS — symmetric Ising cooperativity
 # ============================================================================
 #
 # THE BIOLOGY. Tropomyosin is a continuous strand running the length of the thin
@@ -559,8 +364,8 @@ def thin_transitions(state: 'State',
 # shifts by exactly exp(h) — precisely the Boltzmann factor for a state whose
 # energy has been lowered by h kT. This makes the coupling a genuine free-energy
 # term rather than an ad hoc rate boost, and detailed balance survives on every
-# reversible leg. Multiplying only the forward rates, as the legacy model does,
-# would not have that property.
+# reversible leg. Multiplying only the forward rates — as the retired
+# tension-span cooperativity model did — would not have that property.
 #
 # The one-way cycle-closing rate k_30 is deliberately left unscaled: boosting it
 # alongside the forward rates produces anti-cooperative runaway rather than
@@ -576,10 +381,60 @@ def thin_transitions(state: 'State',
 # then gather per site.
 
 
-def _compute_unique_tm_Q_matrices_ising(ca_concentration: float,
-                                         J_C: float,
-                                         J_M: float,
-                                         params) -> jnp.ndarray:
+def count_neighbor_states_split(tm_states: jnp.ndarray,
+                                tm_prev_neighbor: jnp.ndarray,
+                                tm_next_neighbor: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Count same-chain neighbors in state 2, state 3, and closed (state 0/1),
+    using the fixed (<=2) topological same-chain neighbor set per site.
+
+    NEIGHBOURS ARE STRUCTURAL, NOT SPATIAL. A site couples to its immediate
+    predecessor and successor in its own chain's axial ordering, precomputed once
+    when the topology is built. There is no distance threshold and no length
+    scale to tune, which is what makes the coupling a genuine nearest-neighbour
+    Ising chain rather than a windowed approximation to one.
+
+    Endpoints self-reference rather than carrying a sentinel index, so every
+    gather is valid and no masking is needed. A site therefore has at most two
+    real neighbours by construction, and the counts fall in {0, 1, 2} naturally —
+    the jnp.minimum(..., 2) below is defensive, kept because the downstream
+    Q-matrix gather assumes that range structurally.
+
+    Nothing is written to state: the counts are consumed inline by
+    thin_transitions().
+
+    Args:
+        tm_states:        (n_sites,) TM states (0-3)
+        tm_prev_neighbor: (n_sites,) nearest same-chain predecessor site index
+            (self-referencing at chain endpoints/padding)
+        tm_next_neighbor: (n_sites,) nearest same-chain successor site index
+            (self-referencing at chain endpoints/padding)
+
+    Returns:
+        n_2:      (n_sites,) int32 same-chain state-2 neighbors, in {0,1,2}
+        n_3:      (n_sites,) int32 same-chain state-3 neighbors, in {0,1,2}
+        n_closed: (n_sites,) int32 same-chain state-{0,1} neighbors, in {0,1,2}
+    """
+    n_sites = tm_states.shape[0]
+    site_idx = jnp.arange(n_sites)
+
+    is_2 = (tm_states == 2)
+    is_3 = (tm_states == 3)
+    is_closed = (tm_states == 0) | (tm_states == 1)
+
+    prev_real = (tm_prev_neighbor != site_idx)
+    next_real = (tm_next_neighbor != site_idx)
+
+    n_2 = (is_2[tm_prev_neighbor] & prev_real).astype(jnp.int32) + (is_2[tm_next_neighbor] & next_real).astype(jnp.int32)
+    n_3 = (is_3[tm_prev_neighbor] & prev_real).astype(jnp.int32) + (is_3[tm_next_neighbor] & next_real).astype(jnp.int32)
+    n_c = (is_closed[tm_prev_neighbor] & prev_real).astype(jnp.int32) + (is_closed[tm_next_neighbor] & next_real).astype(jnp.int32)
+
+    return jnp.minimum(n_2, 2), jnp.minimum(n_3, 2), jnp.minimum(n_c, 2)
+
+
+def _compute_unique_tm_Q_matrices(ca_concentration: float,
+                                  J_C: float,
+                                  J_M: float,
+                                  params) -> jnp.ndarray:
     """Build all 27 rate matrices of the Ising cooperativity model.
 
     One matrix per possible neighbour composition (n_2, n_3, n_closed), each
@@ -590,6 +445,12 @@ def _compute_unique_tm_Q_matrices_ising(ca_concentration: float,
     The local field h is applied as exp(+h/2) on the three forward rates and
     exp(-h/2) on their reverses, leaving the one-way cycle-closing rate k_30 at
     its base value — see the section header above for why.
+
+    The rate laws themselves are NOT written here: each comes from its
+    tm_rate_XY function in rate_functions.py, evaluated on all 27 configurations
+    at once. This function only decides which modifier each rate receives and
+    assembles the results, exactly as xb_rate_matrix does for the crossbridge
+    cycle.
 
     Args:
         ca_concentration: Calcium concentration (M)
@@ -622,17 +483,21 @@ def _compute_unique_tm_Q_matrices_ising(ca_concentration: float,
     # Boost ALL three forward TM transitions (0→1 Ca-bind, 1→2 intermediate shift,
     # 2→3 TM-to-M-position) and their backwards symmetrically. State 3 = M-position
     # (TM open, available for XB binding). The cycle-close step k_30 stays at base
-    # — slowing it produces anti-cooperative cascade behavior (verified empirically).
+    # — slowing it produces anti-cooperative cascade behavior (verified empirically),
+    # which is why tm_rate_30 takes no modifier argument at all.
     # This is the original Tanner 2012 prescription (Ψ on r_{t,12} and r_{t,23}),
     # plus the Ca-binding step, applied Glauber-symmetrically.
-    k_01 = (k_01_base * ca_concentration) * forward_boost
-    k_12 = k_12_base * forward_boost
-    k_23 = k_23_base * forward_boost
-    k_30 = jnp.broadcast_to(k_30_base, (27,))
+    #
+    # k_30 is broadcast to (27,) so every rate entering the Q builder has the
+    # same shape, even though this one does not vary across configurations.
+    k_01 = tm_rate_01(ca_concentration, k_01_base, forward_boost)
+    k_12 = tm_rate_12(k_12_base, forward_boost)
+    k_23 = tm_rate_23(k_23_base, forward_boost)
+    k_30 = tm_rate_30(jnp.broadcast_to(k_30_base, (27,)))
 
-    k_10 = (k_01_base / Keq_01) * backward_boost
-    k_21 = (k_12_base / Keq_12) * backward_boost
-    k_32 = (k_23_base / Keq_23) * backward_boost
+    k_10 = tm_rate_10(k_01_base, Keq_01, backward_boost)
+    k_21 = tm_rate_21(k_12_base, Keq_12, backward_boost)
+    k_32 = tm_rate_32(k_23_base, Keq_23, backward_boost)
 
     # Diagonals
     k_00 = -k_01
@@ -648,20 +513,20 @@ def _compute_unique_tm_Q_matrices_ising(ca_concentration: float,
     return Q_flat.reshape(3, 3, 3, 4, 4)
 
 
-def thin_transitions_ising(state: 'State',
-                           constants: 'DynamicParams',
-                           topology: 'SarcTopology',
-                           rng_key: jax.random.PRNGKey,
-                           dt: float,
-                           random_values: Optional[jnp.ndarray] = None) -> Tuple['State', jnp.ndarray]:
-    """Advance every tropomyosin site one timestep — the DEFAULT path.
+def thin_transitions(state: 'State',
+                     constants: 'DynamicParams',
+                     topology: 'SarcTopology',
+                     rng_key: jax.random.PRNGKey,
+                     dt: float,
+                     random_values: Optional[jnp.ndarray] = None,
+                     tm_subpop=None) -> Tuple['State', jnp.ndarray]:
+    """Advance every tropomyosin site one timestep.
 
     Uses the symmetric Ising cooperativity described in the section header
-    above. Unlike the legacy thin_transitions(), this does NOT read
-    state.thin.subject_to_coop: it counts each site's neighbour states itself
-    from the current tm_states and the structural chain adjacency. That is why
-    the default kinetics phase can skip the thin-filament force calculation and
-    the cooperativity update entirely — there is nothing to precompute.
+    above. Nothing about a site's cooperative status is precomputed or stored:
+    this counts each site's neighbour states itself from the current tm_states
+    and the structural chain adjacency. That is why the kinetics phase needs no
+    thin-filament force calculation ahead of it.
 
     Sequence: build 27 rate matrices, exponentiate them in one batch, count each
     site's neighbours to get its configuration index, gather its probability
@@ -669,8 +534,10 @@ def thin_transitions_ising(state: 'State',
 
     LOCKED SITES. A site in state 3 with a crossbridge attached is forced to
     stay there ([0, 0, 0, 1]) — the bound head physically blocks tropomyosin's
-    return. Applied after the exponential, for the same reason as in the legacy
-    path.
+    return. This is applied after the matrix exponential rather than by zeroing
+    rates, because whether a site is locked changes every timestep while the
+    rate matrices do not — folding it into Q would defeat the 27-matrix
+    reduction.
 
     Args:
         state: Current State (reads tm_states and bound_to)
@@ -679,19 +546,17 @@ def thin_transitions_ising(state: 'State',
         rng_key: JAX random key for sampling
         dt: Timestep length (ms)
         random_values: Optional pre-drawn uniforms, for deterministic testing
+        tm_subpop: Optional (mode, constants_k, extra) for mixed populations;
+            None runs the single-population path verbatim. 'mean_field'
+            weight-sums the per-population rate matrices before one exponential;
+            'explicit' exponentiates each population and selects per site by
+            integer label. See core/subpopulation.py.
 
     Returns:
         new_state: State with updated tm_states
-        P_flat: (27, 4, 4) the distinct probability matrices used, for validation
-
-    Note:
-        Subpopulations are not supported on this path — scaling tm_* rates for a
-        subset of sites requires legacy_coop=True. run() raises rather than
-        silently ignoring it.
+        P_flat: the distinct probability matrices used, for validation —
+            (27, 4, 4), or (K, 27, 4, 4) for an explicit mixture
     """
-    # Local import to avoid circular ref at module load
-    from multifil_jax.kernels.cooperativity import count_neighbor_states_split
-
     tm_states = state.thin.tm_states                    # (n_thin, n_sites) int8
     tm_prev_neighbor = topology.tm_prev_neighbor        # (n_thin, n_sites)
     tm_next_neighbor = topology.tm_next_neighbor        # (n_thin, n_sites)
@@ -706,17 +571,35 @@ def thin_transitions_ising(state: 'State',
     J_C = constants.tm_J_C
     J_M = constants.tm_J_M
 
-    # Build 27 unique Q matrices, then expm in one batch
-    Q_unique = _compute_unique_tm_Q_matrices_ising(ca_conc, J_C, J_M, constants)
-    Q_flat = Q_unique.reshape(27, 4, 4)
-    P_flat = expm_pade6_batch(Q_flat * dt, identity=eye_4)  # (27, 4, 4)
-
     # Per-filament neighbor counts (each function call processes one strand)
     n_2, n_3, n_c = jax.vmap(count_neighbor_states_split)(tm_states, tm_prev_neighbor, tm_next_neighbor)
     # all shape (n_thin, n_sites), int32 capped at 2
 
     config_idx = (n_2 * 9 + n_3 * 3 + n_c).reshape(-1)  # (n_sites_total,) int32
-    P_indexed = P_flat[config_idx]                       # (n_sites_total, 4, 4)
+
+    if tm_subpop is None:
+        # Build 27 unique Q matrices, then expm in one batch
+        Q_flat = _compute_unique_tm_Q_matrices(ca_conc, J_C, J_M, constants).reshape(27, 4, 4)
+        P_flat = expm_pade6_batch(Q_flat * dt, identity=eye_4)  # (27, 4, 4)
+        P_indexed = P_flat[config_idx]                          # (n_sites_total, 4, 4)
+    else:
+        mode, constants_k, extra = tm_subpop
+        # Per-population 27-matrix sets. The couplings are per-population too, so
+        # a subpopulation may scale tm_J_C / tm_J_M as well as the rates.
+        Q_k = [_compute_unique_tm_Q_matrices(ca_conc, ck.tm_J_C, ck.tm_J_M, ck).reshape(27, 4, 4)
+               for ck in constants_k]
+        if mode == 'mean_field':
+            fractions = extra  # (K,)
+            Q_eff = sum(fractions[k] * Q_k[k] for k in range(len(constants_k)))
+            P_flat = expm_pade6_batch(Q_eff * dt, identity=eye_4)  # (27, 4, 4)
+            P_indexed = P_flat[config_idx]
+        else:  # explicit mixture: per-site label select
+            labels = extra  # (n_sites_total,) INT in [0, K)
+            Q_stack = jnp.stack(Q_k)  # (K, 27, 4, 4)
+            Kp = Q_stack.shape[0]
+            P_flat = expm_pade6_batch(
+                Q_stack.reshape(Kp * 27, 4, 4) * dt, identity=eye_4).reshape(Kp, 27, 4, 4)
+            P_indexed = P_flat[labels, config_idx]  # (n_sites_total, 4, 4)
 
     tm_states_flat = tm_states.reshape(-1).astype(jnp.int32)
     is_bound_flat = is_bound.reshape(-1)
@@ -1209,7 +1092,7 @@ def thick_transitions(state: 'State',
     bookkeeping is updated on both filaments. A head entering a bound state must
     record which site it took, and that site must record which head took it —
     the thin filament's bound_to array is what locks a tropomyosin site open
-    (see thin_transitions_ising) and what lets forces.py know where to apply
+    (see thin_transitions) and what lets forces.py know where to apply
     crossbridge force.
 
     Rates come from xb_step_probabilities(), which evaluates them on a distance
