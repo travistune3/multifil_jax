@@ -110,9 +110,13 @@ _DYNAMIC_DEFAULTS = {
     #
     # Brunello et al. 2014 J Physiol 592:3881:
     #     specific compliance c_A = 14.3 nm·MPa⁻¹·µm⁻¹, half-sarc thin length l_A = 0.975 µm.
+    #     BOTH VERIFIED verbatim 2026-08-19: "sarcomere length 2.15 μm, lA = 0.975 μm,
+    #     lM = 0.800 μm, ζ = 0.700 μm, cA = 14.3 ± 1.9 nm MPa⁻¹ μm⁻¹". Frog, intact fibres.
     #     Per-thin area A_A = A_M / 2 = 877 nm² (1:2 thick:thin stoichiometry, vertebrate).
     #     k_whole = A_A / (c_A · l_A) = 877 / (14.3 × 0.975) = 63 pN/nm.
-    #   (Note: do NOT use Brunello's overlap-corrected C_A = 6.9 — that removes the
+    #   (Note: do NOT use an overlap-corrected C_A of 6.9 — the string "6.9" does
+    #    not appear anywhere in Brunello 2014, so it must not be attributed to that
+    #    paper; the caution itself still stands — it removes the
     #    non-overlap segment from the load path; our uniform model spring of length l_A
     #    represents the whole filament, so use c × L without the correction.)
     # Mijailovich et al. 2021 Table 1: AE_a = 65 nN, l_a = 1.1 µm → k_whole = 59 pN/nm.
@@ -182,8 +186,10 @@ _DYNAMIC_DEFAULTS = {
     #
     # Also at d = 14 nm the local axial stiffness of the strong state is
     # ~1.3-1.4 pN/nm rather than g_k = 5. THIS is why single-head
-    # stiffness measurements (~2-3 pN/nm; Woody 2019 eLife 8:e49266 report >=2.3
-    # pN/nm for beta-cardiac) must
+    # stiffness measurements (~2-3 pN/nm; Woody 2019 eLife 8:e49266 VERIFIED:
+    # "we estimate the stiffness of the motor to be 2.3 pN/nm (68% CI, 2.0-2.7
+    # pN/nm) or greater", recombinant human beta-cardiac MYH7, and Woody notes it
+    # is "at the upper end of previous estimates") must
     # be compared against the projected two-spring stiffness, never against g_k
     # directly — and it is also the mechanism by which lattice spacing feeds back
     # into crossbridge kinetics, since strain-dependent rates read this geometry.
@@ -201,9 +207,13 @@ _DYNAMIC_DEFAULTS = {
     # The five-figure rest values here are not spurious precision: the paper's
     # Table 1 caption states the 2sXB rests are computed from the 4sXB geometry so
     # that both models' heads rest in the same place, and the table rounds them.
-    # Upstream measurements behind that geometry: the 125 -> 70 deg lever rotation
-    # is Taylor et al. 1999; the light-chain-domain rest length is from Houdusse
-    # et al. 2000 (structure 1DFK); the S2 angle range is Liu et al. 2006. The
+    # Upstream measurements behind that geometry (all three VERIFIED verbatim in
+    # the Table 1 caption, 2026-08-19): the 125 -> 70 deg lever rotation is Taylor
+    # et al. 1999; the light-chain-domain rest length is from Houdusse et al. 2000
+    # (structure 1DFK); the S2 angle range is Liu et al. 2006 -- though Williams did
+    # NOT adopt Liu's 51-60 deg, arguing it was "distorted by the compressive radial
+    # force ... in the swollen lattice spacings that Liu et al. used" and choosing
+    # 40-50 deg instead. The geometry inherited here is Williams' CORRECTION of Liu. The
     # lineage that reuses this head: Daniel, Trimble & Chase 1998 Biophys J
     # 74:1611; Chase, Macpherson & Daniel 2004 Ann Biomed Eng 32:1559; Tanner,
     # Daniel & Regnier 2007 PLoS Comput Biol 3(7):e115; Williams et al. 2013
@@ -230,7 +240,13 @@ _DYNAMIC_DEFAULTS = {
     #   matters mechanically is the projected two-spring stiffness, not g_k alone
     #   (see above): that projection is ~1.33 pN/nm at d = 14 nm, which agrees
     #   closely with the single crossbridge stiffness of 1.3 pN/nm used by MUSICO
-    #   (Mijailovich et al. 2021 JGP 153:e202012604, after Duke 1999).
+    #   (Mijailovich et al. 2021 JGP 153:e202012604, after Duke 1999 -- Duke's
+    #   K = 1.3 pN/nm verified 2026-08-19).
+    #   BUT 1.3 pN/nm is another MODEL's chosen value, while the two direct
+    #   MEASUREMENTS sit at 2.3-2.7 pN/nm: Woody 2019 >=2.3 (human beta-cardiac,
+    #   single molecule) and Brunello et al. 2014 J Physiol 592:3881 Table 1,
+    #   in-situ crossbridge stiffness eps = 2.7 +/- 0.9 pN/nm (frog). So this
+    #   projection agrees with the models and is ~2x below the experiments. Open.
     # --------------------------------------------------------------------------
     'xb_c_rest_weak':   0.82309,   # [G] rad — pre-stroke converter angle
     'xb_c_rest_strong': 1.27758,   # [G] rad — post-stroke converter angle
@@ -575,9 +591,15 @@ _DYNAMIC_DEFAULTS = {
     #                    bound state "only 2 RT below that of the detached M.D.P
     #                    state" — an exact match.
     #   Pi release      -10.7 kT here; -12 kT in Howard; 14 RT in Pate & Cooke
-    #                    (from K34 = 1.89e-4 M^-1 at 3 mM Pi). All inside the -8 to
-    #                    -13 kT range of Månsson 2016 JMRCM 37:181 and Offer &
-    #                    Ranatunga 2013 Biophys J 105:1767.
+    #                    (from K34 = 1.89e-4 M^-1 at 3 mM Pi). Both VERIFIED, and
+    #                    they bracket -10.7.
+    #                    WITHDRAWN 2026-08-19: the "-8 to -13 kT range of Månsson
+    #                    2016 JMRCM 37:181 and Offer & Ranatunga 2013" has NO
+    #                    verified source. Månsson 2016 is not in .claude/papers/
+    #                    (and never reached GAPS.md), so it cannot be cited for a
+    #                    number at all. Offer & Ranatunga 2013 IS on disk and
+    #                    contains no kT/RT free-energy values; its locator was also
+    #                    wrong (105:928-940, not 105:1767).
     #   cycle total     -23 RT in Pate & Cooke, -25 kT in Howard.
     #
     # KNOWN IMBALANCE: the return path (tight_2 -> free_2 -> DRX) is only ~-2.3 kT
