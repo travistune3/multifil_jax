@@ -597,8 +597,14 @@ def xb_rate_34(A34, f_strong, delta34, k_t):
 
     Args:
         A34: Zero-load detachment rate (ms^-1) - params.xb_r34_coeff.
-             [M] >=500 s^-1 at near-zero load for fast skeletal myosin
-             (Siemankowski & White 1984 JBC 259:5045); cardiac is ~10x slower.
+             [I] skeletal / [L] cardiac. Siemankowski & White 1984 JBC 259:5045
+             VERIFY cardiac exactly: "the rate constant for the dissociation of
+             ADP from cardiac actomyosin-S1, k_AD, is ~65 s^-1 at 15 C" (bovine
+             ventricle, beta-MHC). For skeletal the same paper gives ">500 s^-1"
+             at 15 C, but that is a ONE-SIDED BOUND and is quoted from their
+             ref (14), not measured there -- hence [I], not [M]. "Cardiac ~10x
+             slower" is a 15 C statement only: k_AD extrapolates to ~550 s^-1 at
+             38 C (Q10 ~ 2.4).
         f_strong: Force carried in the strong state (pN); positive = tensile
         delta34: Transition-state distance (nm) - params.xb_delta_34
         k_t: Thermal energy kT (pN*nm)
@@ -610,26 +616,52 @@ def xb_rate_34(A34, f_strong, delta34, k_t):
     Pate & Cooke 1989 JMRCM 10:181, Table 2, make ADP release a decreasing
     function of strain — 2 s^-1 for a highly strained force-producing bridge
     (x >= 3.7 nm) rising to 750 s^-1 once it is dragging (x < 0), a 375-fold
-    catch bond. They state the reasoning directly: "we assume that Mg2+ADP release
+    catch bond. VERIFIED EXACTLY against Table 2 (2026-08-19):
+    R45(x) = 2 s^-1 (x >= 3.7); 273.3 - 73.3x (1 <= x < 3.7);
+             750 - 550x (0 <= x < 1); 750 s^-1 (x < 0).
+    Note their own wording makes this an ASSUMPTION, not a measurement: the
+    rates "are assumed to rise dramatically as x approaches 0". They state the
+    reasoning directly: "we assume that Mg2+ADP release
     is slow for highly strained crossbridges in the A.M.D state, limiting the
     isometric ATPase. For values of x < 0, any crossbridge which remains attached
     produces a force which inhibits filament sliding, decreasing efficiency."
     That is the classical Huxley g(x): hold on while doing work, let go when
     resisting.
 
-    Two single-molecule studies measure the same sign: Sung 2015 Nat Commun 6:7931
-    (human beta-cardiac, harmonic force spectroscopy, delta = 0.8 +/- 0.1 nm,
-    k0 = 87 s^-1) find resisting load SLOWS detachment, and Wang 2024 Small
-    (beta-cardiac and slow skeletal, delta = 0.97 nm) report explicit catch-bond
-    behaviour of the ADP-bound state. Both also put delta near 0.9 nm, not 0.5.
+    Two single-molecule studies measure the same sign. Sung 2015 Nat Commun 6:7931
+    (human beta-cardiac, harmonic force spectroscopy) VERIFIED: "they average to
+    k0 = 87 +/- 7 s^-1 and d = 0.8 +/- 0.1 nm (mean +/- s.e.m., N = 7)"; resisting
+    load slows detachment. Wang 2024 Small (rabbit native beta-cardiac and slow
+    skeletal) VERIFIED on the sign: "both kf and ks responded to increasing
+    resistive as well as assistive load by slowing the actomyosin unbinding rates
+    ... exhibiting 'catch bond' behavior".
+    CORRECTION 2026-08-19: delta = 0.97 nm was previously attributed to Wang here.
+    It is NOT their number -- "0.97" appears zero times in that paper; 0.97 nm is
+    Greenberg et al.'s porcine value quoted inside Sung. Wang's own fitted
+    distances are 1.53 +/- 0.31, 1.53 +/- 0.17 and 1.87 +/- 1.4 nm. So the measured
+    Bell distances are 0.8 nm (Sung) and ~1.5-1.9 nm (Wang) -- both above this
+    model's 0.5, and Wang further above than previously stated.
+    Two caveats on Wang: the catch behaviour holds for ASSISTIVE as well as
+    resistive load, and it was measured at 10 uM ATP to isolate a strong-bound
+    rigor-like state, far below physiological ATP.
 
     The likely resolution is that two detachment routes are being conflated: a
     slow, ADP-release-limited exit from the post-stroke state, which is a catch
     bond (Sung 2015; Wang 2024; and Veigel 2005 Nat Cell Biol 7:861 for myosin-V,
-    where resisting load slows ADP release), and a fast premature detachment from
-    early force-generating states, which is a slip bond (Woody 2019; Capitanio
-    2006 PNAS 103:87; Caremani 2025). This model already has the second route as
-    the strain-gated 3->2->1->0 path, so this rate is the first one.
+    where resisting load slows ADP release -- VERIFIED: "extrapolation would
+    predict the detachment kinetics of the front head to slow down 50-fold and the
+    kinetics of the rear head to accelerate"; note this is mouse brain myosin-V, a
+    processive motor, and the effect is INTRAMOLECULAR strain between two heads,
+    not external load on a muscle crossbridge), and a fast premature detachment
+    from early force-generating states, which is a slip bond (Woody 2019;
+    Caremani 2025 -- neither checked yet). This model already has the second route
+    as the strain-gated 3->2->1->0 path, so this rate is the first one.
+    REMOVED 2026-08-19: Capitanio 2006 PNAS 103:87 was cited here for the slip
+    route. It does not support that. The paper measures a TWO-STEP working stroke
+    (~3.4-5.2 nm then ~1.0-1.3 nm) whose second phase "depends linearly on ATP
+    concentration"; "catch bond" and "slip bond" appear zero times in it, and
+    every occurrence of "load" is in the Introduction discussing other work. Its
+    locator (PNAS 103(1):87-92) is correct; its content does not fit the claim.
 
     Because delta_34 is a sweepable field, a NEGATIVE value is exactly a catch
     bond, and the question can be explored without editing code. Note it is not

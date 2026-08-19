@@ -481,15 +481,40 @@ _DYNAMIC_DEFAULTS = {
                              #     apparent rate of sinusoidal-analysis process B
                              #     (2πb ~ 20–60 s⁻¹ skeletal; Kawai & Zhao 1993
                              #     Biophys J 65:638), not measured directly
-    'xb_r23_coeff': 0.15,    # [I] ms⁻¹ working stroke at zero load;
-                             #     Millar & Homsher 1990 (70–100 s⁻¹)
-    'xb_r34_coeff': 0.6,     # [M] ms⁻¹ ADP release/detachment at zero load;
-                             #     Siemankowski & White 1984 JBC 259:5045 (≥500 s⁻¹)
-    'xb_delta_23': 1.0,      # [M] nm, distance to the working-stroke transition
-                             #     state; Pate & Cooke 1989 JMRCM 10:181;
-                             #     Huxley & Simmons 1971 Nature 233:533 (1–2 nm)
-    'xb_delta_34': 0.5,      # [I] nm, distance to the detachment transition state;
-                             #     Duke 1999 PNAS 96:2770. Note this parameter
+    'xb_r23_coeff': 0.15,    # [G] ms⁻¹ working stroke at zero load. The cited
+                             #     "Millar & Homsher 1990 (70–100 s⁻¹)" is NOT in that
+                             #     paper (audit 2026-08-19): JBC 265:20234 measures
+                             #     k_Pi = 23.5 ± 1.7 s⁻¹ at 10 °C, 0.7 mM Pi, and
+                             #     k_TR = 13.6 ± 0.2 s⁻¹ — the only two rates it
+                             #     reports. HYPOTHESIS (not established): 70–100 s⁻¹
+                             #     may be 23.5 s⁻¹ Q10-corrected from 10 °C to ~26 °C
+                             #     (Q10 2–3 gives 68–120). If so, write that down;
+                             #     otherwise drop the attribution.
+    'xb_r34_coeff': 0.6,     # [I] ms⁻¹ ADP release/detachment at zero load.
+                             #     Siemankowski & White 1984 JBC 259:5045 say
+                             #     ">500 s⁻¹" for rabbit skeletal at 15 °C — but that
+                             #     is (a) a ONE-SIDED BOUND, not a value, and (b) not
+                             #     their own measurement: the sentence carries their
+                             #     ref (14). Their own data are bovine ventricle.
+                             #     Retagged [M] → [I] 2026-08-19.
+    'xb_delta_23': 1.0,      # [I] nm, distance to the working-stroke transition
+                             #     state; Pate & Cooke 1989 JMRCM 10:181.
+                             #     Huxley & Simmons 1971 Nature 233:533 give
+                             #     1/a = 2 nm and h = 8 nm (the stroke); there is no
+                             #     "1–2 nm" range in the paper, and 1/a is one of "the
+                             #     parameters used in obtaining this degree of
+                             #     agreement", i.e. a FIT to tension transients (frog,
+                             #     4 °C), not a measurement. Retagged [M] → [I].
+    'xb_delta_34': 0.5,      # [I] nm, distance to the detachment transition state.
+                             #     VERIFIED: Duke 1999 PNAS 96:2770 — with d = 11 nm
+                             #     and K = 1.3 pN/nm chosen, "the value of ε₂ then
+                             #     implies d' = 0.5 nm". [I] is the right tag: it is
+                             #     implied inside a model, not measured. CAVEAT: Duke's
+                             #     d' is a CONFORMATIONAL displacement of the lever on
+                             #     ADP release, whereas this parameter is used as a
+                             #     Bell transition-state distance. Measured Bell
+                             #     distances are larger — Sung 2015 0.8 ± 0.1 nm,
+                             #     Wang 2024 1.53–1.87 nm. Note this parameter
                              #     trades off against xb_g_k_strong when fitting —
                              #     stiffness and Bell distance can compensate for
                              #     each other to give the same load sensitivity
@@ -1031,9 +1056,24 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams]:
                                    model is ~2.6× slow for the preparation it represents.
         xb_r12_coeff = 0.175 ms⁻¹ — Process B 3–4× slower (2πb ~ 5–15 s⁻¹);
                                      Kawai et al. 1993 Circ Res 73:35
-        xb_r23_coeff = 0.065 ms⁻¹ — Lever arm rate ~2× slower (cardiac beta-MHC);
-                                     Deacon et al. 2012 Cell Mol Life Sci 69:2261
-        xb_r34_coeff = 0.065 ms⁻¹ — Cardiac ADP release ~65 s⁻¹; Siemankowski & White 1984 JBC
+        xb_r23_coeff = 0.065 ms⁻¹ — [L-unverified] "lever arm rate ~2× slower".
+                                     Deacon 2012 (recombinant human α-/β-S1, 20 °C) does
+                                     report ~2× α/β differences and says the isoforms
+                                     "differ by no more than two-fold for ANY" parameter
+                                     — but a specifically LEVER-ARM rate 2× slower in β
+                                     was not located, and the paper states the working
+                                     stroke MAGNITUDE does not change significantly.
+                                     Also: the PDF on disk is the erratum reprint at
+                                     69:4239–4255, not the cited 69:2261.
+        xb_r34_coeff = 0.065 ms⁻¹ — [L] Cardiac ADP release. VERIFIED EXACTLY:
+                                   Siemankowski & White 1984 JBC 259:5045 — "the rate
+                                   constant for the dissociation of ADP from cardiac
+                                   actomyosin-S1, k_AD, is ~65 s⁻¹ at 15 °C" (bovine
+                                   ventricle = β-MHC, so isoform AND temperature match
+                                   the human-β 15 °C targets). Corroborated by Sung 2015
+                                   stopped-flow on human β-cardiac: 72 ± 5 s⁻¹.
+                                   STRONGLY temperature dependent: the same paper
+                                   extrapolates ~550 s⁻¹ at 38 °C, i.e. Q10 ≈ 2.4.
         xb_r05   = 0.2 ms⁻¹     — DRX→SRX (k−PS in Mijailovich 2021 PMC7852458 Table 1).
                                    200 s⁻¹ matches Mijailovich cardiac canonical model;
                                    with kPSmax=400, k0=5, Hill b=5, gives 97.5% SRX at
