@@ -726,21 +726,35 @@ def xb_rate_50(ca_conc, k0, kmax, b, ca50):
 
     Args:
         ca_conc: Calcium concentration (M)
+        NOTE: this rate law is taken directly from Mijailovich 2021 JGP
+        153:e202012604 Eq. 1, and ALL FOUR of its parameters are marked "Assumed"
+        in that paper's Table 1 (audit 2026-08-19). Nothing in this function is
+        measured. Conditions there: rat cardiac trabeculae, 27.2 C.
+
         k0: Basal rate at zero calcium (ms^-1) - params.xb_srx_k0.
-            [I] 0.007 skeletal / 0.005 cardiac; Mijailovich 2021 PMC7852458
-            reports kPS0 = 5 s^-1.
+            [G] 0.007 skeletal / 0.005 cardiac. Mijailovich kPS0 = 5 s^-1
+            ("Assumed"); cardiac adopts it exactly, skeletal uses 7 s^-1 because
+            it is pinned to xb_r05 by construction.
         kmax: Saturating rate at high calcium (ms^-1) - params.xb_srx_kmax.
-              [M] 0.4; Mijailovich 2021 kPSmax = 400 s^-1.
+              [G] 0.4; Mijailovich kPSmax = 400 s^-1, also "Assumed"
+              (retagged from [M] 2026-08-19).
         b: Hill exponent - params.xb_srx_b.
            [G] 5.0. Mijailovich 2021 Table 1 lists b = 5 but marks it "Assumed" —
            a shape parameter chosen inside a model, not a measurement, so [G] not
-           [M]. This gate is a calcium proxy for what is believed to be a
-           mechanosensitive process: Linari 2015 Nature 528:276 and Fusi 2016
-           Nat Commun 7:13281 show thick-filament activation tracks filament
-           STRESS and is independent of calcium.
+           [M]. This gate is a calcium proxy for a process that is MEASURED to be
+           stress-driven: Fusi 2016 Nat Commun 7:13281 abstract states that "both
+           the extent and kinetics of thick filament activation depend on thick
+           filament stress but are independent of intracellular calcium
+           concentration in the physiological range" (rabbit psoas), and Linari
+           2015 Nature 528:276 that "filament stress controls the transition
+           between these two states". So the Ca proxy is CONTRADICTED for
+           skeletal. For cardiac it is defensible: Park-Holohan 2021 PNAS
+           118:e2023706118 finds folded motors are "not directly switched on ...
+           in the absence of thin filament activation" (rat trabeculae, 26 C).
         ca50: Calcium for half-maximal recruitment (M) - params.xb_srx_ca50.
               [G] 1e-6 (pCa 6) is a round number in the physiological range,
-              not a measured value for this transition.
+              not a measured value for this transition. Mijailovich Table 1
+              [Ca2+]50 = 1 uM, "Assumed".
 
     Returns:
         Rate r50 (ms^-1)

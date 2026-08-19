@@ -499,8 +499,16 @@ _DYNAMIC_DEFAULTS = {
     'xb_r04': 0.01,          # [M] ms⁻¹ reverse recovery; Mijailovich 2021
                              #     PMC7852458 (k−H = 10 s⁻¹). With r40 this gives
                              #     a hydrolysis equilibrium constant of 10
-    'xb_r05': 0.007,         # [I] ms⁻¹ DRX→SRX sequestration; gives ~50% SRX at
-                             #     rest for skeletal; Stewart 2010 PNAS 107:430
+    'xb_r05': 0.007,         # [I] ms⁻¹ DRX→SRX sequestration. The "~50% SRX at rest"
+                             #     is an ARITHMETIC CONSEQUENCE of setting xb_srx_k0
+                             #     equal to this rate (r05/(r05+k0) = 0.5), not a target
+                             #     taken from Stewart 2010. Stewart PNAS 107:430 Table 1
+                             #     measures P2 = 0.31 ± 0.01 (n=24) in relaxed rabbit
+                             #     psoas at ~24 °C — i.e. ~31% SRX, so the model sits
+                             #     ~1.6× high. Stewart is strongly temperature-dependent:
+                             #     P2 = 0.16 at 12 °C, 0.33 at 30 °C. What Stewart does
+                             #     establish is the EXISTENCE and slow turnover of the
+                             #     resting SRX pool (lifetime T2 = 230 ± 24 s).
 
     # Free energies of each state (kT), relative to a common reference. These fix
     # every reverse rate by detailed balance, so they encode the direction and
@@ -552,10 +560,24 @@ _DYNAMIC_DEFAULTS = {
     # SRX -> DRX recruitment (see rate_functions.xb_rate_50). Thick-filament
     # activation: the Hill exponent here contributes much of the model's calcium
     # sensitivity, independently of tropomyosin.
-    'xb_srx_k0':   0.007,    # [I] ms⁻¹ basal rate at zero Ca. Equal to xb_r05 by
-                             #     construction, which is what puts ~50% of heads
-                             #     in SRX at rest; Mijailovich 2021 (kPS0 = 5 s⁻¹)
-    'xb_srx_kmax': 0.4,      # [M] ms⁻¹ saturating rate; Mijailovich 2021 (400 s⁻¹)
+    # NOTE ON THIS WHOLE BLOCK (audit 2026-08-19): all five SRX parameters trace to
+    # ONE table — Mijailovich 2021 JGP 153:e202012604 Table 1, "PS" block — and the
+    # Reference column there reads "Assumed" for EVERY ONE of them (k−PS 200 s⁻¹,
+    # k⁰PS 5 s⁻¹, kmax_PS 400 s⁻¹, b 5, [Ca²⁺]50 1 µM). Every other block in that
+    # table carries real literature references; the PS block is the exception. So
+    # nothing here is measured, and the subsystem that carries much of the model's
+    # calcium sensitivity rests on another model's assumptions. Conditions there:
+    # rat cardiac trabeculae, 27.2 °C (rat ventricle is predominantly α-MHC).
+    'xb_srx_k0':   0.007,    # [G] ms⁻¹ basal rate at zero Ca. Set equal to xb_r05 by
+                             #     construction — that is what forces 50% SRX at rest.
+                             #     Mijailovich 2021 kPS0 = 5 s⁻¹ ("Assumed"); this is
+                             #     7 s⁻¹, i.e. 1.4× the cited value, because the
+                             #     construction takes precedence over the citation.
+    'xb_srx_kmax': 0.4,      # [G] ms⁻¹ saturating rate; Mijailovich 2021 kmax_PS =
+                             #     400 s⁻¹. RETAGGED [M] → [G] 2026-08-19: the number
+                             #     is transcribed correctly but Table 1 marks it
+                             #     "Assumed", so there is no measurement to be [M] about
+                             #     — the same reasoning already applied to xb_srx_b below.
     'xb_srx_b':    5.0,      # [G] Hill exponent. Mijailovich 2021 Table 1 uses b = 5
                              #     and marks it "Assumed" — a shape parameter chosen
                              #     inside a model, not a measurement, hence [G].
@@ -566,8 +588,20 @@ _DYNAMIC_DEFAULTS = {
                              #     STRESS and is independent of [Ca²⁺]. The proxy is
                              #     more defensible for cardiac, where stress-dependent
                              #     activation does require thin-filament activation
-                             #     (PNAS 2021 doi:10.1073/pnas.2023706118), than for
-                             #     skeletal. It carries much of the model's calcium
+                             #     (Park-Holohan et al. 2021 PNAS 118:e2023706118,
+                             #     PMC8072254 — citation resolved 2026-08-19), than for
+                             #     skeletal. VERIFIED QUOTES: Fusi 2016 abstract — "both
+                             #     the extent and kinetics of thick filament activation
+                             #     depend on thick filament stress but are independent of
+                             #     intracellular calcium concentration in the
+                             #     physiological range" (rabbit psoas, skinned);
+                             #     Park-Holohan 2021 abstract — folded motors are "not
+                             #     directly switched on ... in the absence of thin
+                             #     filament activation", but with thin-filament
+                             #     activation stretch does activate them (rat trabeculae,
+                             #     26 °C). So the Ca proxy is CONTRADICTED for skeletal
+                             #     and SUPPORTED for cardiac.
+                             #     It carries much of the model's calcium
                              #     sensitivity, so treat it as a fitting knob
     'xb_srx_ca50': 1e-6,     # [G] M — half-recruitment at pCa 6, as Mijailovich 2021
                              #     Table 1 ([Ca²⁺]50 = 1 µM, also marked "Assumed")
@@ -1005,8 +1039,8 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams]:
                                    with kPSmax=400, k0=5, Hill b=5, gives 97.5% SRX at
                                    rest (Ca→0) and ~33% SRX at pCa 4.5 — close to Linari
                                    2015 saturating myosin recruitment data.
-        xb_srx_k0 = 0.005 ms⁻¹   — [G] no source; tuned to give a sensible resting
-                                   SRX fraction alongside xb_r05 above
+        xb_srx_k0 = 0.005 ms⁻¹   — [G] = 5 s⁻¹ = Mijailovich 2021 kPS0 exactly, which
+                                   that paper marks "Assumed". Not tuned here — see dict.
         titin_a  = 55.0 pN        — [I] N2B isoform, stiffer than skeletal N2A;
                                    Granzier & Labeit 2004 Circ Res 94:284
         titin_b  = 0.008 nm⁻¹    — [I] Powers 2018 cardiac-like stiffness (8 µm⁻¹)
@@ -1044,8 +1078,15 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams]:
         'xb_r12_coeff': 0.175,    # Process B 3–4× slower; Kawai et al. 1993 Circ Res 73:35
         'xb_r23_coeff': 0.065,    # Lever arm ~2× slower; Deacon et al. 2012 Cell Mol Life Sci 69:2261
         'xb_r34_coeff': 0.065,    # ADP release ~65 s⁻¹; Siemankowski & White 1984 JBC
-        'xb_r05': 0.2,            # DRX→SRX; Mijailovich 2021 (PMC7852458 Table 1) k−PS=200 s⁻¹
-        'xb_srx_k0': 0.005,       # Empirically calibrated (kPS0=5 s⁻¹)
+        'xb_r05': 0.2,            # [G] DRX→SRX; Mijailovich 2021 (PMC7852458 Table 1)
+                                  #     k−PS = 200 s⁻¹ — correctly transcribed, but that
+                                  #     table marks it "Assumed" (audit 2026-08-19).
+        'xb_srx_k0': 0.005,       # [G] = 5 s⁻¹, which is EXACTLY Mijailovich's kPS0
+                                  #     ("Assumed"). It is not "empirically calibrated"
+                                  #     and not independently tuned — it is the source
+                                  #     value adopted unchanged. (The get_cardiac_params
+                                  #     docstring previously said "[G] no source; tuned";
+                                  #     both descriptions were wrong. Fixed 2026-08-19.)
         'titin_a': 55.0,          # N2B stiffer than N2A; Granzier & Labeit 2004 Circ Res 94:284
         'titin_b': 0.008,         # Powers 2018 cardiac-like stiffness (8 µm⁻¹)
         'titin_rest': 140.0,      # slack at SL 1.85 µm (z_line=925 nm → L≈138 nm)
