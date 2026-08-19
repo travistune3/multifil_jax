@@ -280,13 +280,19 @@ _DYNAMIC_DEFAULTS = {
     # Skeletal defaults are the compliant N2A isoform; get_cardiac_params()
     # overrides them with the stiffer N2B values.
     # titin_a [I]: Powers, Williams, Regnier & Daniel 2018 Integr.Comp.Biol. 58:186
-    #          (260 pN divided by the 6 titins per thick filament = 43 pN each)
-    # titin_b [M]: Powers 2018 psoas calibration (4 µm⁻¹ = 0.004 nm⁻¹)
+    #          (260 pN divided by the 6 titins per thick filament = 43 pN each).
+    #          NB the 260 pN is ARBITRARY in the source, which states plainly:
+    #          "a was arbitrarily fixed at 260 pN". The division is ours and the
+    #          "6 titins per thick filament" divisor is not from that paper either.
+    # titin_b [G]: RETAGGED FROM [M] 2026-08-19, and it is NOT a psoas calibration.
+    #          Powers 2018 SWEPT this parameter: "b was set to 4, 7.5, or 10 µm⁻¹"
+    #          to study the effect of titin stiffness. 4 µm⁻¹ = 0.004 nm⁻¹ is simply
+    #          their most compliant case, paired with the arbitrary a above.
     # titin_rest [I]: slack length at SL 2.0 µm (z_line=1000 nm → L≈213 nm);
     #          Linke 1998 PNAS 95:8052
     # --------------------------------------------------------------------------
-    'titin_a':    43.0,    # [I] pN per molecule
-    'titin_b':    0.004,   # [M] nm⁻¹
+    'titin_a':    43.0,    # [I] pN per molecule (from an arbitrary 260 pN — see above)
+    'titin_b':    0.004,   # [G] nm⁻¹ — a swept value in Powers 2018, not a measurement
     'titin_rest': 215.0,   # [I] nm
 
     # ==========================================================================
@@ -1386,9 +1392,11 @@ def get_lethocerus_params() -> Tuple[StaticParams, DynamicParams]:
     # Tier tags: [M] measured, [I] inferred, [G] guess — see docstring for full
     # sourcing/confidence. Every value is a literature-informed starting point.
     static_overrides = {
-        'actin_geometry': 'invertebrate',           # [M] Reedy 1968 JMB 31:155
-        'thick_crown_spacing': 14.5,                 # [M] nm; Reedy 1968; Hu 2016 SciAdv (145 A)
-        'actin_half_pitch': 38.7,                    # [M] nm; Reedy 1968; Squire 2006 JMB 361:823
+        'actin_geometry': 'invertebrate',           # [M] Reedy 1968 JMB 31:155 (Lethocerus IFM)
+        'thick_crown_spacing': 14.5,                 # [M] nm; Hu 2016 SciAdv (145 A). NOT Reedy:
+                                                     #     "145" appears ZERO times in Reedy 1968
+        'actin_half_pitch': 38.7,                    # [M] nm; Squire 2006 JMB 361:823. NOT Reedy:
+                                                     #     Reedy's repeat is 380 A = 38.0 nm throughout
         'mono_per_poly': 28,                         # [M] 28/13 actin helix; Squire 2006 p.823
         'polymer_base_turns': 13,                    # [M] "  (rise 77.4/28 = 2.76 nm confirms)
         'n_xb_per_crown': 4,                         # [M] 4-fold crown; Hu 2016 SciAdv
@@ -1463,9 +1471,11 @@ def get_drosophila_params() -> Tuple[StaticParams, DynamicParams]:
     # Tier tags [M]/[I]/[G] and full sourcing: see get_lethocerus_params() docstring
     # (geometry is shared; only n_superlattice_classes differs).
     static_overrides = {
-        'actin_geometry': 'invertebrate',           # [M] Reedy 1968 JMB 31:155
-        'thick_crown_spacing': 14.5,                 # [M] nm; Reedy 1968; Hu 2016 SciAdv (145 A)
-        'actin_half_pitch': 38.7,                    # [M] nm; Reedy 1968; Squire 2006 JMB 361:823
+        'actin_geometry': 'invertebrate',           # [M] Reedy 1968 JMB 31:155 (Lethocerus IFM)
+        'thick_crown_spacing': 14.5,                 # [M] nm; Hu 2016 SciAdv (145 A). NOT Reedy:
+                                                     #     "145" appears ZERO times in Reedy 1968
+        'actin_half_pitch': 38.7,                    # [M] nm; Squire 2006 JMB 361:823. NOT Reedy:
+                                                     #     Reedy's repeat is 380 A = 38.0 nm throughout
         'mono_per_poly': 28,                         # [M] 28/13 actin helix; Squire 2006 p.823
         'polymer_base_turns': 13,                    # [M] "  (rise 77.4/28 = 2.76 nm confirms)
         'n_xb_per_crown': 4,                         # [M] 4-fold crown; Hu 2016 SciAdv
