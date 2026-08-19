@@ -291,33 +291,86 @@ _DYNAMIC_DEFAULTS = {
     # more than an order of magnitude, so a value picked from within a cited
     # range is a modelling decision as much as a measurement.
     # ==========================================================================
-    'tm_k_01': 100000.0,   # [M] M⁻¹ms⁻¹ Ca binding; Robertson 1981 (5e7–2e8 M⁻¹s⁻¹)
-    'tm_k_12': 1.0,        # [I] ms⁻¹ blocking→closed; Fraser & Marston 1995,
-                           #     Geeves & Lehrer 1994 give 20–1000 s⁻¹ — a 50-fold
-                           #     range, so 1000 s⁻¹ is a choice within it, not a fit
-    'tm_k_23': 0.1,        # [I] ms⁻¹ closed→open; centre of a reported 50–200 s⁻¹
-    'tm_k_30': 0.2,        # [I] ms⁻¹ cycle close (Ca off); Robertson 1981 (100–500 s⁻¹).
+    'tm_k_01': 100000.0,   # [L-compilation] M⁻¹ms⁻¹ = 1e8 M⁻¹s⁻¹. Robertson, Johnson
+                           #     & Potter 1981 Biophys J 34:559, Table I: skeletal Tn
+                           #     Ca-specific sites k_on = 1.15e8 M⁻¹s⁻¹. Model is within
+                           #     13% of that. NOTE the previously quoted "5e7–2e8" range
+                           #     is NOT in the paper — deleted 2026-08-19. Robertson is a
+                           #     COMPILATION (a computer-modelling paper citing others),
+                           #     and states no temperature and no ionic strength.
+    'tm_k_12': 1.0,        # [G] ms⁻¹ blocking→closed. NO SOURCE EXISTS. Audit 2026-08-19:
+                           #     Geeves & Lehrer 1994 contains no "20–1000 s⁻¹" range (its
+                           #     only rate statement is a ONE-SIDED bound, k+T + k-T >> 500
+                           #     s⁻¹, and it applies to the closed↔open step = our 2↔3, not
+                           #     this one). Fraser & Marston 1995 contains ZERO rate
+                           #     constants — it is a steady-state motility paper (its result
+                           #     is pCa50 5.8–6.0 and all-or-none switching). Both citations
+                           #     removed. The EQUILIBRIUM is constrained: McKillop & Geeves
+                           #     1993 K_B = [closed]/[blocked] = 0.3 (−Ca), ≥16 (+Ca) —
+                           #     see tm_Keq_12.
+    'tm_k_23': 0.1,        # [G] ms⁻¹ closed→open. The "50–200 s⁻¹" previously noted here
+                           #     had no citation at all. The one real constraint is
+                           #     Geeves & Lehrer 1994 Biophys J 67:273 p.277: the switch is
+                           #     in RAPID EQUILIBRIUM, k+T + k-T >> 500 s⁻¹ — a one-sided
+                           #     bound on the SUM only. Model: 100 + k_32 1000 = 1100 s⁻¹,
+                           #     which satisfies it. Only the sum and the ratio (tm_Keq_23)
+                           #     are constrained, so both rates may be scaled together.
+                           #     (rabbit skeletal, reconstituted Tm·Tn·actin + S1, 20 °C)
+    'tm_k_30': 0.2,        # [G] ms⁻¹ cycle close (Ca off). The cited "Robertson 1981
+                           #     (100–500 s⁻¹)" is NOT in that paper: no k_off in its
+                           #     Table I lies in 100–500. Skeletal Tn Ca-specific k_off is
+                           #     23.0 s⁻¹; the only 100–500 entry is 238 s⁻¹, which belongs
+                           #     to CALMODULIN, a different protein. Model is 8.7× the cited
+                           #     skeletal value. What IS measured for this physical quantity
+                           #     (Ca off-rate from an assembled filament): Davis 2007 ssTn
+                           #     7.8 s⁻¹ isolated, 85 s⁻¹ in thin filament (15 °C).
+                           #     NB the cardiac preset uses 40 s⁻¹, so the two presets are
+                           #     INVERTED relative to Davis, who measures cardiac Ca release
+                           #     as FASTER than skeletal in every matched condition.
                            #     Dominates relaxation kinetics — see rate_functions.tm_rate_30
 
     # Equilibrium constants. These set every reverse rate (k_reverse = k_forward / Keq).
     'tm_Keq_01': 500000.0,     # [G] M⁻¹, i.e. Kd 2 µM for the regulatory site.
-                               #     Potter & Gergely 1975 JBC 250:4628 measure the
-                               #     Ca-specific sites of isolated skeletal troponin at
-                               #     5×10⁶ M⁻¹ (Kd 0.2 µM), and the high-affinity Ca/Mg
-                               #     sites at 5×10⁸ M⁻¹ falling to 2×10⁶ M⁻¹ under Mg²⁺
-                               #     competition. This value is ~10× weaker than the
-                               #     isolated-protein figure, on the reasoning that
-                               #     regulatory-site affinity is lower in an intact thin
-                               #     filament — plausible but not sourced here, so [G].
+                               #     Potter & Gergely 1975 JBC 250:4628 SUMMARY: whole
+                               #     troponin binds "two sites ... 5 × 10⁸ M⁻¹, and two ...
+                               #     5 × 10⁶ M⁻¹", the latter being the Ca-specific
+                               #     (regulatory) sites (Kd 0.2 µM); under 2 mM MgCl₂ all
+                               #     four sites go to a single 5 × 10⁶ M⁻¹. (CORRECTION
+                               #     2026-08-19: the 2×10⁶ figure previously quoted here is
+                               #     isolated TnC, not Tn — the two were conflated.)
+                               #     Conditions: rabbit skeletal, isolated protein, 100 mM
+                               #     KCl, imidazole pH 7.0; TEMPERATURE NOT STATED.
+                               #     This value is ~10× weaker than the isolated-protein
+                               #     figure, on the reasoning that regulatory-site affinity
+                               #     is lower in an intact thin filament — that DIRECTION is
+                               #     now confirmed measured (Pinto 2011 Table 1: cTn pCa50
+                               #     6.69 → thin filament 6.13, a 3.6× affinity loss), but
+                               #     the 10× magnitude remains a choice, so still [G].
                                #     Note the model's Ca sensitivity is dominated by the
                                #     SRX gate, not by this constant: a 5× change moves
                                #     force pCa50 by ~0.02 units
-    'tm_Keq_12': 130.0,        # [G] dimensionless; no source located. Strongly favours
-                               #     the closed state once Ca is bound, which is
-                               #     qualitatively right, but the magnitude is a choice
-    'tm_Keq_23': 0.1,          # [M] dimensionless; McKillop & Geeves 1993 Biophys J
-                               #     65:693 report K_T = 0.09 without Ca²⁺. <1 means
-                               #     closed is favoured at rest, as it should be
+    'tm_Keq_12': 130.0,        # [G] dimensionless. A SOURCE DOES EXIST (found 2026-08-19;
+                               #     the old "no source located" note was wrong): McKillop &
+                               #     Geeves 1993 Biophys J 65:693 abstract gives
+                               #     K_B = [closed]/[blocked] = 0.3 without Ca²⁺ and ≥16
+                               #     with Ca²⁺ — this model's 1↔2 step. Their K_B is
+                               #     Ca-DEPENDENT; ours is not, because this scheme puts all
+                               #     Ca-dependence in 0→1. So 130 is not directly comparable
+                               #     to 0.3 or 16, and the magnitude remains a choice: [G].
+    'tm_Keq_23': 0.1,          # [L] dimensionless; McKillop & Geeves 1993 Biophys J
+                               #     65:693, abstract: "K_T = [open]/[closed] = 0.09 and
+                               #     0.25 in the absence and presence of calcium,
+                               #     respectively." VERIFIED verbatim 2026-08-19 — the one
+                               #     thin-filament claim that checks out cleanly. <1 means
+                               #     closed is favoured at rest, as it should be.
+                               #     Conditions: rabbit skeletal S1 + reconstituted
+                               #     actin·Tm·Tn, 140 mM KCl, 5 mM MgCl₂, MOPS pH 7.0, 20 °C.
+                               #     TWO CAVEATS: (a) their K_T is Ca-dependent, ours is
+                               #     fixed; (b) their Table 1 spans K_T = 0.013–0.60 across
+                               #     nucleotide conditions (no-nucleotide 0.013, Pi 0.18,
+                               #     ADP 0.12, sulfate 0.07 at −Ca), so a single fixed 0.1 is
+                               #     a mid-range pick from a 46-fold spread, and a
+                               #     contracting muscle is not the no-nucleotide condition.
 
     # ------------------------------------------------------------------------
     # SYMMETRIC ISING COOPERATIVITY — the tropomyosin cooperativity model.
@@ -928,9 +981,20 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams]:
 
     Overrides applied to the skeletal baseline:
         tm_k_12  = 0.5 ms⁻¹      — [G] unsourced; the Lehrer & Morris 1982 attribution does not hold (see dict)
-        tm_k_01  = 80000 M⁻¹ms⁻¹ — Robertson 1981: 4–8×10⁷ M⁻¹s⁻¹
-        tm_Keq_01    = 750000 M⁻¹    — Cardiac TnC Kd ~1.3 µM; Pinto 2011 JBC 286:1005 (1–2 µM)
-        tm_k_30  = 0.04 ms⁻¹     — Cardiac Ca²⁺ off-rate ~40 s⁻¹; Davis 2007 Biophys J 92:3195
+        tm_k_01  = 80000 M⁻¹ms⁻¹ — [L] = 8e7. Robertson 1981 Table I gives 3.9e7 for the
+                                   cardiac Ca-specific site, so this is 2.05× that; the
+                                   "4–8×10⁷" range was never published. Better source:
+                                   Pinto 2011 Table 1, human cTn k_on = 0.94e8 M⁻¹s⁻¹ at 21 °C.
+        tm_Keq_01    = 750000 M⁻¹    — [G] Kd 1.33 µM. Pinto 2011 JBC 286:1005 Table 1 (WT)
+                                   gives pCa50 6.69 for cTn (Kd 0.20 µM) and 6.13 in the
+                                   thin filament (Kd 0.74 µM). NO condition yields 1–2 µM;
+                                   that range is withdrawn (audit 2026-08-19).
+        tm_k_30  = 0.04 ms⁻¹     — [L] Cardiac Ca²⁺ off-rate. Davis 2007 Biophys J 92:3195
+                                   Table 1 VERIFIES 42.5 ± 0.3 s⁻¹ — but that is the
+                                   ISOLATED cTn row. In a reconstituted thin filament it is
+                                   105 s⁻¹, and with S1+ATP 110 s⁻¹ (Pinto: 95.8 / 139.1).
+                                   State 3 is an assembled, myosin-accessible site, so the
+                                   model is ~2.6× slow for the preparation it represents.
         xb_r12_coeff = 0.175 ms⁻¹ — Process B 3–4× slower (2πb ~ 5–15 s⁻¹);
                                      Kawai et al. 1993 Circ Res 73:35
         xb_r23_coeff = 0.065 ms⁻¹ — Lever arm rate ~2× slower (cardiac beta-MHC);
@@ -958,15 +1022,25 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams]:
     """
     cardiac_overrides = {
         'tm_k_12': 0.5,           # [G] ms⁻¹ blocking→closed, half the skeletal value.
+                                  #     NB the SKELETAL value it is half of is itself
+                                  #     unsourced (audit 2026-08-19), so this is a fraction
+                                  #     of a guess. Lehrer & Morris 1982 re-checked: the PDF
+                                  #     contains the word "cardiac" ZERO times.
                                   #   No cardiac-specific measurement of this transition
                                   #   has been located; the halving encodes the general
                                   #   expectation that cardiac thin-filament transitions
                                   #   are slower. Geeves & Lehrer 1994 Biophys J 67:273
                                   #   bound this class of transition at 20–1000 s⁻¹, wide
                                   #   enough that any value inside it is a choice
-        'tm_k_01': 80000.0,       # Robertson 1981: 4–8×10⁷ M⁻¹s⁻¹
-        'tm_Keq_01': 750000.0,        # Cardiac TnC Kd ~1.3 µM; Pinto 2011 JBC 286:1005
-        'tm_k_30': 0.04,          # Cardiac Ca²⁺ off-rate ~40 s⁻¹; Davis 2007 Biophys J 92:3195
+        'tm_k_01': 80000.0,       # [L] Robertson 1981 Table I cardiac = 3.9e7 (this is 2.05×);
+                                  #     "4–8×10⁷" not published. Pinto 2011 human cTn
+                                  #     k_on = 0.94e8 M⁻¹s⁻¹ (21 °C) supports 8e7 far better.
+        'tm_Keq_01': 750000.0,        # [G] Kd 1.33 µM. Pinto 2011 JBC 286:1005 Table 1 gives
+                                  #     Kd 0.20 µM (cTn) / 0.74 µM (thin filament); the
+                                  #     "1–2 µM" attribution is withdrawn.
+        'tm_k_30': 0.04,          # [L] 40 s⁻¹. Davis 2007 Biophys J 92:3195 Table 1 = 42.5 s⁻¹
+                                  #     for ISOLATED cTn (15 °C). In-filament is 105 s⁻¹,
+                                  #     +S1+ATP 110 s⁻¹ — the row that matches state 3.
         'xb_r12_coeff': 0.175,    # Process B 3–4× slower; Kawai et al. 1993 Circ Res 73:35
         'xb_r23_coeff': 0.065,    # Lever arm ~2× slower; Deacon et al. 2012 Cell Mol Life Sci 69:2261
         'xb_r34_coeff': 0.065,    # ADP release ~65 s⁻¹; Siemankowski & White 1984 JBC
@@ -1028,9 +1102,9 @@ def get_lethocerus_params() -> Tuple[StaticParams, DynamicParams]:
         polymer_base_turns   = 13                   axial repeat 2.76nm); Squire 2006
             p.823 (77.4/28 = 2.764nm confirms the pairing).
         n_xb_per_crown       = 4               — [M] IFM 4-fold (32/3) crown symmetry;
-            Wendt & Leonard 2016 Sci Adv (cryo-EM 6 A); Hu et al. 2016 (fourfold).
+            Hu et al. 2016 Sci Adv 2:e1600058 (cryo-EM 6 A; fourfold symmetry imposed).
         crown_rotation_deg   = 33.75            — [I] azimuthal step = 3x360/32 from the
-            32/3 helix (Wendt & Leonard 2016); matches Hu et al. 2016's directly
+            32/3 helix; matches Hu et al. 2016's directly
             MEASURED 33.98 deg/crown.
         target_zone_wiggle   = 26 deg          — [I] chosen so the model reproduces
             a measured binding COUNT rather than a measured angle; see below.
@@ -1189,7 +1263,7 @@ def get_lethocerus_params() -> Tuple[StaticParams, DynamicParams]:
         'actin_half_pitch': 38.7,                    # [M] nm; Reedy 1968; Squire 2006 JMB 361:823
         'mono_per_poly': 28,                         # [M] 28/13 actin helix; Squire 2006 p.823
         'polymer_base_turns': 13,                    # [M] "  (rise 77.4/28 = 2.76 nm confirms)
-        'n_xb_per_crown': 4,                         # [M] 4-fold crown; Wendt & Leonard 2016; Hu 2016
+        'n_xb_per_crown': 4,                         # [M] 4-fold crown; Hu 2016 SciAdv
         'crown_rotation_deg': 33.75,                 # [I] 3x360/32 from 32/3 helix; Hu 2016 meas. 33.98
         'target_zone_wiggle': float(np.radians(26.0)),  # [I] set to Reedy 1998/2004 2-monomer target
         'n_crowns': 100,                             # [I] 3.04um Droso thick filament (Contompasis 2010) /2 /14.5; [G] for Leth
@@ -1266,7 +1340,7 @@ def get_drosophila_params() -> Tuple[StaticParams, DynamicParams]:
         'actin_half_pitch': 38.7,                    # [M] nm; Reedy 1968; Squire 2006 JMB 361:823
         'mono_per_poly': 28,                         # [M] 28/13 actin helix; Squire 2006 p.823
         'polymer_base_turns': 13,                    # [M] "  (rise 77.4/28 = 2.76 nm confirms)
-        'n_xb_per_crown': 4,                         # [M] 4-fold crown; Wendt & Leonard 2016; Hu 2016
+        'n_xb_per_crown': 4,                         # [M] 4-fold crown; Hu 2016 SciAdv
         'crown_rotation_deg': 33.75,                 # [I] 3x360/32 from 32/3 helix; Hu 2016 meas. 33.98
         'target_zone_wiggle': float(np.radians(26.0)),  # [I] set to Reedy 1998/2004 2-monomer target
         'n_crowns': 100,                             # [I] 3.04um Droso thick filament (Contompasis 2010) /2 /14.5

@@ -215,10 +215,16 @@ def tm_rate_12(k_12_base, mod):
 
     Args:
         k_12_base: Rate constant (ms^-1) - params.tm_k_12.
-                   1.0 skeletal / 0.5 cardiac; Fraser & Marston 1995;
-                   Geeves & Lehrer 1994 report 20-1000 s^-1 for this class of
-                   transition, a range wide enough that the choice within it is
-                   effectively a modelling decision.
+                   1.0 skeletal / 0.5 cardiac. NO MEASURED RATE SOURCE EXISTS for
+                   this step (audit 2026-08-19). The former citation to Geeves &
+                   Lehrer 1994 for "20-1000 s^-1" was withdrawn: that range is not
+                   in the paper, and the one rate statement it does make
+                   (k+T + k-T >> 500 s^-1) is a ONE-SIDED bound on the closed<->open
+                   step, i.e. tm_rate_23, not this one. Fraser & Marston 1995 was
+                   also withdrawn: it contains no rate constants at all (it is a
+                   steady-state motility paper). The EQUILIBRIUM is constrained --
+                   McKillop & Geeves 1993 K_B = [closed]/[blocked] = 0.3 without
+                   Ca2+ and >=16 with Ca2+ -- see params.tm_Keq_12.
         mod: Cooperativity multiplier, exp(+h/2) on the Ising path (1.0 = none)
 
     Returns:
@@ -248,6 +254,14 @@ def tm_rate_23(k_23_base, mod):
 
     The step that actually gates myosin. Sites in state 3 are the only ones a
     crossbridge can attach to (see xb_rate_01's permissiveness argument).
+
+    This is the transition Geeves & Lehrer 1994 (Biophys J 67:273 p.277) actually
+    measured. They report only that the switch is in RAPID EQUILIBRIUM:
+    k+T + k-T >> 500 s^-1, a one-sided bound on the SUM of this rate and its
+    reverse. The model's pair (100 + 1000 = 1100 s^-1) satisfies it. Because only
+    the sum and the ratio (tm_Keq_23) are constrained, both rates may be scaled
+    together without contradicting anything measured -- a genuine free direction.
+    Conditions: rabbit skeletal, reconstituted Tm.Tn.actin + S1, pH 7.0, 20 C.
 
     Args:
         k_23_base: Rate constant (ms^-1) - params.tm_k_23
@@ -291,6 +305,14 @@ def tm_rate_30(k_30_base):
     Consequences worth being aware of:
       - Relaxation kinetics are governed largely by this rate, not by the
         forward path. For cardiac muscle it is the slowest TM step.
+      - No experiment measures a "3->0" transition; this step is a modelling
+        device collapsing "Ca2+ leaves" and "Tm re-blocks" into one irreversible
+        event. The measurable proxy is the Ca2+ off-rate from an ASSEMBLED thin
+        filament: Davis 2007 gives 105 s^-1 cardiac / 85 s^-1 skeletal in
+        filament (vs 42.5 / 7.8 s^-1 for isolated troponin), Pinto 2011 gives
+        95.8 s^-1 cardiac. Both presets currently sit outside that band -- cardiac
+        low (40 s^-1, the isolated-protein value), skeletal high (200 s^-1,
+        unsourced) -- and in the OPPOSITE isoform order to the measurements.
       - Because it is one-way, this step is where the TM cycle stops obeying
         detailed balance. That is deliberate, but it means cooperativity must
         NOT be applied here: boosting the cycle-closing step along with the
