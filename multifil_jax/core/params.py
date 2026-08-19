@@ -543,8 +543,18 @@ _DYNAMIC_DEFAULTS = {
     #
     # The reference set is Howard 2001, Mechanics of Motor Proteins and the
     # Cytoskeleton (Sinauer), Table 14.2 "Actin-myosin hydrolysis cycle (rabbit
-    # skeletal muscle)", p. 235, which gives state free energies in kT at
-    # [ATP] = 2 mM, [Pi] = 2 mM, [ADP] = 20 µM:
+    # skeletal muscle)", p. 235. VERIFIED CELL BY CELL 2026-08-19 by reading the
+    # page as an image (the PDF's OCR text layer corrupts digits and units and
+    # must NOT be quoted; see .claude/papers/TEXT_LAYER_REPLACEMENTS.md).
+    # All ten energies below are transcribed correctly.
+    # CORRECTION: the table's note says [ATP] = 4 mM, not 2 mM as previously
+    # stated here. Verbatim: "In parentheses are the approximate free energies of
+    # the states assuming [ATP] = 4 mM, [P_i] = 2 mM, [ADP] = 20 uM."
+    # CONDITIONS (same note): rabbit skeletal, 20 C, "isolated S1 and/or
+    # myofibrils under roughly physiological ionic strength", overall ATPase
+    # k_cat = 25 s^-1. Howard's own caveat: "The values vary by up to a factor of
+    # 10 between laboratories."
+    # State free energies in kT at [ATP] = 4 mM, [Pi] = 2 mM, [ADP] = 20 µM:
     #
     #   attached   A.M.T (+8)   A.M.D.P (0)   A.M.D (-12)   A.M (-15)   A.M.T (-17)
     #   detached   M.T (0)      M.D.P (-2)    M.D (-8)      M (-6)      M.T (-25)
@@ -1054,8 +1064,23 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams]:
                                    105 s⁻¹, and with S1+ATP 110 s⁻¹ (Pinto: 95.8 / 139.1).
                                    State 3 is an assembled, myosin-accessible site, so the
                                    model is ~2.6× slow for the preparation it represents.
-        xb_r12_coeff = 0.175 ms⁻¹ — Process B 3–4× slower (2πb ~ 5–15 s⁻¹);
-                                     Kawai et al. 1993 Circ Res 73:35
+        xb_r12_coeff = 0.175 ms⁻¹ — [L] Kawai et al. 1993 Circ Res 73:35 (ferret
+                                     myocardium, V3/beta2 isoform, pCa 4.82, 200 mM
+                                     ionic strength, 20 C — SAME conditions as the
+                                     skeletal companion, so the preset ratio is not a
+                                     temperature artifact). Read as page images
+                                     2026-08-19; the PDF has no text layer.
+                                     "2πb ~ 5–15 s⁻¹" VERIFIES: f_min "around 1 to 2 Hz"
+                                     and "f_min approximates the characteristic
+                                     frequency b" (p.39) gives 2πb = 6.3–12.6 s⁻¹.
+                                     BUT "3–4× slower" does NOT match the paper, which
+                                     says the rate constants are "generally an order of
+                                     magnitude smaller in myocardium than in psoas";
+                                     its k2 = 48 s⁻¹ vs the skeletal companion's
+                                     510 ± 30 s⁻¹ is 10.6×. This preset uses 3.4×
+                                     (175/600). Either the skeletal 20–60 s⁻¹ range is
+                                     too low (it was never located in its source) or
+                                     this value is ~3× too fast. NOT resolved here.
         xb_r23_coeff = 0.065 ms⁻¹ — [L-unverified] "lever arm rate ~2× slower".
                                      Deacon 2012 (recombinant human α-/β-S1, 20 °C) does
                                      report ~2× α/β differences and says the isoforms
