@@ -1139,7 +1139,8 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams]:
                                    that paper marks "Assumed". Not tuned here — see dict.
         titin_a  = 55.0 pN        — [I] N2B isoform, stiffer than skeletal N2A;
                                    Granzier & Labeit 2004 Circ Res 94:284
-        titin_b  = 0.008 nm⁻¹    — [I] Powers 2018 cardiac-like stiffness (8 µm⁻¹)
+        titin_b  = 0.008 nm⁻¹    — [G] 8 µm⁻¹ is NOT one of Powers 2018's values
+                                   (they swept 4, 7.5, 10 µm⁻¹). Interpolated, unsourced.
         titin_rest = 140.0 nm     — [I] slack at SL 1.85 µm (z_line=925 → L≈138 nm);
                                    Linke 1998 PNAS 95:8052
 
@@ -1184,7 +1185,9 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams]:
                                   #     docstring previously said "[G] no source; tuned";
                                   #     both descriptions were wrong. Fixed 2026-08-19.)
         'titin_a': 55.0,          # N2B stiffer than N2A; Granzier & Labeit 2004 Circ Res 94:284
-        'titin_b': 0.008,         # Powers 2018 cardiac-like stiffness (8 µm⁻¹)
+        'titin_b': 0.008,         # [G] 8 µm⁻¹. NOT a Powers 2018 value: that paper
+                                  #     swept b = 4, 7.5 and 10 µm⁻¹ only (audit
+                                  #     2026-08-19). 8 is interpolated, not sourced.
         'titin_rest': 140.0,      # slack at SL 1.85 µm (z_line=925 nm → L≈138 nm)
     }
     return StaticParams(), DynamicParams(**cardiac_overrides)
@@ -1247,7 +1250,10 @@ def get_lethocerus_params() -> Tuple[StaticParams, DynamicParams]:
             a measured binding COUNT rather than a measured angle; see below.
         n_polymers_per_thin  = 20              — [I] ~1.55 um thin filament
             (20 x 77.4 nm repeat); see filament lengths below.
-        n_crowns             = 100             — [I] ~1.5 um half thick filament;
+        n_crowns             = 100             — [I] ~1.5 um half thick filament. NB the
+            3.04 um it derives from is Contompasis 2010's NEWLY ECLOSED (<1 h) wild-type
+            filament; their MATURE 3-5 day wild type is 3.20 +/- 0.04 um, which would give
+            ~110 crowns (audit 2026-08-19).;
             see filament lengths below. Coupled to n_polymers_per_thin and to the
             z_line you run at — this is what gates the overlap zone.
         thick_bare_zone: NOT overridden — kept at the 58 nm vertebrate value. [G]
@@ -1260,10 +1266,18 @@ def get_lethocerus_params() -> Tuple[StaticParams, DynamicParams]:
             calibration exists. Note this is a different acceptance window from
             target_zone_wiggle — see the StaticParams field documentation.
 
-    HOW target_zone_wiggle = 26 deg WAS SET. Reedy et al. (Biophys J 1998, 2004)
-    report that ~98% of insect flight muscle crossbridge attachments fall on
-    exactly 2 actin monomers per 38.7 nm long-pitch repeat, midway between
-    successive troponin complexes. That is a count, not an angle, so the angle was
+    HOW target_zone_wiggle = 26 deg WAS SET. Reedy et al. 2004 (Biophys J 86:3009)
+    state that myosin binding in active IFM "is mostly restricted to smaller target
+    zones of two to three actin monomers along each strand, halfway between
+    successive troponin complexes in each 38.7-nm helical repeat".
+    CORRECTION 2026-08-19: this previously read "~98% ... exactly 2 actin monomers".
+    Neither figure is in either paper -- "98%" appears in neither, and the count is
+    "two to three", not exactly two. (Reedy 1998's own numbers are different
+    quantities: 7-23% of heads attach stereoselectively, and lead-bridge target
+    zones comprise ~1/3 of the 75-80% that attach in rigor.) The consequence for
+    the plateau argument below: a window landing on 3.0 monomers would also be
+    consistent with the literature, so 26 deg is one defensible choice, not the
+    only one. That is a count, not an angle, so the angle was
     solved for: sweeping the window and counting the sites the model actually
     generates gives exactly 1.0 monomer per face per repeat at the vertebrate
     15 deg (too few), and a flat plateau at exactly 2.0 for any window between
@@ -1338,12 +1352,18 @@ def get_lethocerus_params() -> Tuple[StaticParams, DynamicParams]:
 
     NO PUBLISHED WORK FITS KETTIN OR PROJECTIN TO A SINGLE-EXPONENTIAL SPRING,
     so all three values are estimates for an underdetermined model:
-      - titin_rest = 50.0 nm. [M] Best supported of the three. Kettin's
+      - titin_rest = 50.0 nm. [L-unverified] Formerly [M] and called "best
+        supported"; see the retag note below. Kettin's
         N-terminus is embedded in the Z-disc while its C-terminus reaches the end
         of the A-band, because the insect I-band is only ~50 nm long;
-        van Straaten et al. 1999 J Mol Biol 285:1549. Cross-checks to the same
+        van Straaten et al. 1999 J Mol Biol 285:1549. RETAG [M] -> [L-unverified]
+        2026-08-19: "I-band" appears only 4 times in that paper and never with a
+        length. Its stated dimensions are different quantities -- kettin is 180 nm
+        long, the Z-disc is 110 nm (Lethocerus) / 80 nm (Drosophila), kettin extends
+        83/60 nm beyond it and spans 93 nm of the thin filament. The 50 nm may still
+        be right; it is not supported by a quote from this source. Cross-checks to the same
         order of magnitude (~40-46 nm) against the passive-tension elastic limit
-        in Granzier & Wang 1993 J Gen Physiol 101:235.
+        in Granzier & Wang 1993 Biophys J 65:2141 (NOT J Gen Physiol 101:235 as previously cited).
       - titin_b = 0.025 nm^-1, plausible range 0.02-0.03. [I] Derived, not
         measured, by two independent routes that happen to agree: proportional
         scaling from the cardiac titin_b/titin_rest ratio, and an elastic-limit
@@ -1413,7 +1433,8 @@ def get_lethocerus_params() -> Tuple[StaticParams, DynamicParams]:
     dynamic_overrides = {
         'titin_a': 40.0,      # [G] pN; weakest — back-of-envelope, Linari 2004; see docstring
         'titin_b': 0.025,     # [I] nm^-1; derived (2 converging chains), Kulke 2001; see docstring
-        'titin_rest': 50.0,   # [M] nm; IFM I-band length, van Straaten 1999; see docstring
+        'titin_rest': 50.0,   # [L-unverified] nm; IFM I-band length, van Straaten 1999
+                              #     -- number NOT located in that paper; see docstring
     }
     return StaticParams(**static_overrides), DynamicParams(**dynamic_overrides)
 
@@ -1493,7 +1514,7 @@ def get_drosophila_params() -> Tuple[StaticParams, DynamicParams]:
     dynamic_overrides = {
         'titin_a': 40.0,      # [G] pN; see get_lethocerus_params() docstring
         'titin_b': 0.025,     # [I] nm^-1; see get_lethocerus_params() docstring
-        'titin_rest': 50.0,   # [M] nm; see get_lethocerus_params() docstring
+        'titin_rest': 50.0,   # [L-unverified] nm; see get_lethocerus_params() docstring
     }
     return StaticParams(**static_overrides), DynamicParams(**dynamic_overrides)
 
