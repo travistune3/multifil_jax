@@ -601,11 +601,14 @@ _DYNAMIC_DEFAULTS = {
     #                    they bracket -10.7.
     #                    WITHDRAWN 2026-08-19: the "-8 to -13 kT range of Månsson
     #                    2016 JMRCM 37:181 and Offer & Ranatunga 2013" has NO
-    #                    verified source. Månsson 2016 is not in .claude/papers/
-    #                    (and never reached GAPS.md), so it cannot be cited for a
-    #                    number at all. Offer & Ranatunga 2013 IS on disk and
-    #                    contains no kT/RT free-energy values; its locator was also
-    #                    wrong (105:928-940, not 105:1767).
+    #                    source. BOTH papers are now on disk and BOTH were checked:
+    #                    Månsson 2016 (JMRCM 37:181-194, locator correct) contains
+    #                    only three kT values -- 18 kBT for the MT-vs-AM free-energy
+    #                    minima difference, and 18/7 kBT as an NEM-HMM binding
+    #                    energy in a figure legend -- and gives NO Pi-release free
+    #                    energy at all. Offer & Ranatunga 2013 contains no kT/RT
+    #                    values whatsoever (and its locator was wrong: 105:928-940,
+    #                    not 105:1767).
     #   cycle total     -23 RT in Pate & Cooke, -25 kT in Howard.
     #
     # KNOWN IMBALANCE: the return path (tight_2 -> free_2 -> DRX) is only ~-2.3 kT
@@ -1288,7 +1291,9 @@ def get_lethocerus_params() -> Tuple[StaticParams, DynamicParams]:
         = 2 x (58 + 99 x 14.5) = ~2.99 um
       - [M] Adult Drosophila IFM thick filament measures 3.04 +/- 0.05 um;
         Contompasis, Nyland, Maughan & Vigoreaux 2010 J Mol Biol 395:340
-        (PMID 19917296). It grows from ~1.6 um in the early pupa in regulated
+        (Contompasis, Nyland, Maughan & Vigoreaux 2010 J Mol Biol 395:340-348,
+        PMID 19917296 -- bare-PMID citation resolved 2026-08-19). It grows from
+        ~1.6 um in the early pupa in regulated
         unison with the thin filament.
       - [I] n_crowns = (3040/2 - 58)/14.5 + 1 ~= 101, rounded to 100. Finer
         precision is unwarranted while thick_bare_zone is itself a guess.
