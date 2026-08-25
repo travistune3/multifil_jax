@@ -77,7 +77,7 @@ essentially absent in fast skeletal myosin (Gollub, Cremo & Cooke 1996 Nat
 Struct Biol 3:796). Its structural role is argued to be strain sensing rather
 than force generation, and in this model it appears only as the Bell distance
 of the detachment step (xb_delta_34), not as a displacement. Note the dissenting
-view: Offer & Ranatunga 2013 (Biophys J 105:1767) require TWO tension-generating
+view: Offer & Ranatunga 2013 (Biophys J 105:928-940) require TWO tension-generating
 steps of 5.6 and 4.6 nm and reject single-step models on efficiency and on
 lengthening force-velocity.
 
@@ -154,6 +154,107 @@ simply has no such argument.
 
 Naming: ``tm_rate_XY`` / ``xb_rate_XY`` is the rate for state X -> state Y, with
 state indices as listed above.
+
+
+REFERENCES
+----------
+Every paper cited anywhere in this module, with its title and (where the paper
+prints one) its DOI, so any claim here can be checked without access to anything
+outside this repository.
+
+Bell GI (1978), "Models for the specific adhesion of cells to cells", Science
+    200:618-627.
+Capitanio M, Canepari M, Cacciafesta P, Lombardi V, Cicchi R, Maffei M, Pavone
+    FS, Bottinelli R (2006), "Two independent mechanical events in the
+    interaction cycle of skeletal muscle myosin with actin", PNAS 103:87-92.
+Caremani M, Pinzauti F, Powers JD, Governali S, Narayanan T, Stienen GJM,
+    Reconditi M, Linari M, Lombardi V, Piazzesi G (2019), "Inotropic
+    interventions do not change the resting state of myosin motors during
+    cardiac diastole", J Gen Physiol 151:53-65, doi:10.1085/jgp.201812196.
+Caremani M et al. (2025), "Multiple pathways in the actin-myosin cycle of
+    energy transduction", Front Physiol 16, doi:10.3389/fphys.2025.1664568.
+Davis JP, Norman C, Kobayashi T, Solaro RJ, Swartz DR, Tikunova SB (2007),
+    "Effects of thin and thick filament proteins on calcium binding and
+    exchange with cardiac troponin C", Biophys J 92:3195-3206,
+    doi:10.1529/biophysj.106.095406.
+Debold EP (2021), "Recent insights into the relative timing of myosin's
+    powerstroke and release of phosphate", Cytoskeleton 78:448-458,
+    doi:10.1002/cm.21695.
+Doran MH et al. (2023), "Conformational changes linked to ADP release from
+    human cardiac myosin bound to actin-tropomyosin", J Gen Physiol
+    155:e202213267, doi:10.1085/jgp.202213267.
+Eakins CG, Reconditi M, Morris EP, Squire JM (2016), "X-ray diffraction
+    evidence for low force actin-attached and rigor-like cross-bridges in the
+    contractile cycle", Biology 5:41, doi:10.3390/biology5040041.
+Fraser IDC, Marston SB (1995), "In vitro motility analysis of actin-tropomyosin
+    regulation by troponin and calcium", J Biol Chem 270:7836-7841.
+Fusi L, Brunello E, Yan Z, Irving M (2016), "Thick filament mechano-sensing is
+    a calcium-independent regulatory mechanism in skeletal muscle", Nat Commun
+    7:13281, doi:10.1038/ncomms13281.
+Geeves MA, Lehrer SS (1994), "Dynamics of the muscle thin filament regulatory
+    switch: the size of the cooperative unit", Biophys J 67:273-282.
+Gollub J, Cremo CR, Cooke R (1996), "ADP release produces a rotation of the
+    neck region of smooth myosin but not skeletal myosin", Nat Struct Biol
+    3:796-802.
+Kawai M, Zhao Y (1993), "Cross-bridge scheme and force per cross-bridge state
+    in skinned rabbit psoas muscle fibers", Biophys J 65:638-651.
+Knupp C, Squire JM (2020), "The transient mechanics of muscle require only a
+    single force-producing cross-bridge state and a 100 Angstrom working
+    stroke", Biology 9:475, doi:10.3390/biology9120475.
+Lehrer SS, Morris EP (1982), "Dual effects of tropomyosin and troponin-
+    tropomyosin on actomyosin subfragment 1 ATPase", J Biol Chem 257:8073-8080.
+McKillop DFA, Geeves MA (1993), "Regulation of the interaction between actin
+    and myosin subfragment 1: evidence for three states of the thin filament",
+    Biophys J 65:693-701.
+Mijailovich SM, Prodanovic M, Poggesi C, Geeves MA, Regnier M (2021),
+    "Multiscale modeling of twitch contractions in cardiac trabeculae", J Gen
+    Physiol 153:e202012604, doi:10.1085/jgp.202012604.
+Millar NC, Homsher E (1990), "The effect of phosphate and calcium on force
+    generation in glycerinated rabbit skeletal muscle fibers", J Biol Chem
+    265:20234-20240.
+Offer G, Ranatunga KW (2013), "A cross-bridge cycle with two tension-generating
+    steps simulates skeletal muscle mechanics", Biophys J 105:928-940,
+    doi:10.1016/j.bpj.2013.07.009.
+Park-Holohan S-J et al. (2021), "Stress-dependent activation of myosin in the
+    heart requires thin filament activation and thick filament mechanosensing",
+    PNAS 118:e2023706118, doi:10.1073/pnas.2023706118.
+Pate E, Cooke R (1989), "A model of crossbridge action: the effects of ATP, ADP
+    and Pi", J Muscle Res Cell Motil 10:181-196.
+Piazzesi G et al. (2007), "Skeletal muscle performance determined by modulation
+    of number of myosin motors rather than motor force or stroke size", Cell
+    131:784-795, doi:10.1016/j.cell.2007.09.045.
+Pinto JR et al. (2011), "Strong cross-bridges potentiate the Ca2+ affinity
+    changes produced by hypertrophic cardiomyopathy cardiac troponin C mutants
+    in myofilaments", J Biol Chem 286:1005-1013, doi:10.1074/jbc.M110.168583.
+Prodanovic M, Irving TC, Mijailovich SM (2019), "Estimation of forces on actin
+    filaments in living muscle from X-ray diffraction patterns and mechanical
+    data", Int J Mol Sci 20:6044, doi:10.3390/ijms20236044.
+Reconditi M, Brunello E, Fusi L, Linari M, Piazzesi G, Lombardi V, Irving M
+    (2011), "Motion of myosin head domains during activation and force
+    development in skeletal muscle", PNAS 108:7236-7240,
+    doi:10.1073/pnas.1018330108.
+Siemankowski RF, White HD (1984), "Kinetics of the interaction between actin,
+    ADP, and cardiac myosin-S1", J Biol Chem 259:5045-5053.
+Stewart MA, Franks-Skiba K, Chen S, Cooke R (2010), "Myosin ATP turnover rate
+    is a mechanism involved in thermogenesis in resting skeletal muscle
+    fibers", PNAS 107:430-435, doi:10.1073/pnas.0909468107.
+Sung J, Nag S, Mortensen KI, Vestergaard CL, Sutton S, Ruppel K, Flyvbjerg H,
+    Spudich JA (2015), "Harmonic force spectroscopy measures load-dependent
+    kinetics of individual human beta-cardiac myosin molecules", Nat Commun
+    6:7931, doi:10.1038/ncomms8931.
+Veigel C, Schmitz S, Wang F, Sellers JR (2005), "Load-dependent kinetics of
+    myosin-V can explain its high processivity", Nat Cell Biol 7:861-869,
+    doi:10.1038/ncb1287.
+Walcott S, Warshaw DM (2010), "Modeling smooth muscle myosin's two heads: long-
+    lived enzymatic roles and phosphorylation-dependent equilibria", Biophys J
+    99:1129-1138, doi:10.1016/j.bpj.2010.06.018.
+Wang Y et al. (2024), "Single-molecule investigation of load-dependent
+    actomyosin dissociation kinetics for cardiac and slow skeletal myosin",
+    Small, doi:10.1002/smll.202406865.
+Woody MS, Winkelmann DA, Capitanio M, Ostap EM, Goldman YE (2019), "Single
+    molecule mechanics resolves the earliest events in force generation by
+    cardiac myosin", eLife 8:e49266, doi:10.7554/eLife.49266.
+
 """
 import jax.numpy as jnp
 
@@ -574,8 +675,9 @@ def xb_rate_32(r23, U_tight_1, U_tight_2):
         Rate r32 (ms^-1), capped at 10000 ms^-1
 
     References:
-        Hill 1977 Free Energy Transduction in Biology;
-        Pate & Cooke 1989 J Muscle Res Cell Motil 10:181.
+        Pate E, Cooke R (1989), "A model of crossbridge action: the effects of ATP,
+        ADP and Pi", J Muscle Res Cell Motil 10:181-196. (No DOI printed in the
+        paper.)
     """
     upper = 10000.0
     log_r43 = jnp.log(r23 + 1e-30) + (U_tight_2 - U_tight_1)
@@ -664,10 +766,24 @@ def xb_rate_34(A34, f_strong, delta34, k_t):
     locator (PNAS 103(1):87-92) is correct; its content does not fit the claim.
 
     Because delta_34 is a sweepable field, a NEGATIVE value is exactly a catch
-    bond, and the question can be explored without editing code. Note it is not
-    separable from delta_23: with the current slip sign, setting delta_23 to zero
-    costs 77% of active force, but with a catch bond it costs only 22%. See
-    section 4 of .claude/lit_reviews/state_scheme_rate_function_audit.md.
+    bond, and the question can be explored without editing code.
+
+    IT IS NOT SEPARABLE FROM delta_23, and how strongly they couple depends on
+    the MAGNITUDE of this rate's Bell distance, not just its sign. Measured
+    (8x8 lattice, pCa 4.5 vs pCa 9 passive reference, z_line = 1100 nm, 3
+    replicates), the cost in active force of setting delta_23 = 0:
+
+                                 skeletal    cardiac
+        delta_34 = +0.5 (slip)     -78%        -83%
+        delta_34 = -0.5 (catch)    -67%        -45%
+        delta_34 = -0.9 (catch)    -46%        -19%
+
+    A catch bond takes over delta_23's job of retaining strained force-bearing
+    heads, and the deeper the catch the more of that job it absorbs -- but at
+    -0.5 it absorbs only part of it. delta_23 is doing real load-dependent work
+    in the current (slip) configuration, which is why zeroing it there costs
+    ~80%. Sweep the two TOGETHER over both sign and magnitude; neither parameter
+    is interpretable alone, and a single-sign test will mislead.
 
     References:
         Bell 1978 Science 200:618 (the functional form); Siemankowski & White 1984

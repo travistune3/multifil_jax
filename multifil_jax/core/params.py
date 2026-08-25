@@ -53,6 +53,159 @@ is a placeholder:
 
 A [F] or [G] value is not wrong — it is simply not evidence. Treat the tag as
 part of the parameter.
+
+
+REFERENCES
+----------
+Every paper cited anywhere in this module, with its title and (where the paper
+prints one) its DOI, so any claim here can be checked without access to anything
+outside this repository.
+
+Brenner B, Schoenberg M, Chalovich JM, Greene LE, Eisenberg E (1982), "Evidence
+    for cross-bridge attachment in relaxed muscle at low ionic strength", PNAS
+    79:7288-7291.
+Brunello E, Caremani M, Melli L, Linari M, Fernandez-Martinez M, Narayanan T,
+    Irving M, Piazzesi G, Lombardi V (2014), "The contributions of filaments
+    and cross-bridges to sarcomere compliance in skeletal muscle", J Physiol
+    592:3881-3899, doi:10.1113/jphysiol.2014.276196.
+Chase PB, Macpherson JM, Daniel TL (2004), "A spatially explicit nanomechanical
+    model of the half-sarcomere: myofilament compliance affects
+    Ca2+-activation", Ann Biomed Eng 32:1559-1568.
+Contompasis JL, Nyland LR, Maughan DW, Vigoreaux JO (2010), "Flightin is
+    necessary for length determination, structural integrity, and large bending
+    stiffness of insect flight muscle thick filaments", J Mol Biol 395:340-348,
+    doi:10.1016/j.jmb.2009.11.021.
+Daniel TL, Trimble AC, Chase PB (1998), "Compliant realignment of binding sites
+    in muscle: transient behavior and mechanical tuning", Biophys J
+    74:1611-1621. PMID 9545027.
+Davis JP, Norman C, Kobayashi T, Solaro RJ, Swartz DR, Tikunova SB (2007),
+    "Effects of thin and thick filament proteins on calcium binding and
+    exchange with cardiac troponin C", Biophys J 92:3195-3206,
+    doi:10.1529/biophysj.106.095406.
+Deacon JC, Bloemink MJ, Rezavandi H, Geeves MA, Leinwand LA (2012),
+    "Identification of functional differences between recombinant human alpha
+    and beta cardiac myosin motors" (Erratum), Cell Mol Life Sci 69:4239-4255,
+    doi:10.1007/s00018-012-1111-5.
+Duke TAJ (1999), "Molecular model of muscle contraction", PNAS 96:2770-2775.
+Fraser IDC, Marston SB (1995), "In vitro motility analysis of actin-tropomyosin
+    regulation by troponin and calcium", J Biol Chem 270:7836-7841.
+Fusi L, Brunello E, Yan Z, Irving M (2016), "Thick filament mechano-sensing is
+    a calcium-independent regulatory mechanism in skeletal muscle", Nat Commun
+    7:13281, doi:10.1038/ncomms13281.
+Geeves MA, Lehrer SS (1994), "Dynamics of the muscle thin filament regulatory
+    switch: the size of the cooperative unit", Biophys J 67:273-282.
+Granzier HLM, Wang K (1993), "Passive tension and stiffness of vertebrate
+    skeletal and insect flight muscles: the contribution of weak cross-bridges
+    and elastic filaments", Biophys J 65:2141-2159.
+Granzier HL, Labeit S (2004), "The giant protein titin: a major player in
+    myocardial mechanics, signaling, and disease", Circ Res 94:284-295,
+    doi:10.1161/01.RES.0000117769.88862.F8.
+Houdusse A, Szent-Gyorgyi AG, Cohen C (2000), "Three conformational states of
+    scallop myosin S1", PNAS 97:11238-11243.
+Howard J (2001), Mechanics of Motor Proteins and the Cytoskeleton, Sinauer
+    Associates. (Book; no DOI.)
+Huxley AF, Simmons RM (1971), "Proposed mechanism of force generation in
+    striated muscle", Nature 233:533-538.
+Kawai M, Saeki Y, Zhao Y (1993), "Crossbridge scheme and the kinetic constants
+    of elementary steps deduced from chemically skinned papillary and
+    trabecular muscles of the ferret", Circ Res 73:35-50.
+Kawai M, Zhao Y (1993), "Cross-bridge scheme and force per cross-bridge state
+    in skinned rabbit psoas muscle fibers", Biophys J 65:638-651.
+Kulke M, Neagoe C, Kolmerer B, Minajeva A, Hinssen H, Bullard B, Linke WA
+    (2001), "Kettin, a major source of myofibrillar stiffness in Drosophila
+    indirect flight muscle", J Cell Biol 154:1045-1057,
+    doi:10.1083/jcb.200104016.
+Lehrer SS, Morris EP (1982), "Dual effects of tropomyosin and troponin-
+    tropomyosin on actomyosin subfragment 1 ATPase", J Biol Chem 257:8073-8080.
+Linari M, Reedy MK, Reedy MC, Lombardi V, Piazzesi G (2004), "Ca-activation and
+    stretch-activation in insect flight muscle", Biophys J 87:1101-1111,
+    doi:10.1529/biophysj.103.037374.
+Linke WA, Ivemeyer M, Mundel P, Stockmeier MR, Kolmerer B (1998), "Nature of
+    PEVK-titin elasticity in skeletal muscle", PNAS 95:8052-8057.
+Liu J, Wu S, Reedy MC, Winkler H, Lucaveche C, Cheng Y, Reedy MK, Taylor KA
+    (2006), "Electron tomography of swollen rigor fibers of insect flight
+    muscle reveals a short and variably angled S2 domain", J Mol Biol
+    362:844-860, doi:10.1016/j.jmb.2006.07.084.
+Mardahl-Dumesnil M, Fowler VM (2001), "Thin filaments elongate from their
+    pointed ends during myofibril assembly in Drosophila indirect flight
+    muscle", J Cell Biol 155:1043-1053, doi:10.1083/jcb.200108026.
+McKillop DFA, Geeves MA (1993), "Regulation of the interaction between actin
+    and myosin subfragment 1: evidence for three states of the thin filament",
+    Biophys J 65:693-701.
+Mijailovich SM, Prodanovic M, Poggesi C, Geeves MA, Regnier M (2021),
+    "Multiscale modeling of twitch contractions in cardiac trabeculae", J Gen
+    Physiol 153:e202012604, doi:10.1085/jgp.202012604.
+Millar NC, Homsher E (1990), "The effect of phosphate and calcium on force
+    generation in glycerinated rabbit skeletal muscle fibers", J Biol Chem
+    265:20234-20240.
+Offer G, Ranatunga KW (2013), "A cross-bridge cycle with two tension-generating
+    steps simulates skeletal muscle mechanics", Biophys J 105:928-940,
+    doi:10.1016/j.bpj.2013.07.009.
+Park-Holohan S-J et al. (2021), "Stress-dependent activation of myosin in the
+    heart requires thin filament activation and thick filament mechanosensing",
+    PNAS 118:e2023706118, doi:10.1073/pnas.2023706118.
+Pate E, Cooke R (1989), "A model of crossbridge action: the effects of ATP, ADP
+    and Pi", J Muscle Res Cell Motil 10:181-196.
+Piazzesi G, Lucii L, Lombardi V (2002), "The size and the speed of the working
+    stroke of muscle myosin and its dependence on the force", J Physiol
+    545:145-151, doi:10.1113/jphysiol.2002.028969.
+Pinto JR et al. (2011), "Strong cross-bridges potentiate the Ca2+ affinity
+    changes produced by hypertrophic cardiomyopathy cardiac troponin C mutants
+    in myofilaments", J Biol Chem 286:1005-1013, doi:10.1074/jbc.M110.168583.
+Potter JD, Gergely J (1975), "The calcium and magnesium binding sites on
+    troponin and their role in the regulation of myofibrillar adenosine
+    triphosphatase", J Biol Chem 250:4628-4633.
+Powers JD, Williams CD, Regnier M, Daniel TL (2018), "A spatially explicit
+    model shows how titin stiffness modulates muscle mechanics and energetics",
+    Integr Comp Biol 58:186-193, doi:10.1093/icb/icy055.
+Reedy MK (1968), "Ultrastructure of insect flight muscle. I. Screw sense and
+    structural grouping in the rigor cross-bridge lattice", J Mol Biol
+    31:155-176.
+Reedy MC, Reedy MK, Leonard KR, Bullard B (1998), "X-ray diffraction indicates
+    that active cross-bridges bind to actin target zones in insect flight
+    muscle", Biophys J 74:1439-1451.
+Reedy MC et al. (2004), "Cross-bridge number, position, and angle in target
+    zones of cryofixed isometrically active insect flight muscle", Biophys J
+    86:3009-3019.
+Robertson SP, Johnson JD, Potter JD (1981), "The time-course of Ca2+ exchange
+    with calmodulin, troponin, parvalbumin, and myosin in response to transient
+    increases in Ca2+", Biophys J 34:559-569.
+Saadat E, Caruel M, Gherardini S, Morotti I, Marcello M, Caremani M, Linari M,
+    Latella I, Ruffo S (2026), "Ising models of cooperativity in muscle
+    contraction".
+Siemankowski RF, White HD (1984), "Kinetics of the interaction between actin,
+    ADP, and cardiac myosin-S1", J Biol Chem 259:5045-5053.
+Squire JM, Luther PK, Knupp C (2006), "The myosin filament superlattice in the
+    flight muscles of flies: A-band lattice optimisation for stretch-
+    activation?", J Mol Biol 361:823-838, doi:10.1016/j.jmb.2006.06.072.
+Stewart MA, Franks-Skiba K, Chen S, Cooke R (2010), "Myosin ATP turnover rate
+    is a mechanism involved in thermogenesis in resting skeletal muscle
+    fibers", PNAS 107:430-435, doi:10.1073/pnas.0909468107.
+Sung J, Nag S, Mortensen KI, Vestergaard CL, Sutton S, Ruppel K, Flyvbjerg H,
+    Spudich JA (2015), "Harmonic force spectroscopy measures load-dependent
+    kinetics of individual human beta-cardiac myosin molecules", Nat Commun
+    6:7931, doi:10.1038/ncomms8931.
+Tanner BCW, Daniel TL, Regnier M (2007), "Sarcomere lattice geometry influences
+    cooperative myosin binding in muscle", PLoS Comput Biol 3(7):e115,
+    doi:10.1371/journal.pcbi.0030115.
+Taylor KA et al. (1999), "Tomographic 3D reconstruction of quick-frozen,
+    Ca2+-activated contracting insect flight muscle", Cell 99:421-431.
+van Straaten M, Goulding D, Kolmerer B, Labeit S, Clayton J, Leonard K, Bullard
+    B (1999), "Association of kettin with actin in the Z-disc of insect flight
+    muscle", J Mol Biol 285:1549-1562.
+Wang Y et al. (2024), "Single-molecule investigation of load-dependent
+    actomyosin dissociation kinetics for cardiac and slow skeletal myosin",
+    Small, doi:10.1002/smll.202406865.
+Williams CD, Regnier M, Daniel TL (2010), "Axial and radial forces of cross-
+    bridges depend on lattice spacing", PLoS Comput Biol 6(12):e1001018,
+    doi:10.1371/journal.pcbi.1001018.
+Williams CD, Salcedo MK, Irving TC, Regnier M, Daniel TL (2013), "The length-
+    tension curve in muscle depends on lattice spacing", Proc R Soc B
+    280:20130697, doi:10.1098/rspb.2013.0697.
+Woody MS, Winkelmann DA, Capitanio M, Ostap EM, Goldman YE (2019), "Single
+    molecule mechanics resolves the earliest events in force generation by
+    cardiac myosin", eLife 8:e49266, doi:10.7554/eLife.49266.
+
 """
 import jax
 import jax.numpy as jnp
@@ -228,13 +381,33 @@ _DYNAMIC_DEFAULTS = {
     #   stereospecifically bound one — but the factor of 5 is a modelling choice
     #   with no measurement behind it, and how any softening partitions between the
     #   linear and angular springs is not measured either.
-    #   KNOWN MISMATCH: at these values the weak state carries ~28% of total
-    #   crossbridge tension. The X-ray decomposition of Eakins et al. 2016
-    #   (Biology 5:41) puts it at ~4%, while this model matches that study's state
-    #   POPULATIONS well (24%/32.5% here vs 20%/32% there). So the weak state is
-    #   roughly 7x too load-bearing, and moving toward Williams 2010's stiffer
-    #   values would worsen it. Treat both as open, and see section 5 of
-    #   .claude/lit_reviews/state_scheme_rate_function_audit.md before fitting them.
+    #   KNOWN MISMATCH — THE WEAK STATE IS ~5x TOO LOAD-BEARING.
+    #   Measured in this model (8x8 lattice, pCa 4.5, 3 replicates, mean over the
+    #   last 1000 ms; stable across z_line = 900-1200 nm):
+    #
+    #                        weak share of XB tension   loose / tight_1 / tight_2
+    #       skeletal preset          18.5-19.0%           21.7% / 12.6% / 8.0%
+    #       cardiac preset           21.0-22.1%           22.5% / 11.9% / 21.4%
+    #
+    #   Compare Eakins CG, Reconditi M, Morris EP, Squire JM (2016), "X-ray
+    #   diffraction evidence for low force actin-attached and rigor-like
+    #   cross-bridges in the contractile cycle", Biology 5:41,
+    #   doi:10.3390/biology5040041. Bony fish muscle, tetanus plateau. Abstract,
+    #   verbatim: "48% of the heads are off actin giving a resting diffraction
+    #   pattern, 20% of heads are in the weak binding conformation and 32% of the
+    #   heads are in the strong (rigor-like) state. The strong states account for
+    #   96% of the tension at the tetanus plateau" -- i.e. the weak state carries
+    #   4%, against this model's ~19%.
+    #   The weak-state POPULATION matches well (21.7% here vs their 20%); the
+    #   strong population does not (20.6% here vs their 32%). So the discrepancy is
+    #   force per weak head, not how many weak heads there are.
+    #   Eakins' own caveat, verbatim: "these populations should not be taken to be
+    #   the proportions in different biochemical states."
+    #
+    #   DO NOT assume stiffer weak springs fix this -- they do not. Setting
+    #   c_k_weak = 40, g_k_weak = 2.0 (Williams 2010's single-stiffness values)
+    #   moves the weak share only 19.0% -> 16.5% while collapsing loose occupancy
+    #   21.7% -> 7.4%. Both parameters remain open.
     # g_k_strong = 5.0 pN/nm [G]: taken from the 4sXB "c" spring of the same paper
     #   (5 pN/nm, Houdusse 2000) rather than the 2sXB r' value of 2 pN/nm. What
     #   matters mechanically is the projected two-spring stiffness, not g_k alone
@@ -453,11 +626,25 @@ _DYNAMIC_DEFAULTS = {
     # (chain driven alone, crossbridge binding DISABLED; 1 chain site ~ 4.35
     # actin monomers at the vertebrate site spacing):
     #
-    #       tm_J_M   1.50   2.00   2.25   2.50   2.70   3.00
-    #       xi (mon) 2.53   4.11   5.14   6.52   7.84   9.98
+    #       tm_J_M       1.50   2.00   2.25   2.50   2.70   3.00
+    #       xi (mon)     2.53   4.11   5.14   6.52   7.84   9.98   <- inherited
+    #       re-measured  1.33   2.02   2.64   3.54   4.50   6.52
     #
-    # These numbers are real, but they do NOT currently anchor to a literature
-    # target, and an earlier reading of this table that put tm_J_M at 1.5-2.5 has
+    # THE TWO ROWS DISAGREE BY A NEAR-CONSTANT FACTOR OF ~2 (ratios 0.49-0.65).
+    # Re-measured 2026-08-20 on an 8x8 lattice at pCa 4.5, binding disabled,
+    # 3000 warmup + 60 sampled steps, taking xi as the exponential decay length
+    # of the open-state autocorrelation along each chain and converting at 4.35
+    # monomers per site. A systematic ~2x offset is the signature of a DIFFERENT
+    # DEFINITION -- decay length vs full domain extent (~2*xi) is the obvious
+    # candidate, as is a different monomers-per-site conversion -- not of a model
+    # change. The inherited row records neither its method nor its conditions, so
+    # it cannot be reproduced as written; prefer the re-measured row, and state
+    # the definition whenever this is quoted.
+    # (Sanity check on the re-measurement: at tm_J_M = 2.70 it gives an open
+    # fraction of 0.243 with binding disabled, matching an independent
+    # measurement of 24.5% open sites at pCa 4.5 under the same condition.)
+    #
+    # Neither row anchors to a literature target, and an earlier reading of this table that put tm_J_M at 1.5-2.5 has
     # been WITHDRAWN. Saadat et al.'s correlation length of 2-7 is in REGULATORY
     # UNITS, not actin monomers (their §IV B: "correlation length between
     # neighboring regulatory units"; their Eq. 9 indexes spins, and one spin is
@@ -563,12 +750,13 @@ _DYNAMIC_DEFAULTS = {
     # around the cycle is ΔG_ATP ≈ -22 to -24 kT at 37 °C — the energy available
     # from one ATP, and therefore the ceiling on the work one crossbridge can do.
     #
-    # The reference set is Howard 2001, Mechanics of Motor Proteins and the
-    # Cytoskeleton (Sinauer), Table 14.2 "Actin-myosin hydrolysis cycle (rabbit
-    # skeletal muscle)", p. 235. VERIFIED CELL BY CELL 2026-08-19 by reading the
-    # page as an image (the PDF's OCR text layer corrupts digits and units and
-    # must NOT be quoted; see .claude/papers/TEXT_LAYER_REPLACEMENTS.md).
-    # All ten energies below are transcribed correctly.
+    # The reference set is Howard J (2001), Mechanics of Motor Proteins and the
+    # Cytoskeleton, Sinauer Associates, Table 14.2 "Actin-myosin hydrolysis cycle
+    # (rabbit skeletal muscle)", p. 235. (A book, so no DOI.) All ten energies
+    # below were transcribed from the printed table and verified cell by cell.
+    # NOTE FOR ANYONE RE-CHECKING THIS: scanned copies of this page carry an OCR
+    # text layer that corrupts both digits and units, so the numbers must be read
+    # off the page image, not copied from extracted text.
     # CORRECTION: the table's note says [ATP] = 4 mM, not 2 mM as previously
     # stated here. Verbatim: "In parentheses are the approximate free energies of
     # the states assuming [ATP] = 4 mM, [P_i] = 2 mM, [ADP] = 20 uM."
@@ -1304,9 +1492,10 @@ def get_lethocerus_params() -> Tuple[StaticParams, DynamicParams]:
         2 x (thick_bare_zone + (n_crowns-1) x thick_crown_spacing)
         = 2 x (58 + 99 x 14.5) = ~2.99 um
       - [M] Adult Drosophila IFM thick filament measures 3.04 +/- 0.05 um;
-        Contompasis, Nyland, Maughan & Vigoreaux 2010 J Mol Biol 395:340
-        (Contompasis, Nyland, Maughan & Vigoreaux 2010 J Mol Biol 395:340-348,
-        PMID 19917296 -- bare-PMID citation resolved 2026-08-19). It grows from
+        Contompasis JL, Nyland LR, Maughan DW, Vigoreaux JO (2010), "Flightin is
+        necessary for length determination, structural integrity, and large
+        bending stiffness of insect flight muscle thick filaments", J Mol Biol
+        395:340-348, PMID 19917296. It grows from
         ~1.6 um in the early pupa in regulated
         unison with the thin filament.
       - [I] n_crowns = (3040/2 - 58)/14.5 + 1 ~= 101, rounded to 100. Finer

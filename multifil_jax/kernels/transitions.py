@@ -53,6 +53,14 @@ TIERED INPUTS
     Constants (Tier 2)  DynamicParams with rates, pCa, lattice_spacing
 
 Rate laws live in rate_functions.py; this module assembles and applies them.
+
+
+REFERENCE
+---------
+Tanner BCW, Regnier M, Daniel TL (2012), "Filament compliance influences
+    cooperative activation of thin filaments and the dynamics of force production
+    in skeletal muscle", PLoS Comput Biol 8:e1002506,
+    doi:10.1371/journal.pcbi.1002506.
 """
 
 import jax

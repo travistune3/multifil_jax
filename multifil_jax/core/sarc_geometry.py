@@ -59,6 +59,13 @@ Usage
 >>> topo = SarcTopology.create(nrows=2, ncols=2, static_params=static,
 ...                            dynamic_params=dynamic)
 >>> topo = jax.device_put(topo)   # move to GPU once, reuse for every run
+
+
+REFERENCE
+---------
+Squire JM, Luther PK, Knupp C (2006), "The myosin filament superlattice in the
+    flight muscles of flies: A-band lattice optimisation for stretch-activation?",
+    J Mol Biol 361:823-838, doi:10.1016/j.jmb.2006.06.072.
 """
 
 import jax

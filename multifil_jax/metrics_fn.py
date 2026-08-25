@@ -66,7 +66,7 @@ import jax
 import jax.numpy as jnp
 from typing import Dict, TYPE_CHECKING
 
-from multifil_jax.kernels.forces import axial_force_at_mline
+from multifil_jax.kernels.forces import axial_force_at_mline, xb_axial_force_by_state
 from multifil_jax.kernels.transitions import xb_exit_probabilities
 from multifil_jax.core.state import Drivers, resolve_value, MetricsDict
 
@@ -190,6 +190,12 @@ def compute_all_metrics(
     new_tm = new_state.thin.tm_states
 
     n_total_xb = jnp.float32(jnp.size(new_xb))
+
+    f_xb_loose, f_xb_tight_1, f_xb_tight_2 = xb_axial_force_by_state(
+        new_state.thick.axial, new_state.thin.axial, new_xb,
+        new_state.thick.xb_bound_to,
+        resolve_value(drivers.lattice_spacing, constants.lattice_spacing),
+        constants, topology)
     n_total_tm = jnp.float32(jnp.size(new_tm))
 
     # Resolve driver values
@@ -356,6 +362,15 @@ def compute_all_metrics(
         'n_xb_tight_2': n_tight_2,
         'n_xb_free_2': n_free_2,
         'n_xb_srx': n_srx,
+
+        # Axial XB force split by bound state (pN).  Divide by the matching
+        # count above for mean force per head in that state: that is what
+        # separates "more heads are strong" from "each strong head pulls
+        # harder".  These sum to the total XB force on the thick filaments,
+        # which is NOT 'axial_force' -- see the module docstring.
+        'force_xb_loose': f_xb_loose,
+        'force_xb_tight_1': f_xb_tight_1,
+        'force_xb_tight_2': f_xb_tight_2,
 
         # Crossbridge state fractions
         'frac_xb_bound': n_bound / n_total_xb,

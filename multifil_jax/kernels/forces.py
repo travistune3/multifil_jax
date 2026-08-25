@@ -325,11 +325,96 @@ def compute_xb_forces_vectorized(
         forces_on_thick: (n_thick, n_crowns) net XB force on each crown
         forces_on_thin: (n_thin, n_sites) net XB force on each binding site
     """
+    forces, thin_flat_idx = _xb_axial_forces_flat(
+        positions_thick, positions_thin, xb_states, xb_bound_to,
+        lattice_spacing, params, geometry)
+
     n_thick, n_crowns = positions_thick.shape
     n_thin, n_sites = positions_thin.shape
     n_xb_per_crown = xb_states.shape[2]
     n_crowns_total = n_thick * n_crowns
     n_sites_total = n_thin * n_sites
+
+    # Accumulate thick filament forces (reshape+sum - unchanged, regular pattern)
+    forces_per_crown = forces.reshape(n_crowns_total, n_xb_per_crown)
+    forces_on_thick_flat = forces_per_crown.sum(axis=-1)
+    forces_on_thick = forces_on_thick_flat.reshape(n_thick, n_crowns)
+
+    # REFACTORED: Use segment_sum instead of one_hot matmul
+    # segment_sum uses GPU atomic operations - no huge buffer allocation
+    forces_on_thin_flat = jax.ops.segment_sum(
+        -forces,
+        thin_flat_idx,
+        num_segments=n_sites_total
+    )
+    forces_on_thin = forces_on_thin_flat.reshape(n_thin, n_sites)
+
+    return forces_on_thick, forces_on_thin
+
+
+def xb_axial_force_by_state(
+    positions_thick: jnp.ndarray,
+    positions_thin: jnp.ndarray,
+    xb_states: jnp.ndarray,
+    xb_bound_to: jnp.ndarray,
+    lattice_spacing: float,
+    params: 'DynamicParams',
+    geometry: 'SarcTopology'
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Total axial crossbridge force, split by bound state.
+
+    Answers "did force rise because MORE heads are strongly bound, or because
+    EACH strongly bound head is carrying more?" -- the state occupancies alone
+    cannot separate those. Dividing each sum by the matching state count gives
+    the mean force a head in that state is exerting; if two conditions differ in
+    the sums but not in the per-head means, the change is pure occupancy.
+
+    Uses the same `_xb_axial_forces_flat` as `compute_xb_forces_vectorized`, so
+    the two can never disagree about the force law, and
+
+        weak + tight_1 + tight_2 == compute_xb_forces_vectorized(...)[0].sum()
+
+    exactly. Note that is the total XB force on the thick filaments, which is
+    NOT `axial_force` at the M-line -- that is read from backbone spring strain
+    and includes titin (see metrics_fn module docstring).
+
+    Returns:
+        (f_weak, f_tight_1, f_tight_2) scalar summed axial force (pN) from
+        crossbridges in states 1, 2 and 3 respectively.
+    """
+    forces, _ = _xb_axial_forces_flat(
+        positions_thick, positions_thin, xb_states, xb_bound_to,
+        lattice_spacing, params, geometry)
+    s = xb_states.reshape(-1)
+    return (jnp.sum(jnp.where(s == 1, forces, 0.0)),
+            jnp.sum(jnp.where(s == 2, forces, 0.0)),
+            jnp.sum(jnp.where(s == 3, forces, 0.0)))
+
+
+def _xb_axial_forces_flat(
+    positions_thick: jnp.ndarray,
+    positions_thin: jnp.ndarray,
+    xb_states: jnp.ndarray,
+    xb_bound_to: jnp.ndarray,
+    lattice_spacing: float,
+    params: 'DynamicParams',
+    geometry: 'SarcTopology'
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Axial force exerted by EVERY crossbridge, flat, plus its thin-site index.
+
+    The two-spring force law lives here and only here -- both the solver path
+    (`compute_xb_forces_vectorized`) and the by-state accounting
+    (`xb_axial_force_by_state`) call this, so a change to the physics cannot
+    reach one and miss the other. See `compute_xb_forces_vectorized` for the
+    geometry and the sign conventions, including why the angular term is minus.
+
+    Returns:
+        forces: (n_xb_total,) axial force per crossbridge, 0 where unbound
+        thin_flat_idx: (n_xb_total,) flat index of the site each XB acts on
+    """
+    n_thick, n_crowns = positions_thick.shape
+    n_thin, n_sites = positions_thin.shape
+    n_xb_per_crown = xb_states.shape[2]
 
     # Flatten all arrays for vectorized computation
     xb_states_flat = xb_states.reshape(-1)
@@ -401,21 +486,7 @@ def compute_xb_forces_vectorized(
     # Zero force for unbound XBs
     forces = jnp.where(is_bound, f_axial, 0.0)
 
-    # Accumulate thick filament forces (reshape+sum - unchanged, regular pattern)
-    forces_per_crown = forces.reshape(n_crowns_total, n_xb_per_crown)
-    forces_on_thick_flat = forces_per_crown.sum(axis=-1)
-    forces_on_thick = forces_on_thick_flat.reshape(n_thick, n_crowns)
-
-    # REFACTORED: Use segment_sum instead of one_hot matmul
-    # segment_sum uses GPU atomic operations - no huge buffer allocation
-    forces_on_thin_flat = jax.ops.segment_sum(
-        -forces,
-        thin_flat_idx,
-        num_segments=n_sites_total
-    )
-    forces_on_thin = forces_on_thin_flat.reshape(n_thin, n_sites)
-
-    return forces_on_thick, forces_on_thin
+    return forces, thin_flat_idx
 
 
 # ============================================================================

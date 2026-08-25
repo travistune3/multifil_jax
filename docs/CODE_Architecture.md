@@ -520,10 +520,20 @@ Avoids ~46 redundant identity-copy XLA ops per timestep.
 
 ## 9. Cooperativity
 
-One TM cooperativity model: a symmetric Ising chain. (A second, tension-dependent
-span model was removed 2026-08-05, together with its selector kwarg, its `State`
-field, its module, and four `DynamicParams` entries. Full symbol list and the
-reproducibility consequences: `.claude/legacy_coop_removal_local_projects.md`.)
+One TM cooperativity model: a symmetric Ising chain. A second, tension-dependent
+span model was removed in v3.0, verified bit-exact against the Ising path.
+Removed with it:
+
+| removed | was |
+|---|---|
+| `kernels/cooperativity.py` | the whole legacy module |
+| `legacy_coop=` kwarg on `run()` / `timestep()` (earlier spelled `ising_coop=`) | selected between the two models |
+| `State.subject_to_coop` | `(n_thin, n_sites)` bool field |
+| `tm_coop_magnitude`, `tm_span_base`, `tm_span_force50`, `tm_span_steep` | `DynamicParams` entries |
+| `tm_Keq_30` | `DynamicParams` entry, already unused — the 3→0 step is one-way |
+
+Pre-v3.0 scripts passing any of these will raise. Set cooperativity through
+`tm_J_M` (and `tm_J_C`) instead.
 
 **File:** `multifil_jax/kernels/transitions.py` — `thin_transitions()`,
 `_compute_unique_tm_Q_matrices()`, `count_neighbor_states_split()`. Rate laws
