@@ -686,19 +686,44 @@ _DYNAMIC_DEFAULTS = {
                              #     effectively a free parameter, and a natural first
                              #     candidate when fitting. The 5-figure precision is
                              #     an artifact of that derivation, not significance.
-    'xb_r12_coeff': 0.6,     # [F] ms⁻¹ weak→strong (Pi release). Tuned to the
-                             #     apparent rate of sinusoidal-analysis process B
+    'xb_r12_coeff': 0.6,     # [F] ms⁻¹ weak→strong. THIS IS THE WORKING STROKE, and
+                             #     Pi release, lumped into one step — the only
+                             #     transition in the model that moves the spring rest
+                             #     configuration, so it does all of the work. Tuned to
+                             #     the apparent rate of sinusoidal-analysis process B
                              #     (2πb ~ 20–60 s⁻¹ skeletal; Kawai & Zhao 1993
-                             #     Biophys J 65:638), not measured directly
-    'xb_r23_coeff': 0.15,    # [G] ms⁻¹ working stroke at zero load. The cited
-                             #     "Millar & Homsher 1990 (70–100 s⁻¹)" is NOT in that
-                             #     paper (audit 2026-08-19): JBC 265:20234 measures
-                             #     k_Pi = 23.5 ± 1.7 s⁻¹ at 10 °C, 0.7 mM Pi, and
-                             #     k_TR = 13.6 ± 0.2 s⁻¹ — the only two rates it
+                             #     Biophys J 65:638), not measured directly.
+                             #     MOVED HERE 2026-08-27 (S127) from xb_r23_coeff,
+                             #     where the 1-indexed legacy naming had filed it:
+                             #     the cited "Millar & Homsher 1990 (70–100 s⁻¹)" is
+                             #     NOT in that paper (audit 2026-08-19). JBC 265:20234
+                             #     measures k_Pi = 23.5 ± 1.7 s⁻¹ at 10 °C, 0.7 mM Pi,
+                             #     and k_TR = 13.6 ± 0.2 s⁻¹ — the only two rates it
                              #     reports. HYPOTHESIS (not established): 70–100 s⁻¹
                              #     may be 23.5 s⁻¹ Q10-corrected from 10 °C to ~26 °C
                              #     (Q10 2–3 gives 68–120). If so, write that down;
                              #     otherwise drop the attribution.
+    'xb_r23_coeff': 0.15,    # [G] ms⁻¹ Tight_1 -> Tight_2 isomerization at zero load.
+                             #     NOT the working stroke and NOT Pi release — both are
+                             #     on r12 (see rate_functions.py module docstring,
+                             #     "WHERE THE WORKING STROKE ACTUALLY IS"). This step
+                             #     moves nothing, does no work and changes no force; it
+                             #     commits the ~6 kT drop and makes the head
+                             #     ADP-release-competent.
+                             #     STALE-INDEX FIX 2026-08-27 (S127): this comment described the WORKING
+                             #     STROKE. It does not live here. The model was renumbered
+                             #     from 1-indexed to 0-indexed states; under the old scheme
+                             #     r23 meant states 2->3, which is TODAY's r12. The code was
+                             #     migrated, the comments were not.
+                             #     The Millar & Homsher / k_Pi audit note that used to
+                             #     sit here has moved to xb_r12_coeff, which is the step
+                             #     it was always about.
+                             #     THE VALUE IS THEREFORE UNJUSTIFIED, not merely
+                             #     unsourced: 0.15 was chosen for a step this is not.
+                             #     Physically r23 is the AM.ADP isomerization that
+                             #     precedes ADP release. Not re-derived here — that
+                             #     changes get_skeletal_params() and is a separate
+                             #     decision. Tag stays [G].
     'xb_r34_coeff': 0.6,     # [I] ms⁻¹ ADP release/detachment at zero load.
                              #     Siemankowski & White 1984 JBC 259:5045 say
                              #     ">500 s⁻¹" for rabbit skeletal at 15 °C — but that
@@ -706,8 +731,15 @@ _DYNAMIC_DEFAULTS = {
                              #     their own measurement: the sentence carries their
                              #     ref (14). Their own data are bovine ventricle.
                              #     Retagged [M] → [I] 2026-08-19.
-    'xb_delta_23': 1.0,      # [I] nm, distance to the working-stroke transition
-                             #     state; Pate & Cooke 1989 JMRCM 10:181.
+    'xb_delta_23': 1.0,      # [I] nm, Bell transition-state distance for the
+                             #     Tight_1 -> Tight_2 isomerization. NOT the working
+                             #     stroke — that is r12 (stale-index fix 2026-08-27,
+                             #     S127; old 1-indexed r23 == today's r12). The
+                             #     literature below is about the STROKE and therefore
+                             #     supports xb_delta_12's role, not this one; it is
+                             #     kept here only because the value has never been
+                             #     re-derived for the step this actually is.
+                             #     Pate & Cooke 1989 JMRCM 10:181.
                              #     Huxley & Simmons 1971 Nature 233:533 give
                              #     1/a = 2 nm and h = 8 nm (the stroke); there is no
                              #     "1–2 nm" range in the paper, and 1/a is one of "the
@@ -1300,13 +1332,15 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams]:
                                      (175/600). Either the skeletal 20–60 s⁻¹ range is
                                      too low (it was never located in its source) or
                                      this value is ~3× too fast. NOT resolved here.
-        xb_r23_coeff = 0.065 ms⁻¹ — [L-unverified] "lever arm rate ~2× slower".
-                                     Deacon 2012 (recombinant human α-/β-S1, 20 °C) does
-                                     report ~2× α/β differences and says the isoforms
-                                     "differ by no more than two-fold for ANY" parameter
-                                     — but a specifically LEVER-ARM rate 2× slower in β
-                                     was not located, and the paper states the working
-                                     stroke MAGNITUDE does not change significantly.
+        xb_r23_coeff = 0.065 ms⁻¹ — [G] STALE-INDEX FIX 2026-08-27 (S127). This was
+                                     tagged [L-unverified] "lever arm rate ~2× slower",
+                                     but r23 is NOT the lever arm: the stroke is on r12
+                                     (old 1-indexed r23 == today's r12). r23 is the
+                                     Tight_1 -> Tight_2 isomerization, which does no
+                                     work. The Deacon lever-arm reasoning therefore does
+                                     not apply to this parameter at all, and the value
+                                     is UNJUSTIFIED rather than merely unverified.
+                                     Retagged [L-unverified] -> [G].
                                      Also: the PDF on disk is the erratum reprint at
                                      69:4239–4255, not the cited 69:2261.
         xb_r34_coeff = 0.065 ms⁻¹ — [L] Cardiac ADP release. VERIFIED EXACTLY:
@@ -1361,7 +1395,8 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams]:
                                   #     for ISOLATED cTn (15 °C). In-filament is 105 s⁻¹,
                                   #     +S1+ATP 110 s⁻¹ — the row that matches state 3.
         'xb_r12_coeff': 0.175,    # Process B 3–4× slower; Kawai et al. 1993 Circ Res 73:35
-        'xb_r23_coeff': 0.065,    # Lever arm ~2× slower; Deacon et al. 2012 Cell Mol Life Sci 69:2261
+        'xb_r23_coeff': 0.065,    # [G] Tight_1->Tight_2 isomerization. NOT the lever arm
+                                  #     (stale-index fix S127) — value unjustified, see prose
         'xb_r34_coeff': 0.065,    # ADP release ~65 s⁻¹; Siemankowski & White 1984 JBC
         'xb_r05': 0.2,            # [G] DRX→SRX; Mijailovich 2021 (PMC7852458 Table 1)
                                   #     k−PS = 200 s⁻¹ — correctly transcribed, but that

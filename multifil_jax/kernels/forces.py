@@ -303,8 +303,13 @@ def compute_xb_forces_vectorized(
     reverse the sign of total muscle force.
 
     Which rest configuration applies depends on the head's state: strong
-    (states 2 and 3) or weak (states 1 and 4). Heads in states 0 or 5 are
-    detached and contribute nothing.
+    (states 2 and 3), weak otherwise. Only state 1 is both weak AND bound;
+    states 0, 4 and 5 are detached and carry no spring (rate_functions.py module
+    docstring), and n_bound counts states 1-3 only (metrics_fn.py). They are
+    given the weak parameter set by the `jnp.where` below purely because it
+    needs some value -- force is gated on xb_bound_to (-1 when unbound), not on
+    state, so a detached head contributes nothing regardless. An earlier version
+    of this sentence listed state 4 as weak-bound, which contradicted both.
 
     Forces are equal and opposite: whatever a head does to its crown, it does the
     negative of to its binding site. Site accumulation uses segment_sum because

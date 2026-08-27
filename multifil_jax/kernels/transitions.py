@@ -264,8 +264,8 @@ def _build_xb_Q_matrix_optimized(r00, r01, r04, r05, r10, r11, r12,
         from 5 [ r50     0      0      0      0     r55 ]
 
     The sparsity encodes the biology. A head must pass through weak binding
-    before it can bind strongly (no 0->2), it cannot skip the working stroke
-    (no 2->4), and SRX connects only to DRX — a parked head has to rejoin the
+    before it can bind strongly (no 0->2), it cannot detach from Tight_1 without
+    first isomerizing to Tight_2 (no 2->4), and SRX connects only to DRX — a parked head has to rejoin the
     available pool before it can do anything else. r43 is structurally present
     but always zero: re-attaching directly into the post-stroke state would run
     the ATPase backwards.
