@@ -461,8 +461,14 @@ def _xb_axial_forces_flat(
     sin_theta = lattice_spacing / r_safe
     theta = jnp.arctan2(lattice_spacing, x_dist)
 
-    # Get spring parameters based on state
-    is_strong = (xb_states_flat == 2) | (xb_states_flat == 3)
+    # Get spring parameters based on state. THREE configurations, not two:
+    # state 1 Loose (*_weak), state 2 Tight_1 (*_tight_1) and state 3 Tight_2
+    # (*_strong). Tight_1 gained its own rest configuration with the split
+    # stroke (S129) — see the _DYNAMIC_DEFAULTS block on xb_c_rest_tight_1.
+    # A plain three-way select, no interpolation: there is no fraction to
+    # forget, so this site and _xb_radial_force_total cannot drift apart.
+    is_t2 = (xb_states_flat == 3)
+    is_t1 = (xb_states_flat == 2)
 
     # Extract scalar params (attribute access)
     c_rest_strong = params.xb_c_rest_strong
@@ -475,12 +481,16 @@ def _xb_axial_forces_flat(
     g_k_weak = params.xb_g_k_weak
 
     # Converter domain (angular spring)
-    c_rest = jnp.where(is_strong, c_rest_strong, c_rest_weak)
-    c_k = jnp.where(is_strong, c_k_strong, c_k_weak)
+    c_rest = jnp.where(is_t2, c_rest_strong,
+                       jnp.where(is_t1, params.xb_c_rest_tight_1, c_rest_weak))
+    c_k = jnp.where(is_t2, c_k_strong,
+                    jnp.where(is_t1, params.xb_c_k_tight_1, c_k_weak))
 
     # Globular domain (linear spring)
-    g_rest = jnp.where(is_strong, g_rest_strong, g_rest_weak)
-    g_k = jnp.where(is_strong, g_k_strong, g_k_weak)
+    g_rest = jnp.where(is_t2, g_rest_strong,
+                       jnp.where(is_t1, params.xb_g_rest_tight_1, g_rest_weak))
+    g_k = jnp.where(is_t2, g_k_strong,
+                    jnp.where(is_t1, params.xb_g_k_tight_1, g_k_weak))
 
     # Calculate axial force using algebraic trig
     # Sign: F_crown_x = -∂U_g/∂x_crown - ∂U_c/∂x_crown
@@ -775,11 +785,20 @@ def _xb_radial_force_total(
     sin_theta = lattice_spacing / r_safe
     theta = jnp.arctan2(lattice_spacing, x_dist)
 
-    is_strong = (xb_states_flat == 2) | (xb_states_flat == 3)
-    c_rest = jnp.where(is_strong, params.xb_c_rest_strong, params.xb_c_rest_weak)
-    c_k = jnp.where(is_strong, params.xb_c_k_strong, params.xb_c_k_weak)
-    g_rest = jnp.where(is_strong, params.xb_g_rest_strong, params.xb_g_rest_weak)
-    g_k = jnp.where(is_strong, params.xb_g_k_strong, params.xb_g_k_weak)
+    # Same three-way spring select as _xb_axial_forces_flat. The S129 prototype
+    # patch could not reach this function (it rewrote one function's source);
+    # splitting it here removes the axial/radial mismatch that would otherwise
+    # exist for every state-2 head under dynamic lattice spacing.
+    is_t2 = (xb_states_flat == 3)
+    is_t1 = (xb_states_flat == 2)
+    c_rest = jnp.where(is_t2, params.xb_c_rest_strong,
+                       jnp.where(is_t1, params.xb_c_rest_tight_1, params.xb_c_rest_weak))
+    c_k = jnp.where(is_t2, params.xb_c_k_strong,
+                    jnp.where(is_t1, params.xb_c_k_tight_1, params.xb_c_k_weak))
+    g_rest = jnp.where(is_t2, params.xb_g_rest_strong,
+                       jnp.where(is_t1, params.xb_g_rest_tight_1, params.xb_g_rest_weak))
+    g_k = jnp.where(is_t2, params.xb_g_k_strong,
+                    jnp.where(is_t1, params.xb_g_k_tight_1, params.xb_g_k_weak))
 
     f_radial = (g_k * (r - g_rest) * sin_theta +
                 (1.0 / r_safe) * c_k * (theta - c_rest) * cos_theta)

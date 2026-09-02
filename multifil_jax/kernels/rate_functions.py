@@ -42,44 +42,72 @@ THE CROSSBRIDGE CYCLE (6 states)
     5  SRX      super-relaxed; head folded back against the thick filament
 
 The force-producing path is 0 -> 1 -> 2 -> 3 -> 4 -> 0, consuming one ATP per
-lap. State 1 uses the weak spring configuration and states 2 and 3 use the
-strong one; 0, 4 and 5 are detached and carry no spring at all.
+lap. Each bound state has its own spring configuration — 1 the *_weak set, 2
+the *_tight_1 set, 3 the *_strong set; 0, 4 and 5 are detached and carry no
+spring at all.
 
 WHERE THE WORKING STROKE ACTUALLY IS
 ------------------------------------
-On 1 -> 2. NOT on 2 -> 3, despite the Tight_1/Tight_2 naming.
+Mostly on 1 -> 2, with the remainder on 2 -> 3. NOT on 2 -> 3 alone, despite
+the Tight_1/Tight_2 naming.
 
-There are only two spring configurations in the model, weak and strong, so the
-entire rest-position change — and therefore all of the work — happens when a
-head isomerizes from Loose to Tight_1. States 2 and 3 share one rest
-configuration AND one pair of spring constants (see forces.py, where
-`is_strong = (state == 2) | (state == 3)` selects a single parameter set). The
-2 -> 3 transition therefore moves nothing, does no work, and changes no force.
-It is a purely chemical step. What separates the two states is the ~6 kT free
-energy drop that makes the stroke effectively one-way, and the fact that only
-state 3 can release ADP and detach.
+THIS DEPENDS ON THE PARAMETERS, and the dependence is worth stating exactly,
+because it used to be a structural fact and is now a control path. When the
+*_tight_1 springs equal the *_strong ones, states 2 and 3 are elastically
+identical, the whole rest-position change happens on 1 -> 2, and 2 -> 3 moves
+nothing, does no work and changes no force — a purely chemical step. That was
+the model until 2026-09-01 and it is still exactly what the six control values
+in core/params.py reproduce.
 
-This is a deliberate design, not an oversight. Fibre mechanics and X-ray
-modelling both argue that ONE force-bearing conformation plus one low-force
-attached conformation is sufficient: Knupp & Squire 2020 (Biology 9:464) fit
-length-step transients, isotonic shortening and the M3 reflection with exactly
-that, and could not find parameters for variants carrying two force-producing
-attached states; Eakins 2016 (Biology 5:41) concludes from X-ray that "no more
-than two main attached structural states are necessary and sufficient", with
-the weak state contributing ~4% of tension. In that mapping state 1 is the
-low-force attached state and states 2+3 together are the single force-bearing
-one.
+At the shipped defaults the *_tight_1 rest positions differ (see the split
+stroke block in core/params.py), so 2 -> 3 carries part of the lever swing:
+the axial rest projection g_rest*cos(c_rest) is 13.5516 / 6.8596 / 4.7604 nm
+for Loose / Tight_1 / Tight_2, i.e. 6.692 nm on 1 -> 2 and 2.099 nm — 23.9% of
+the 8.791 nm total — on 2 -> 3. Note the projection is NOT linear in the
+interpolation fraction the two rest positions were built from (0.75), and
+2.099 nm is ~1.4x the ~1.5 nm second swing quoted below, so it is NOT a match
+to Doran 2023 or Woody 2019. It is also a different quantity from the 5.837 nm
+"effective stroke" measured mechanically in S109; do not mix the two.
 
-The known omission is the second, much smaller lever swing that accompanies ADP
-release: ~16 degrees / ~1.5 nm in cardiac myosin (Doran 2023 JGP 155:e202213267
-by cryo-EM; Woody 2019 eLife 8:e49266 measures 1-1.5 nm by single molecule),
-essentially absent in fast skeletal myosin (Gollub, Cremo & Cooke 1996 Nat
-Struct Biol 3:796). Its structural role is argued to be strain sensing rather
-than force generation, and in this model it appears only as the Bell distance
-of the detachment step (xb_delta_34), not as a displacement. Note the dissenting
-view: Offer & Ranatunga 2013 (Biophys J 105:928-940) require TWO tension-generating
-steps of 5.6 and 4.6 nm and reject single-step models on efficiency and on
-lengthening force-velocity.
+What separates the two states in every configuration is the ~6 kT free energy
+drop that makes the stroke effectively one-way, and the fact that only state 3
+can release ADP and detach.
+
+The two-configuration form was a deliberate design, not an oversight, and the
+case for it still stands on its own terms. Fibre mechanics and X-ray modelling
+both argue that ONE force-bearing conformation plus one low-force attached
+conformation is sufficient: Knupp & Squire 2020 (Biology 9:464) fit length-step
+transients, isotonic shortening and the M3 reflection with exactly that, and
+could not find parameters for variants carrying two force-producing attached
+states; Eakins 2016 (Biology 5:41) concludes from X-ray that "no more than two
+main attached structural states are necessary and sufficient", with the weak
+state contributing ~4% of tension. In that mapping state 1 is the low-force
+attached state and states 2+3 together are the single force-bearing one.
+
+The split stroke breaks that mapping: states 2 and 3 are now elastically
+distinct, so this model carries two force-bearing configurations against those
+two arguments. It was adopted anyway, on a measurement the two-configuration
+form fails outright — force per strong head 1.67 pN against Piazzesi 2007's
+~5.7, with the strong-bound FRACTION already right, i.e. a strain-distribution
+deficit rather than a recruitment one (S129). Splitting the stroke and taking
+the catch-bond sign of xb_delta_34 together carried force from 52% to 93% of
+the Kooiker target at literature values, with no fitting.
+
+The known omission WAS the second, much smaller lever swing that accompanies
+ADP release: ~16 degrees / ~1.5 nm in cardiac myosin (Doran 2023 JGP
+155:e202213267 by cryo-EM; Woody 2019 eLife 8:e49266 measures 1-1.5 nm by
+single molecule), essentially absent in fast skeletal myosin (Gollub, Cremo &
+Cooke 1996 Nat Struct Biol 3:796). Its structural role is argued to be strain
+sensing rather than force generation, and in the two-configuration model it
+appeared only as the Bell distance of the detachment step (xb_delta_34), never
+as a displacement.
+
+The split stroke is precisely the fix for that omission: the second swing is
+now a real displacement, and it is the 2 -> 3 step. That moves the model TOWARD
+the dissenting view — Offer & Ranatunga 2013 (Biophys J 105:928-940) require
+TWO tension-generating steps, of 5.6 and 4.6 nm, and reject single-step models
+on efficiency and on lengthening force-velocity — though not to their
+partition: this model's split is 6.69 / 2.10 nm, far more lopsided than theirs.
 
 SRX is not part of that cycle — it is a reserve. Heads parked in SRX have very
 low ATPase and cannot bind at all; calcium recruits them out (xb_rate_50).
@@ -482,9 +510,19 @@ def xb_rate_10(r01, U_DRX, U_loose):
     """Rate 1->0: weakly bound head detaches.
 
     Detailed balance against the forward rate: r10 = r01 * exp(U_loose - U_DRX).
-    Because U_loose carries the head's elastic energy, a badly strained weak
-    bridge detaches quickly — weak binding is only stable near the head's
-    unstrained geometry.
+
+    STRAIN CANCELS, and a reader looking at the formula will assume the
+    opposite, which is why this paragraph is here. r01 carries exp(-E_weak) and
+    U_loose carries +E_weak; detailed balance ties them together:
+
+        r10 = (r01 + 0.005) * exp(U_loose - U_DRX)
+            = [C*exp(-E_weak) + 0.005] * exp(U_loose_base + E_weak - U_DRX)
+            = C*exp(U_loose_base - U_DRX)                 <- CONSTANT, 41.4 /ms
+                                                             at cardiac defaults
+              + 0.005*exp(U_loose_base + E_weak - U_DRX)  <- the floor
+
+    So the weak state's LIFETIME is the same at every strain. What strain
+    changes is its OCCUPANCY, through r01.
 
     Computed in log space, since r01 spans many orders of magnitude across the
     strain range and the naive product overflows float32.
@@ -492,9 +530,20 @@ def xb_rate_10(r01, U_DRX, U_loose):
     The +0.005 floor inside the logarithm keeps the rate finite where r01 is
     exactly zero, which happens for every head facing a covered site
     (permissiveness = 0). Without it those heads would produce log(0) = -inf and
-    poison the rate matrix. The floor is numerical housekeeping — it puts a small
-    non-zero detachment rate on heads that are not attached in the first place,
-    where it has no physical effect.
+    poison the rate matrix. The floor is numerical housekeeping with no physical
+    effect — but for a different reason since 2026-09-01 than the one that used
+    to be written here. It is no longer that a head cannot be bound at a covered
+    site because the hard lock forbids tropomyosin from closing over one; the
+    lock is finite now and tropomyosin does close. It is that closure DETACHES
+    every bound head in the same timestep (kernels/transitions.thin_transitions,
+    which runs before thick_transitions), so no state-1 head is ever at a
+    covered site when this rate is evaluated.
+
+    DO NOT "SIMPLIFY" THIS FUNCTION. Because the rate is analytically constant,
+    the log-space form, the floor and the 10000 ms^-1 cap all look removable.
+    Removing the floor changes r10 at OPEN sites by a relative 1.6e-5 — small,
+    but not bit-identical, and an exact control path is worth more than the
+    three lines. It is a good follow-up on its own.
 
     Args:
         r01: Forward binding rate (ms^-1)
@@ -592,28 +641,55 @@ def xb_rate_21(r12, U_loose, U_tight_1):
 def xb_rate_23(A23, f_strong, delta23, k_t):
     """Rate 2->3: chemical transition between the two strongly-bound states.
 
-    NOT the working stroke, despite the state names. The stroke is on 1 -> 2 —
-    see the module docstring. Tight_1 and Tight_2 share one spring configuration
-    and one pair of spring constants, so this transition produces no
-    displacement, does no work, and changes no force. What it does is commit the
-    head to the ~6 kT drop that makes the stroke effectively irreversible, and
-    move it into the only state from which ADP release and detachment are
+    NOT the whole working stroke, despite the state names — most of the stroke
+    is on 1 -> 2; see the module docstring. What this step always does is commit
+    the head to the ~6 kT drop that makes the stroke effectively irreversible,
+    and move it into the only state from which ADP release and detachment are
     possible.
+
+    WHETHER IT ALSO MOVES THE HEAD DEPENDS ON THE PARAMETERS, and the two cases
+    are worth separating because the second one is new (2026-09-01).
+
+    Control case, *_tight_1 springs EQUAL to the *_strong ones. Tight_1 and
+    Tight_2 then share a spring configuration and a pair of spring constants, so
+    the transition produces no displacement, does no work and changes no force.
+    The same Bell factor appears in the reverse rate (xb_rate_32), so K_23 is
+    load-independent and load never redistributes heads between the pre- and
+    post-ADP-release states: the Huxley-Simmons redistribution between attached
+    states is absent from THIS leg and lives entirely on 1 -> 2, via E_diff.
+    There is no E_diff term here because the elastic energy is unchanged.
+
+    Shipped case, the split stroke. Tight_1 has its own rest configuration, so
+    this step carries 2.099 nm of the 8.791 nm axial swing (23.9%), does work,
+    and changes force. K_23 = exp(U_tight_1 - U_tight_2) is then strain-
+    dependent, because the two configurations differ elastically, and load DOES
+    redistribute heads between them. The elastic energy difference still does
+    not appear explicitly in this expression — it enters through U_tight_1 in
+    xb_rate_32, and the f fed to the Bell factor here is state 2's force
+    (f_tight1), not state 3's.
 
     Bell model: r23 = A23 * exp(-f * delta_23 / kT). A load resisting the head
     (f > 0) slows it. Physically, external load tilts the energy landscape
     against the transition state, and delta_23 is how far along the reaction
     coordinate that transition state sits.
 
-    Because there is no net displacement, the same factor appears in the reverse
-    rate (xb_rate_32), so K_23 is load-independent and load never redistributes
-    heads between the pre- and post-ADP-release states. The consequence is that
-    the Huxley-Simmons load-dependent redistribution between attached states is
-    absent from THIS leg; in this model it lives on 1 -> 2, via E_diff. See the
-    module docstring's caveat on delta_23 before changing this parameter.
+    delta_23 IS NOW COHERENT, which it was not before. A Bell transition-state
+    distance on a step with zero displacement had nothing to be a fraction of;
+    on a step carrying ~2.10 nm of swing, delta_23 = 1.0 nm is admissible as a
+    transition-state distance precisely because it is less than that
+    displacement. That is a new argument for the value, not a derivation of it:
+    1.0 nm was inherited from the stroke literature and has never been
+    re-derived for this step. See the module docstring's caveat before changing
+    it, and note xb_delta_34's coupling to it.
 
-    Unlike r12, there is no E_diff term here — the elastic energy is unchanged by
-    the transition, so only the load term matters.
+    OPEN, AND OUT OF SCOPE HERE: 1 -> 2 and 2 -> 3 now both carry displacement
+    but use two different formalisms for the same kind of physics — r12 is
+    A12*exp(E_diff/2), an elastic-energy difference with a symmetric barrier,
+    while this step is a Bell distance. Do NOT add an xb_delta_12 to "fix" it:
+    r12 does not use the Bell formalism at all and already has strain dependence
+    through E_diff, so a Bell distance there would either double-count against
+    E_diff or require reformulating the step. The question the split exposes is
+    genuine and is new physics.
 
     Args:
         A23: Zero-load rate (ms^-1) - params.xb_r23_coeff.
@@ -647,8 +723,9 @@ def xb_rate_23(A23, f_strong, delta23, k_t):
 def xb_rate_32(r23, U_tight_1, U_tight_2):
     """Rate 3->2: reverse of the Tight_1 <-> Tight_2 chemical transition.
 
-    Not a reverse working stroke — nothing moved on the forward step (see
-    xb_rate_23).
+    A reverse of the smaller part of the stroke at the shipped defaults, and of
+    nothing at all in the control configuration where the *_tight_1 springs
+    equal the *_strong ones (see xb_rate_23 for both cases).
 
     Detailed balance: r32 = r23 * exp(U_tight_2 - U_tight_1). At the default free
     energies (U_tight_1 = -15 kT, U_tight_2 = -21 kT) the 6 kT drop gives
@@ -656,15 +733,21 @@ def xb_rate_32(r23, U_tight_1, U_tight_2):
     asymmetry is what keeps heads in the ADP-release-competent state long enough
     to bear load and complete the cycle, rather than rattling back and forth.
 
-    Both free energies include the same elastic term (Tight_1 and Tight_2 share a
-    spring configuration), so it cancels IN THE DIFFERENCE. What that makes
-    strain-independent is the RATIO, not this rate: K_23 = r23/r32 is fixed at
+    IN THE CONTROL CONFIGURATION both free energies include the SAME elastic
+    term, so it cancels IN THE DIFFERENCE. What that makes strain-independent is
+    the RATIO, not this rate: K_23 = r23/r32 is fixed at
     exp(-(U_tight_2 - U_tight_1)) everywhere, so load cannot shift the 2/3
     population in either direction. r32 ITSELF is strongly strain-dependent,
     because it inherits r23's exp(-f*delta_23/kT) factor — measured over
     x in [-4, 21.5] nm it varies by ~8.5e5-fold. Load therefore slows both
     directions of this transition equally, which is the anomaly described in the
     module docstring's caveat on delta_23.
+
+    AT THE SHIPPED DEFAULTS the elastic terms differ — U_tight_1 carries
+    E_tight1 and U_tight_2 carries E_strong — so the cancellation is only
+    partial, K_23 becomes strain-dependent, and load does redistribute heads
+    between states 2 and 3. That is the split stroke doing its job; the anomaly
+    above is the control-path statement.
 
     Args:
         r23: Forward working-stroke rate (ms^-1)
@@ -765,8 +848,21 @@ def xb_rate_34(A34, f_strong, delta34, k_t):
     every occurrence of "load" is in the Introduction discussing other work. Its
     locator (PNAS 103(1):87-92) is correct; its content does not fit the claim.
 
-    Because delta_34 is a sweepable field, a NEGATIVE value is exactly a catch
-    bond, and the question can be explored without editing code.
+    RESOLVED 2026-09-01: the default is now NEGATIVE (-0.80 nm), i.e. a catch
+    bond, matching Sung's beta-cardiac measurement in this kernel's own sign
+    convention. Marang et al. 2025 PNAS 122:e2504758122 is a fifth measurement
+    on the same side, in the same Bell form, in rabbit fast skeletal: Fig. 6
+    caption, d = -0.89 +/- 0.12 nm at 0 mM added Pi, progressing to +0.34 nm at
+    30 mM Pi — so the slip result quoted from that paper's abstract is its
+    high-Pi arm, not a contradiction. Provenance and both isoforms:
+    core/params.py, xb_delta_34.
+
+    THE SLIP SIGN'S STATED JUSTIFICATION IS FALSIFIED, not merely unsourced. It
+    was that a catch bond "contradicts the fast unloaded shortening velocities".
+    Tested by length-controlled ramps (S129): V0 is 0.215 nm/ms shipped and
+    0.214 nm/ms with the catch bond — identical. V0 in this model is not
+    detachment-limited. What the catch bond does change is sub-V0 force, ~3x the
+    power output at 0.1 nm/ms.
 
     IT IS NOT SEPARABLE FROM delta_23, and how strongly they couple depends on
     the MAGNITUDE of this rate's Bell distance, not just its sign. Measured
@@ -780,10 +876,12 @@ def xb_rate_34(A34, f_strong, delta34, k_t):
 
     A catch bond takes over delta_23's job of retaining strained force-bearing
     heads, and the deeper the catch the more of that job it absorbs -- but at
-    -0.5 it absorbs only part of it. delta_23 is doing real load-dependent work
-    in the current (slip) configuration, which is why zeroing it there costs
-    ~80%. Sweep the two TOGETHER over both sign and magnitude; neither parameter
-    is interpretable alone, and a single-sign test will mislead.
+    -0.5 it absorbs only part of it. delta_23 was doing real load-dependent work
+    in the old (slip) configuration, which is why zeroing it there cost ~80%.
+    The table was measured BEFORE the split stroke, on a two-configuration
+    model; the direction holds, the percentages have not been re-measured.
+    Sweep the two TOGETHER over both sign and magnitude; neither parameter is
+    interpretable alone, and a single-sign test will mislead.
 
     References:
         Bell 1978 Science 200:618 (the functional form); Siemankowski & White 1984

@@ -47,10 +47,18 @@ if TYPE_CHECKING:
 # Elementary crossbridge transitions — exactly the non-zero off-diagonals of the
 # rate matrix built in kernels/transitions.py. States are 0-based:
 # 0 DRX, 1 Loose, 2 Tight_1, 3 Tight_2, 4 Free_2, 5 SRX.
+#
+# LABELS CORRECTED 2026-09-01. This block was never touched by the S127
+# stale-index fix (b63a724), so it still carried the 1-indexed scheme's names:
+# it called 1->2 "Pi release" and 2->3 "the working stroke". Both belong to
+# 1->2 in the 0-indexed scheme — see kernels/rate_functions.py, which is the
+# source of truth for what each transition physically is. Only the labels were
+# wrong; the WIRING has always been right (r23 has always been
+# Tight_1 -> Tight_2). Nothing computed here or anywhere else was affected.
 _XB_TRANSITION_PAIRS = (
-    (0, 1), (1, 0),   # attachment / weak detachment
-    (1, 2), (2, 1),   # weak-to-strong isomerization (Pi release) / reverse
-    (2, 3), (3, 2),   # working stroke / reverse stroke
+    (0, 1), (1, 0),   # weak attachment (Tm-gated) / weak detachment
+    (1, 2), (2, 1),   # Pi release + the larger part of the lever swing / reverse
+    (2, 3), (3, 2),   # AM.ADP isomerization, the smaller part of the swing / reverse
     (3, 4), (4, 3),   # ADP release and detachment / reverse (structurally zero)
     (4, 0), (0, 4),   # recovery stroke / reverse
     (0, 5), (5, 0),   # SRX sequestration / Ca-dependent recruitment
@@ -229,20 +237,30 @@ def validate_forces_numerical(state: 'State', constants: 'DynamicParams',
 
     # ------------------------------------------------------------------ setup
     # Per-crossbridge constants. Which spring configuration applies depends on
-    # the head's state: strong for Tight_1/Tight_2, weak for Loose. A head is
-    # attached only if it is in a bound state AND has a recorded partner site.
+    # the head's state: three of them since the split stroke (S129) — Loose
+    # (*_weak), Tight_1 (*_tight_1) and Tight_2 (*_strong). This validator is
+    # written independently of kernels/forces.py, so it must be split here too:
+    # left two-way it would silently disagree with the force kernel for every
+    # state-2 head, and the disagreement would read as a force-law bug.
+    # A head is attached only if it is in a bound state AND has a recorded
+    # partner site.
     n_xb_per_crown = xb_states.shape[2]
     xb_states_flat = xb_states.reshape(-1)
     xb_bound_flat = xb_bound_to.reshape(-1)
 
     is_bound = (xb_states_flat >= 1) & (xb_states_flat <= 3) & (xb_bound_flat >= 0)
-    is_strong = (xb_states_flat == 2) | (xb_states_flat == 3)
+    is_t2 = (xb_states_flat == 3)
+    is_t1 = (xb_states_flat == 2)
     bound_weight = is_bound.astype(jnp.float32)
 
-    g_k = jnp.where(is_strong, constants.xb_g_k_strong, constants.xb_g_k_weak)
-    g_rest = jnp.where(is_strong, constants.xb_g_rest_strong, constants.xb_g_rest_weak)
-    c_k = jnp.where(is_strong, constants.xb_c_k_strong, constants.xb_c_k_weak)
-    c_rest = jnp.where(is_strong, constants.xb_c_rest_strong, constants.xb_c_rest_weak)
+    g_k = jnp.where(is_t2, constants.xb_g_k_strong,
+                    jnp.where(is_t1, constants.xb_g_k_tight_1, constants.xb_g_k_weak))
+    g_rest = jnp.where(is_t2, constants.xb_g_rest_strong,
+                       jnp.where(is_t1, constants.xb_g_rest_tight_1, constants.xb_g_rest_weak))
+    c_k = jnp.where(is_t2, constants.xb_c_k_strong,
+                    jnp.where(is_t1, constants.xb_c_k_tight_1, constants.xb_c_k_weak))
+    c_rest = jnp.where(is_t2, constants.xb_c_rest_strong,
+                       jnp.where(is_t1, constants.xb_c_rest_tight_1, constants.xb_c_rest_weak))
 
     # Flat index of each head's partner site. Unbound heads carry -1, which would
     # wrap when used as an index, so clamp — their contribution is zeroed by

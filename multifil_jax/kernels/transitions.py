@@ -538,14 +538,59 @@ def thin_transitions(state: 'State',
 
     Sequence: build 27 rate matrices, exponentiate them in one batch, count each
     site's neighbours to get its configuration index, gather its probability
-    vector, override locked sites, then sample.
+    vector, bias locked sites, sample, then detach any head whose tropomyosin
+    closed underneath it.
 
-    LOCKED SITES. A site in state 3 with a crossbridge attached is forced to
-    stay there ([0, 0, 0, 1]) — the bound head physically blocks tropomyosin's
-    return. This is applied after the matrix exponential rather than by zeroing
-    rates, because whether a site is locked changes every timestep while the
-    rate matrices do not — folding it into Q would defeat the 27-matrix
-    reduction.
+    LOCKED SITES — A FINITE LOCK. A site in state 3 with a crossbridge attached
+    has its total exit probability divided by (1 + xb_tm_K2), with the other
+    entries rescaled proportionally: a bound head biases tropomyosin towards
+    open, it does not pin it. McKillop & Geeves 1993 Fig. 1 — one bound S1
+    multiplies the open/closed ratio by (1 + K2). See the xb_tm_K2 block in
+    core/params.py for the measured values and why some lock is necessary.
+    xb_tm_K2 = jnp.inf recovers the old hard [0, 0, 0, 1] lock bit-exactly.
+    This is applied after the matrix exponential rather than by zeroing rates,
+    because whether a site is locked changes every timestep while the rate
+    matrices do not — folding it into Q would defeat the 27-matrix reduction.
+
+    DETACHMENT ON CLOSURE. Once the lock is finite, tropomyosin CAN close over
+    a bound head, and that configuration has to mean something. Here the head
+    detaches: it goes to state 0 DRX and its bound_to is cleared on both sides.
+    xb_rate_01 gates attachment on permissiveness, so this model does not permit
+    a head to bind unless tropomyosin is fully open; leaving ANY bound head —
+    weak included — behind after closure would contradict the model's own
+    binding rule. Smith & Geeves 2003 Biophys J 84:3168, Abstract, verbatim:
+    "Myosin is detached by the actin binding of TnI".
+
+    REJECTED ALTERNATIVE, recorded so it is not mistaken for what the code does.
+    Vibert et al. 1997 J Mol Biol 266:8 (negative-stain 3D EM), Results p.13,
+    verbatim: in the off-state the residues taking part in "strong,
+    stereospecific myosin-binding ... are seen to lie beneath tropomyosin and
+    are therefore completely blocked ..., while residues 1 to 4 and 92 to 95,
+    thought to be involved in weak binding, remain exposed" — which would spare
+    weak heads and demote strong ones instead of detaching them. Taken seriously that implies
+    weak binding is tropomyosin-INDEPENDENT: r01 should not be gated either,
+    tropomyosin should gate 1 -> 2, and closure should demote. That is a
+    different model and is NOT what this function implements.
+
+    THIS IS A NON-ATP DETACHMENT. atp_expected_p is computed from the Q matrix
+    (P_abs_all[:, 3, 4]) so nothing is miscounted, but xb_tear_expected will not
+    see this route.
+
+    NOT QUITE EQUIVALENT TO THE S129 PROTOTYPE, and the residue is measured. The
+    patch stack that produced the validated cohort detached only STRONG heads
+    here and compensated by ungating r10, whose value at a covered site is then
+    41.4 /ms — argued to be the same thing at dt = 1 ms, since P(detach within
+    one step) rounds to 1 and this function runs before thick_transitions. It is
+    nearly the same thing, not exactly. Measured over 200 steps, cardiac 2x2,
+    pCa 6.2 (2026-09-01): of 24 weak heads caught by closure, the patch leaves 1
+    still bound after thick_transitions (r12 competes with r10 for the same
+    head), while detaching here returns the head to DRX one sub-step earlier, so
+    1 of them re-binds a different open site within the same step. Over a
+    150-step trace the two arms are bit-identical for 107 steps and then differ
+    by one bound head for three steps: 0.072% of peak axial force. Both are
+    ~1-in-24 events on a population that is itself rare. This form is the root
+    cause and the patch's was the workaround; the difference is recorded so that
+    nobody re-derives "exactly equivalent" from the algebra alone.
 
     Args:
         state: Current State (reads tm_states and bound_to)
@@ -614,9 +659,18 @@ def thin_transitions(state: 'State',
 
     prob_vectors = jax.vmap(lambda P, s: P[s])(P_indexed, tm_states_flat)
 
-    # Locked: in state 3 AND bound to XB → stay in state 3
+    # Locked: in state 3 AND bound to XB → biased towards staying in state 3.
+    # Divide the total exit probability by (1 + K2) and rescale the other
+    # entries proportionally, so the row still sums to 1. At K2 = jnp.inf this
+    # is bit-exactly the old hard lock with no branch: new_exit = exit/inf = 0,
+    # ratio = 0, the scaled row is prob*0 with entry 3 set to 1 - 0, i.e.
+    # exactly [0, 0, 0, 1] — and identically so in the tiny-exit branch below.
     locked_mask = (tm_states_flat == 3) & is_bound_flat
-    locked_prob = jnp.array([0.0, 0.0, 0.0, 1.0])
+    p_stay = prob_vectors[:, 3]
+    p_exit = jnp.clip(1.0 - p_stay, 0.0, 1.0)
+    new_exit = p_exit / (1.0 + constants.xb_tm_K2)
+    ratio = jnp.where(p_exit > 1e-12, new_exit / p_exit, 0.0)
+    locked_prob = (prob_vectors * ratio[:, None]).at[:, 3].set(1.0 - new_exit)
     prob_vectors = jnp.where(locked_mask[:, None], locked_prob, prob_vectors)
 
     if random_values is None:
@@ -627,8 +681,39 @@ def thin_transitions(state: 'State',
     new_states = jnp.argmax(random_values[:, None] < cum_probs, axis=1)
 
     new_tm_states = new_states.reshape(n_thin, n_sites).astype(jnp.int8)
-    new_thin = state.thin._replace(tm_states=new_tm_states)
-    new_state = state._replace(thin=new_thin)
+
+    # ---------------------------------------------------------------- closure
+    # Tropomyosin that closed over a bound head detaches it. See DETACHMENT ON
+    # CLOSURE in the docstring: every bound head, weak included, because
+    # xb_rate_01 lets nothing bind unless the site is fully open.
+    # Unreachable while xb_tm_K2 is jnp.inf — the lock and this trigger read the
+    # same bound_to, so a locked site can never leave state 3 — which is what
+    # makes the control path those six parameter values and no flag.
+    left = ((tm_states == 3) & (new_tm_states != 3) & (bound_to >= 0)).reshape(-1)
+
+    xb_shape = state.thick.xb_states.shape
+    xb_flat = state.thick.xb_states.reshape(-1)
+    n_xb = xb_flat.shape[0]
+
+    # thin.bound_to holds a FLAT crossbridge index (assigned from
+    # jnp.arange(n_xb_total)), so scatter the per-site flag onto heads by that
+    # index. Scatter-MAX, not add: unbound and unaffected sites clip to head 0
+    # and contribute 0, which cannot raise the flag of a head that did not move.
+    idx = jnp.clip(bound_to.reshape(-1), 0, n_xb - 1)
+    hit = jnp.zeros(n_xb, jnp.int32).at[idx].max(left.astype(jnp.int32)) == 1
+
+    new_xb_states = jnp.where(hit, jnp.int8(0), xb_flat).reshape(xb_shape)
+    # Clear bound_to on BOTH sides. If the site kept its record it would stay
+    # flagged occupied and nothing could ever rebind it.
+    new_xb_bound_to = jnp.where(
+        hit, jnp.int32(-1), state.thick.xb_bound_to.reshape(-1)).reshape(xb_shape)
+    new_bound_to = jnp.where(left.reshape(bound_to.shape), jnp.int32(-1), bound_to)
+
+    new_thin = state.thin._replace(tm_states=new_tm_states,
+                                   bound_to=new_bound_to)
+    new_thick = state.thick._replace(xb_states=new_xb_states,
+                                     xb_bound_to=new_xb_bound_to)
+    new_state = state._replace(thin=new_thin, thick=new_thick)
 
     return new_state, P_flat
 
@@ -677,9 +762,11 @@ def xb_rate_matrix(xb_distances: jnp.ndarray,
         lattice_spacing: Lattice spacing (nm). Redundant with the radial column
             of xb_distances in current callers, but kept explicit so callers can
             evaluate hypothetical geometries.
-        spring_constants: (n_xb, 8) two-spring parameters per head —
-            [:, 0:4] g_k_weak, g_rest_weak, c_k_weak, c_rest_weak
-            [:, 4:8] g_k_strong, g_rest_strong, c_k_strong, c_rest_strong
+        spring_constants: (n_xb, 12) two-spring parameters per head, one block
+            per bound configuration —
+            [:, 0:4]  g_k_weak, g_rest_weak, c_k_weak, c_rest_weak
+            [:, 4:8]  g_k_strong, g_rest_strong, c_k_strong, c_rest_strong
+            [:, 8:12] g_k_tight_1, g_rest_tight_1, c_k_tight_1, c_rest_tight_1
         permissiveness: (n_xb,) 1 if the target site's tropomyosin is open,
             else 0. Gates attachment entirely.
         ca_concentration: Calcium concentration (M), for SRX recruitment
@@ -708,6 +795,14 @@ def xb_rate_matrix(xb_distances: jnp.ndarray,
     g_r_strong = spring_constants[:, 5]
     c_k_strong = spring_constants[:, 6]
     c_r_strong = spring_constants[:, 7]
+    # Tight_1's own spring configuration (the split stroke, S129). Equal to the
+    # Tight_2 block in stiffness and distinct only in rest position at the
+    # shipped defaults, but read separately so the chemistry can never silently
+    # fall back to Tight_2's geometry.
+    g_k_t1 = spring_constants[:, 8]
+    g_r_t1 = spring_constants[:, 9]
+    c_k_t1 = spring_constants[:, 10]
+    c_r_t1 = spring_constants[:, 11]
 
     # Thermal energy kT, converted from J to pN*nm (1 J = 1e21 pN*nm).
     # Boltzmann's constant is written to 5 significant figures here (the CODATA
@@ -720,13 +815,20 @@ def xb_rate_matrix(xb_distances: jnp.ndarray,
               0.5 * c_k_weak * (theta - c_r_weak)**2) / k_t
     E_strong = (0.5 * g_k_strong * (r - g_r_strong)**2 +
                 0.5 * c_k_strong * (theta - c_r_strong)**2) / k_t
+    # THE FORCE LAW AND THE ENERGETICS MUST MOVE TOGETHER. U_tight_1, r21, r32
+    # and r12's E_diff all derive from state 2's elastic energy, and r23 must
+    # feel the force in state 2's configuration while r34 feels state 3's.
+    # Splitting only forces.py would leave the chemistry describing a different
+    # molecule from the mechanics.
+    E_tight1 = (0.5 * g_k_t1 * (r - g_r_t1)**2 +
+                0.5 * c_k_t1 * (theta - c_r_t1)**2) / k_t
 
     # Energy difference driving the weak->strong isomerization. Note this is a
     # plain subtraction, unlike compute_xb_energies() in rate_functions.py which
     # accumulates the same quantity term-wise to preserve float32 precision.
     # Here the inputs are bin-grid geometries rather than per-head positions, so
     # the cancellation is bounded and the simpler form is adequate.
-    E_diff = E_weak - E_strong
+    E_diff = E_weak - E_tight1
 
     # Chemical free energy of each state (kT). Adding the elastic energy to the
     # bound states below is what couples mechanics to chemistry: a strained head
@@ -738,11 +840,12 @@ def xb_rate_matrix(xb_distances: jnp.ndarray,
     U_tight_2_base = params.xb_U_tight_2
 
     U_loose = U_loose_base + E_weak
-    U_tight_1 = U_tight_1_base + E_strong
+    U_tight_1 = U_tight_1_base + E_tight1
     U_tight_2 = U_tight_2_base + E_strong
 
     # Calculate forces for force-dependent rates
     f_strong = g_k_strong * (r - g_r_strong) + (1.0/r) * c_k_strong * (theta - c_r_strong)
+    f_tight1 = g_k_t1 * (r - g_r_t1) + (1.0/r) * c_k_t1 * (theta - c_r_t1)
 
     # ========================================================================
     # RATE DEFINITIONS using consolidated params and imported rate functions
@@ -776,8 +879,12 @@ def xb_rate_matrix(xb_distances: jnp.ndarray,
     r12 = xb_rate_12(r12_coeff, E_diff)
     r21 = xb_rate_21(r12, U_loose, U_tight_1)
 
-    # 2 Tight_1 <-> 3 Tight_2 : the working stroke (load-dependent)
-    r23 = xb_rate_23(r23_coeff, f_strong, params.xb_delta_23, k_t)
+    # 2 Tight_1 <-> 3 Tight_2 : the AM.ADP isomerization (load-dependent).
+    # LABEL CORRECTED 2026-09-01: this line used to read "the working stroke",
+    # a survivor of the 1-indexed scheme that b63a724 missed. The stroke is
+    # split across 1->2 (the larger part) and this step; see
+    # rate_functions.xb_rate_23. The load is state 2's, not state 3's.
+    r23 = xb_rate_23(r23_coeff, f_tight1, params.xb_delta_23, k_t)
     r32 = xb_rate_32(r23, U_tight_1, U_tight_2)
 
     # 3 Tight_2 -> 4 Free_2 : ADP release and detachment; r43 is structurally 0
@@ -904,12 +1011,14 @@ def _build_xb_Q_bins(
 
     # Spring constants: same scalar for all bins
     spring_vec = jnp.array([
-        constants.xb_g_k_weak,   constants.xb_g_rest_weak,
-        constants.xb_c_k_weak,   constants.xb_c_rest_weak,
-        constants.xb_g_k_strong, constants.xb_g_rest_strong,
-        constants.xb_c_k_strong, constants.xb_c_rest_strong,
+        constants.xb_g_k_weak,    constants.xb_g_rest_weak,
+        constants.xb_c_k_weak,    constants.xb_c_rest_weak,
+        constants.xb_g_k_strong,  constants.xb_g_rest_strong,
+        constants.xb_c_k_strong,  constants.xb_c_rest_strong,
+        constants.xb_g_k_tight_1, constants.xb_g_rest_tight_1,
+        constants.xb_c_k_tight_1, constants.xb_c_rest_tight_1,
     ])
-    springs_grid = jnp.broadcast_to(spring_vec, (n_bins, 8))  # (n_bins, 8)
+    springs_grid = jnp.broadcast_to(spring_vec, (n_bins, 12))  # (n_bins, 12)
 
     # Q matrices for AP=0 and AP=1 at each bin position
     Q_ap0 = xb_rate_matrix(dist_grid, d, springs_grid,

@@ -431,6 +431,58 @@ _DYNAMIC_DEFAULTS = {
     'xb_g_k_strong':    5.0,       # [I] pN/nm
 
     # --------------------------------------------------------------------------
+    # THE SPLIT STROKE — Tight_1's own spring rest configuration (S129, landed
+    # 2026-09-01). Before this, Tight_1 (state 2) and Tight_2 (state 3) shared
+    # ONE spring set, so 2 -> 3 moved nothing and the whole lever swing sat on
+    # 1 -> 2. Capitanio et al. 2006 PNAS 103:87 measure the stroke as TWO steps
+    # — "first step (3.4-5.2 nm) ... followed by a smaller step (1.0-1.3 nm)" —
+    # i.e. 72-84% of the displacement on the first. State 2 is therefore placed
+    # at weak + 0.75*(strong - weak), which is inside that range:
+    #     xb_c_rest_tight_1 = 0.82309 + 0.75*(1.27758 - 0.82309) = 1.1639575
+    #     xb_g_rest_tight_1 = 19.93   + 0.75*(16.47   - 19.93  ) = 17.335
+    # ENDPOINTS AND TOTAL STROKE ARE UNCHANGED — only the partition moves.
+    # The four values are evaluated ONCE, here; there is no interpolation
+    # fraction anywhere in the kernels (no `frac` knob), so a site reading the
+    # wrong configuration is a visibly wrong parameter name rather than a
+    # silently missing computation.
+    #
+    # THE AXIAL PROJECTION IS NOT LINEAR IN THE FRACTION. x_rest = g_rest *
+    # cos(c_rest) gives 13.5516 / 6.8596 / 4.7604 nm for Loose / Tight_1 /
+    # Tight_2, so the 2 -> 3 sub-step is 2.0992 nm of an 8.7912 nm total —
+    # 23.88%, not 25%. Do NOT claim this matches Doran 2023's ~1.5 nm or
+    # Woody 2019's 1-1.5 nm second swing; 2.10 nm is ~1.4x those values. It is
+    # also a different quantity from the 5.837 nm "effective stroke" measured
+    # in S109 (project_strong_state_mechanical_degeneracy) — do not mix them.
+    #
+    # STIFFNESSES ARE NOT SPLIT: both equal the Tight_2 values, because the
+    # validated S129 arm interpolated REST POSITIONS ONLY (stroke_patch's
+    # stiff='strong'). Interpolating g_k/c_k as well softens state 2 by up to
+    # 12.5x and decomposes the population in the opposite direction; that arm
+    # was prototype scaffolding and is deliberately not carried over.
+    #
+    # HONEST COST: these are equal to the *_strong values BY CONSTRUCTION, not
+    # BY WIRING. local_projects/fitting_examples/library/bounds.py frees
+    # xb_g_k_strong and xb_c_k_strong, and a fit or sweep that moves those now
+    # leaves xb_*_k_tight_1 behind. Likewise "sweeping the split" now means
+    # moving xb_c_rest_tight_1 and xb_g_rest_tight_1 TOGETHER rather than
+    # turning one knob. Arguably more correct: the two rest positions need not
+    # be collinear between Loose and Tight_2, and that collinearity was an
+    # artifact of the interpolation, not a physical constraint.
+    #
+    # NAMING, DEFERRED. The state map is weak -> Loose (1), tight_1 -> Tight_1
+    # (2), strong -> Tight_2 (3). weak/strong was ACCURATE for a
+    # two-configuration model — Tight_1 and Tight_2 genuinely shared one spring
+    # set — and it is this change that makes _strong mean specifically Tight_2.
+    # The consistent rename _weak -> _loose, _strong -> _tight_2 is now
+    # warranted but is NOT done here: it touches the fitting bounds, the E525K
+    # parameter sets and ~a dozen local_projects/ files, and belongs in its own
+    # commit with a repair note (see the legacy-coop-removal precedent).
+    'xb_c_rest_tight_1': 1.1639575, # [I] rad — Tight_1 converter angle
+    'xb_c_k_tight_1':    40.0,      # [I] pN·nm/rad — equals Tight_2 (see above)
+    'xb_g_rest_tight_1': 17.335,    # [I] nm — Tight_1 head length
+    'xb_g_k_tight_1':    5.0,       # [I] pN/nm — equals Tight_2 (see above)
+
+    # --------------------------------------------------------------------------
     # TITIN — the passive elastic element
     #
     # Titin is a single giant protein spanning from the Z-disc to the thick
@@ -665,6 +717,40 @@ _DYNAMIC_DEFAULTS = {
     'tm_J_C': 0.0,   # [I] kT, coupling to closed (state-2) neighbours; inert here
     'tm_J_M': 2.70,  # [F] kT, coupling to open (state-3) neighbours; see above
 
+    # --------------------------------------------------------------------------
+    # THE CROSSBRIDGE LOCK — how strongly one bound head holds its tropomyosin
+    # open (S129, landed 2026-09-01). A bound head does not pin the site: it
+    # divides tropomyosin's total exit probability from the open state by
+    # (1 + K2) and rescales the other entries proportionally
+    # (kernels/transitions.thin_transitions).
+    #
+    # [L] McKillop & Geeves 1993 Biophys J 65:693. Fig. 1 caption, verbatim:
+    # "The ratio of open to closed structural units is defined by KT in the
+    # absence of any bound S1. With a single S1 bound per A7-Tm-Tn unit the
+    # ratio is KT(1 + K2)". Their Table 1 (p.697, +Ca rows, KB = 100) gives
+    # K2 = 241 (no nucleotide), 79 (phosphate), 18 (ADP). 79 is the phosphate
+    # value, i.e. the nucleotide state of a cycling head, and is what ships.
+    # K2 is a usable dial WITHIN that measured range: 18 relaxes fastest and
+    # makes least force, 241 makes most force and relaxes slowest (S129).
+    #
+    # THE SHIPPED HARD LOCK WAS THE K2 -> INFINITY LIMIT, and jnp.inf still
+    # reproduces it BIT-EXACTLY, with no branch: exit/inf = 0, the rescale ratio
+    # is 0, and the row becomes exactly [0, 0, 0, 1]. That is the control path.
+    # None is not available as a sentinel — DynamicParams.__init__ runs
+    # jnp.asarray on every field — so the sentinel is jnp.inf.
+    #
+    # A LOCK IS NECESSARY, NOT OPTIONAL. With none at all, tropomyosin leaves
+    # the open state at k_32 + k_30 = 1040 /s, so at dt = 1 ms every bound head
+    # is caught the step after it binds and force collapses (measured S129:
+    # amplitude 10769 -> 1214 pN). (1 + K2) gives the open state a 19-287 ms
+    # lifetime under a bound head across the measured K2 range.
+    #
+    # K2-SENSITIVITY CANNOT PROVE THIS IS LIVE. S132 measured K2 = 18 vs 241
+    # changing force by 0.04% at pCa 4.5 and 0.7% at pCa 6.2, because openness
+    # is already high and tropomyosin rarely tries to close. To check the
+    # mechanism, count closure events that carried a bound head — not force.
+    'xb_tm_K2': 79.0,  # [L] dimensionless; jnp.inf = the old hard lock
+
     # ==========================================================================
     # CROSSBRIDGE KINETICS
     #
@@ -746,19 +832,52 @@ _DYNAMIC_DEFAULTS = {
                              #     parameters used in obtaining this degree of
                              #     agreement", i.e. a FIT to tension transients (frog,
                              #     4 °C), not a measurement. Retagged [M] → [I].
-    'xb_delta_34': 0.5,      # [I] nm, distance to the detachment transition state.
-                             #     VERIFIED: Duke 1999 PNAS 96:2770 — with d = 11 nm
-                             #     and K = 1.3 pN/nm chosen, "the value of ε₂ then
-                             #     implies d' = 0.5 nm". [I] is the right tag: it is
-                             #     implied inside a model, not measured. CAVEAT: Duke's
-                             #     d' is a CONFORMATIONAL displacement of the lever on
-                             #     ADP release, whereas this parameter is used as a
-                             #     Bell transition-state distance. Measured Bell
-                             #     distances are larger — Sung 2015 0.8 ± 0.1 nm,
-                             #     Wang 2024 1.53–1.87 nm. Note this parameter
-                             #     trades off against xb_g_k_strong when fitting —
-                             #     stiffness and Bell distance can compensate for
-                             #     each other to give the same load sensitivity
+    'xb_delta_34': -0.80,    # [M] nm, distance to the detachment transition state.
+                             #     NEGATIVE = CATCH BOND: r34 = A34*exp(+f*δ₃₄/kT), so
+                             #     δ₃₄ < 0 means a resistive load SLOWS detachment.
+                             #     THE SIGN IS THE SUBSTANCE OF THIS VALUE, not the
+                             #     magnitude. Changed 0.5 -> -0.80 on 2026-09-01
+                             #     (S129 stack): every DIRECT measurement of this step
+                             #     gives a catch bond, and the model used a slip.
+                             #     * Sung et al. 2015 Nat Commun 6:7931 (human
+                             #       β-cardiac S1 — the isoform of the cardiac preset;
+                             #       harmonic force spectroscopy, saturating ATP), p.3:
+                             #       "myosin detaches faster under forward load
+                             #       (F0 < 0) and slower under backward load (F0 > 0)";
+                             #       p.4: "They average to k0 = 87 ± 7 s⁻¹ ... and
+                             #       d = 0.8 ± 0.1 nm (mean ± s.e.m., N = 7)". Their
+                             #       Eq. (1) carries exp(-F0*d/kBT), so their +0.8 nm
+                             #       is OUR -0.8 nm. That is where this value comes from.
+                             #     * Marang et al. 2025 PNAS 122:e2504758122 (rabbit
+                             #       psoas fast skeletal — the isoform of the SKELETAL
+                             #       preset; laser trap, 25 °C, 100 µM ATP) fit the SAME
+                             #       Bell equation this kernel uses, in the SAME sign
+                             #       convention: Fig. 6 caption, "kdet = k0 × exp(Fd/kT)
+                             #       ... k0 = 124.39 ± 9.47 s⁻¹ and d-value was
+                             #       -0.89 ± 0.12 nm, R² = 0.99 (0 mM added Pi)".
+                             #       RESOLVES A CONTRADICTION IN papers_index.md: the
+                             #       abstract's "detachment ... also increased at higher
+                             #       resistive forces" is the HIGH-Pi arm. d is [Pi]-
+                             #       dependent — Results p.5: "this value was strongly
+                             #       negative in the absence of added Pi, at -0.89 nm,
+                             #       but progressed to 0.34 nm in the presence of 30 mM
+                             #       Pi". At the low Pi this model represents, both
+                             #       papers and both isoforms agree on CATCH.
+                             #     SUPERSEDED SOURCE, kept because it is where 0.5 came
+                             #     from: Duke 1999 PNAS 96:2770 — with d = 11 nm and
+                             #     K = 1.3 pN/nm chosen, "the value of ε₂ then implies
+                             #     d' = 0.5 nm". That is implied INSIDE a model, not
+                             #     measured, and Duke's d' is a CONFORMATIONAL
+                             #     displacement of the lever on ADP release rather than
+                             #     a Bell transition-state distance. Measured Bell
+                             #     distances are also larger in magnitude than 0.5 —
+                             #     Sung 0.8, Wang 2024 1.53–1.87 nm.
+                             #     NEVER ZERO THIS ALONE. It trades off against
+                             #     xb_g_k_strong when fitting (stiffness and Bell
+                             #     distance compensate to the same load sensitivity),
+                             #     and xb_delta_23 has been observed to silently
+                             #     compensate for changes here — see the coupling table
+                             #     in rate_functions.xb_rate_34's docstring.
     'xb_r40': 0.1,           # [G] ms⁻¹ recovery stroke. Unsourced, inherited as a
                              #     hardcoded constant from an earlier version.
                              #     Caps the maximum cycling rate
