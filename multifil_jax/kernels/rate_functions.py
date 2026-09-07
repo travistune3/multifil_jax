@@ -61,12 +61,12 @@ in core/params.py reproduce.
 
 At the shipped defaults the *_tight_1 rest positions differ (see the split
 stroke block in core/params.py), so 2 -> 3 carries part of the lever swing:
-the axial rest projection g_rest*cos(c_rest) is 13.5516 / 6.8596 / 4.7604 nm
-for Loose / Tight_1 / Tight_2, i.e. 6.692 nm on 1 -> 2 and 2.099 nm — 23.9% of
+the axial rest projection g_rest*cos(c_rest) is 13.5516 / 6.6021 / 4.7604 nm
+for Loose / Tight_1 / Tight_2, i.e. 6.949 nm on 1 -> 2 and 1.842 nm — 21.0% of
 the 8.791 nm total — on 2 -> 3. Note the projection is NOT linear in the
-interpolation fraction the two rest positions were built from (0.75), and
-2.099 nm is ~1.4x the ~1.5 nm second swing quoted below, so it is NOT a match
-to Doran 2023 or Woody 2019. It is also a different quantity from the 5.837 nm
+interpolation fraction the two rest positions were built from (0.78), and
+1.842 nm is ~1.2-1.4x the ~1.5 nm second swing quoted below, so it is NOT a
+match to Doran 2023 or Woody 2019. It is also a different quantity from the 5.837 nm
 "effective stroke" measured mechanically in S109; do not mix the two.
 
 What separates the two states in every configuration is the ~6 kT free energy

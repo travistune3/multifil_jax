@@ -437,9 +437,15 @@ _DYNAMIC_DEFAULTS = {
     # 1 -> 2. Capitanio et al. 2006 PNAS 103:87 measure the stroke as TWO steps
     # — "first step (3.4-5.2 nm) ... followed by a smaller step (1.0-1.3 nm)" —
     # i.e. 72-84% of the displacement on the first. State 2 is therefore placed
-    # at weak + 0.75*(strong - weak), which is inside that range:
-    #     xb_c_rest_tight_1 = 0.82309 + 0.75*(1.27758 - 0.82309) = 1.1639575
-    #     xb_g_rest_tight_1 = 19.93   + 0.75*(16.47   - 19.93  ) = 17.335
+    # at weak + 0.78*(strong - weak), which is inside that range:
+    #     xb_c_rest_tight_1 = 0.82309 + 0.78*(1.27758 - 0.82309) = 1.1775922
+    #     xb_g_rest_tight_1 = 19.93   + 0.78*(16.47   - 19.93  ) = 17.2312
+    # 0.78 IS THE COHORT'S VALUE. cache_s129_v1 -- the 148-baseline cohort that
+    # Figure 8, the kinetics table and the force-pCa ladder are all drawn from --
+    # was run at 0.78 (S129/S130). 063a6da shipped 0.75 (S132's recipe) and left
+    # the core a near-neighbour of, rather than identical to, the model behind
+    # every published number. Moved to 0.78 on 2026-09-07 so the core IS that
+    # model. Do not move it back without re-running the cohort.
     # ENDPOINTS AND TOTAL STROKE ARE UNCHANGED — only the partition moves.
     # The four values are evaluated ONCE, here; there is no interpolation
     # fraction anywhere in the kernels (no `frac` knob), so a site reading the
@@ -447,10 +453,10 @@ _DYNAMIC_DEFAULTS = {
     # silently missing computation.
     #
     # THE AXIAL PROJECTION IS NOT LINEAR IN THE FRACTION. x_rest = g_rest *
-    # cos(c_rest) gives 13.5516 / 6.8596 / 4.7604 nm for Loose / Tight_1 /
-    # Tight_2, so the 2 -> 3 sub-step is 2.0992 nm of an 8.7912 nm total —
-    # 23.88%, not 25%. Do NOT claim this matches Doran 2023's ~1.5 nm or
-    # Woody 2019's 1-1.5 nm second swing; 2.10 nm is ~1.4x those values. It is
+    # cos(c_rest) gives 13.5516 / 6.6021 / 4.7604 nm for Loose / Tight_1 /
+    # Tight_2, so the 2 -> 3 sub-step is 1.8418 nm of an 8.7912 nm total —
+    # 20.95%, not 22%. Do NOT claim this matches Doran 2023's ~1.5 nm or
+    # Woody 2019's 1-1.5 nm second swing; 1.84 nm is ~1.2-1.4x those values. It is
     # also a different quantity from the 5.837 nm "effective stroke" measured
     # in S109 (project_strong_state_mechanical_degeneracy) — do not mix them.
     #
@@ -477,9 +483,9 @@ _DYNAMIC_DEFAULTS = {
     # warranted but is NOT done here: it touches the fitting bounds, the E525K
     # parameter sets and ~a dozen local_projects/ files, and belongs in its own
     # commit with a repair note (see the legacy-coop-removal precedent).
-    'xb_c_rest_tight_1': 1.1639575, # [I] rad — Tight_1 converter angle
+    'xb_c_rest_tight_1': 1.1775922, # [I] rad — Tight_1 converter angle
     'xb_c_k_tight_1':    40.0,      # [I] pN·nm/rad — equals Tight_2 (see above)
-    'xb_g_rest_tight_1': 17.335,    # [I] nm — Tight_1 head length
+    'xb_g_rest_tight_1': 17.2312,   # [I] nm — Tight_1 head length
     'xb_g_k_tight_1':    5.0,       # [I] pN/nm — equals Tight_2 (see above)
 
     # --------------------------------------------------------------------------
