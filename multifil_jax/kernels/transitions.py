@@ -558,8 +558,36 @@ def thin_transitions(state: 'State',
     xb_rate_01 gates attachment on permissiveness, so this model does not permit
     a head to bind unless tropomyosin is fully open; leaving ANY bound head —
     weak included — behind after closure would contradict the model's own
-    binding rule. Smith & Geeves 2003 Biophys J 84:3168, Abstract, verbatim:
-    "Myosin is detached by the actin binding of TnI".
+    binding rule.
+
+    >>> THAT SELF-CONSISTENCY ARGUMENT IS THE WHOLE JUSTIFICATION. Detachment
+    on closure is NOT a measured mechanism, and this docstring used to imply it
+    was. The nearest support is Smith & Geeves 2003 Biophys J 84:3168, Abstract,
+    verbatim: "Myosin is detached by the actin binding of TnI" — but that is
+    (a) about TnI competing with myosin for actin through oppositely-directed
+    kinks in a flexible chain, NOT about tropomyosin's azimuthal position
+    closing over a bound head, and (b) a PREDICTION OF THEIR MODEL, whose own
+    parameters are fitted, not an observation. It is a theoretical precedent for
+    a regulatory protein displacing myosin from actin. Cite it as that or not at
+    all. Nothing in .claude/papers/ measures this; part I of the same pair
+    records no detachment rate of any kind.
+
+    AND THE STRUCTURAL EVIDENCE OPPOSES THE WEAK-HEAD HALF — see the rejected
+    alternative below, which is not merely an option not taken but a direct
+    measurement pointing the other way.
+
+    >>> VIBERT DOES NOT DISCRIMINATE BETWEEN THIS MODEL AND THE OLD ONE, so do
+    not cite it as support for the change. It establishes that a closed
+    tropomyosin and an attached head are MUTUALLY EXCLUSIVE — a symmetric
+    geometric fact, satisfied equally by (a) the hard lock, where the excluded
+    configuration never arises, and (b) this code, where it arises and is
+    resolved by detaching. Three static structures cannot say which mechanism
+    prevents a state, only that the state does not exist.
+    THE ENTIRE CASE FOR THE FINITE LOCK IS McKILLOP'S TABLE 1: K2 is measured
+    at 241 / 79 / 18, all finite. The hard lock is the unmeasured K2 -> inf
+    limit. That one fact is what makes the old model wrong; Vibert then applies
+    only CONDITIONALLY — given that closure happens, the head cannot stay.
+    Ordering matters when this is written up: lead with K2, not with sterics.
 
     REJECTED ALTERNATIVE, recorded so it is not mistaken for what the code does.
     Vibert et al. 1997 J Mol Biol 266:8 (negative-stain 3D EM), Results p.13,
@@ -591,6 +619,14 @@ def thin_transitions(state: 'State',
     ~1-in-24 events on a population that is itself rare. This form is the root
     cause and the patch's was the workaround; the difference is recorded so that
     nobody re-derives "exactly equivalent" from the algebra alone.
+
+    >>> 0.072% IS SCOPED TO THOSE CONDITIONS AND IS NOT A BOUND. At 8x8, pCa 4.0,
+    5000 ms the WT force-pCa plateau differs by **+11.2%** between the patch
+    stack and this code (53.28 -> 59.24 kPa, measured 2026-09-08). frac
+    0.75-vs-0.78 accounts for -2.1% of that, wrong sign; the lock formula and the
+    rate matrix are byte-identical; the remaining candidates are this detach rule
+    and the patch's axial/radial mismatch. UNRESOLVED, deliberately deferred. Do
+    not quote 0.072% as the patch-core difference at other conditions.
 
     Args:
         state: Current State (reads tm_states and bound_to)

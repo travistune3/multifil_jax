@@ -739,6 +739,24 @@ _DYNAMIC_DEFAULTS = {
     # K2 is a usable dial WITHIN that measured range: 18 relaxes fastest and
     # makes least force, 241 makes most force and relaxes slowest (S129).
     #
+    # WHY THIS IS NOT CALCIUM-DEPENDENT, since it is the obvious question.
+    # In McKillop & Geeves calcium acts on K_B and K_T, NOT on K2 — "Calcium
+    # binding to Tn can influence either equilibrium constant" (THE MODEL,
+    # p. 694, of those two). Their Table 1 pairs K_B with calcium directly
+    # (+Ca -> K_B 100, -Ca -> 0.3, a 333x swing) and moves K_T ~3x, while K2
+    # varies only ~1.2x (phosphate 79/64, no-nucleotide 241/188) and NOT AT ALL
+    # for ADP (18/18) or BDM+Pi (3/3). K2 is a property of the myosin-nucleotide
+    # state, not of the regulatory system: it is the isomerization of an already
+    # bound head on an already open unit. Only K_T was fitted in that table
+    # (footnote "Numbers in bold were allowed to vary"; the bold column is K_T
+    # alone — invisible in the extracted text, confirmed on the page image).
+    # THE LOCK'S EFFECT IS CALCIUM-DEPENDENT ANYWAY, because it fires only on
+    # `open AND bound` and both populations are Ca-driven — structurally the
+    # same as (1 + K2) multiplying K_T. Measured (S132): K2 = 18 vs 241 moves
+    # force 0.04% at pCa 4.5 but 0.7% at pCa 6.2, a 17x larger response at
+    # submaximal calcium, because at saturating Ca tropomyosin rarely tries to
+    # close in the first place.
+    #
     # THE SHIPPED HARD LOCK WAS THE K2 -> INFINITY LIMIT, and jnp.inf still
     # reproduces it BIT-EXACTLY, with no branch: exit/inf = 0, the rescale ratio
     # is 0, and the row becomes exactly [0, 0, 0, 1]. That is the control path.
