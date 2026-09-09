@@ -42,11 +42,20 @@ specifically want realised events.
 NOT EVERY DETACHMENT COSTS AN ATP. A strongly bound head can back down the cycle,
 3 -> 2 -> 1 -> 0, without ever reaching Free_2, and pay nothing. That route is
 strain-gated at 2 -> 1 (see xb_rate_21) — it is how a badly-positioned head gives
-up rather than completing a cycle it cannot afford. xb_tear_expected counts it.
-atp_expected_p already excludes it, so the two are disjoint and their sum is
-total detachment of strongly bound heads. Measured on the cardiac preset, tearing
-is ~0.1% of detachments isometrically but 14-19% during imposed lengthening, so
-it is negligible for isometric work and emphatically not for work loops.
+up rather than completing a cycle it cannot afford. xb_tear_expected counts it,
+atp_expected_p excludes it. Measured on the cardiac preset, tearing is ~0.1% of
+detachments isometrically but 14-19% during imposed lengthening, so it is
+negligible for isometric work and emphatically not for work loops.
+
+THE TWO DO NOT SUM TO TOTAL STRONG DETACHMENT, and this docstring claimed they
+did until 2026-09-08. They are disjoint OUTCOMES — reached Free_2, versus
+reached DRX without passing through it, made mutually exclusive by trapping both
+in the same absorbing generator — but they are read over different STARTING
+sets. atp_expected_p runs over states 1-3, because a head can complete the whole
+cycle inside one step; xb_tear_expected runs over states 2-3 only, because a
+Loose head falling off is an ordinary failed weak attachment and not a
+load-driven tear. Their sum is therefore neither a partition of strong
+detachment nor of all detachment.
 
 (A third metric, atp_expected_q, was removed in Session 108. It capped each
 head's detachment rate at its zero-load value, which silently encoded a DIFFERENT
@@ -305,7 +314,6 @@ def compute_all_metrics(
     )
 
     old_xb_flat = old_xb.reshape(-1)
-    mask_state3 = (old_xb_flat == 3).astype(jnp.float32)
 
     # Expected ATP, from transition probabilities.
     #
@@ -313,11 +321,37 @@ def compute_all_metrics(
     # Free_2, which undercounts: a head can go 3 -> 4 -> 0 within one timestep,
     # spending an ATP but ending where a before/after comparison sees no
     # detachment at all. P_abs comes from a generator with states 4 and 0 made
-    # absorbing, so P_abs[3,4] is the probability of VISITING Free_2 at any
-    # point during the step — the quantity actually wanted. The error grows with
-    # dt and with detachment rate, so it is not negligible at the fast rates of
-    # skeletal myosin.
-    atp_expected_p = jnp.sum(mask_state3 * P_abs_all[:, 3, 4])
+    # absorbing, so P_abs[i,4] is the probability of VISITING Free_2 at any
+    # point during the step, having started in state i — the quantity wanted.
+    #
+    # READ FOR EVERY CYCLING HEAD, not only for heads that begin the step in
+    # Tight_2. There is no direct 2 -> 4 or 1 -> 4 transition; the point is that
+    # a head can clear two or three stages inside one timestep (2 -> 3 -> 4, or
+    # 1 -> 2 -> 3 -> 4) and spend a real ATP doing it. Masking on old_xb == 3,
+    # as this did until 2026-09-08, dropped every one of those. It is a
+    # discretisation bias rather than a missing pathway, and it scales as
+    # dt * r23 * r34 — largest on exactly the axes a tension-cost study sweeps.
+    #
+    # SIZE, measured 2026-09-08, pCa 4.5, dt = 1 ms, as a fraction of the
+    # corrected flux:  cardiac 7.6% (2x2), skeletal 33.5% (2x2).
+    # DO NOT quote the S115 figures (2.31% cardiac / 13.37% skeletal) for this
+    # change. Those were measured for the state-2 starters ALONE — see
+    # local_projects/tension_cost/old/audit_atp.py, whose whole premise is that
+    # P_abs[2,4] exists and is not read — and this mask also picks up state-1
+    # heads completing the entire cycle within one step. Same defect, strictly
+    # larger correction.
+    #
+    # States 0 and 5 are outside the mask and would contribute nothing anyway:
+    # row 0 is absorbing, and SRX can only reach DRX, which is also absorbing.
+    # State 4 is outside the mask and MUST be — row 4 is absorbing, so
+    # P_abs[4,4] = 1, and a head waiting in Free_2 for xb_rate_40 to fire would
+    # otherwise be charged a fresh ATP on every step it lingered there.
+    mask_cycling = ((old_xb_flat >= 1) & (old_xb_flat <= 3)).astype(jnp.float32)
+    atp_expected_p = jnp.sum(
+        mask_cycling * jnp.take_along_axis(
+            P_abs_all[:, :, 4], old_xb_flat[:, None].astype(jnp.int32), axis=1
+        )[:, 0]
+    )
 
     # Expected NON-ATP detachment ("tearing"), from the same absorbing matrix.
     #
