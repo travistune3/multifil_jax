@@ -36,11 +36,24 @@ not:
     atp_consumed     a stochastic count of realised events: heads observed to
                      leave Tight_2 via Free_2 or DRX, plus the same strong
                      closure tears. Noisy, and it undercounts multi-hop
-                     traversals (measured ~5% low at dt = 1 ms against a
-                     dt = 0.1 ms reference).
+                     traversals badly.
 
 Use atp_expected_p for rates and efficiencies, atp_consumed only when you
-specifically want realised events. Both are read against the MID state — the
+specifically want realised events.
+
+HOW WRONG IS atp_consumed? THE ANSWER IS PRESET-DEPENDENT AND THE SPREAD IS
+LARGE. This docstring said "~5% low at dt = 1 ms" without qualification until
+2026-09-11. That figure is CARDIAC ONLY. Measured against exact expected
+crossing counts (local_projects/tension_cost/atp_balance_spy.py), 8x8, dt = 1 ms:
+
+    cardiac    pCa 4.5  -5.0%    pCa 6.2  -5.3%
+    skeletal   pCa 4.5 -27.6%    pCa 6.2 -25.2%
+
+Skeletal turns over ~2.6x faster, so far more heads clear two or three stages
+inside one step and land outside the (mid == 3) -> {4, 0} window this counter
+reads. Do not carry the 5% figure into a skeletal tension-cost study; it is off
+by a factor of five. atp_expected_p over the same runs is -0.07% (cardiac) and
+-1.2% (skeletal), which is the reason it is the preferred key. Both are read against the MID state — the
 sarcomere as thick_transitions found it — not against the state at the top of
 the step; see compute_all_metrics.
 
@@ -457,6 +470,14 @@ def compute_all_metrics(
     # State 4 is outside the mask and MUST be — row 4 is absorbing, so
     # P_abs[4,4] = 1, and a head waiting in Free_2 for xb_rate_40 to fire would
     # otherwise be charged a fresh ATP on every step it lingered there.
+    # THE MASK ALSO IMMUNISES THIS METRIC AGAINST THE ONE FLUX THAT IS NOT IN
+    # Q. thick_transitions sends a head that sampled a bound state but lost the
+    # site race back to DRX (`is_binding & ~won`), which no generator predicts
+    # and which is 4.8-7.1% of binding attempts at dt = 1 ms. It cannot touch
+    # the sum below, because `is_binding` requires the head to start the step
+    # UNBOUND and this mask reads only states 1-3. That is an argument from the
+    # mask, not from the size of the effect — see the comment at that line.
+    #
     # THE TWO TERMS ARE DISJOINT BY CONSTRUCTION, not by an approximation. A
     # head torn off by tropomyosin is in state 0 or state 4 in `trace.state`, so
     # it is outside the 1..3 mask below and cannot be counted twice.
@@ -493,6 +514,16 @@ def compute_all_metrics(
     #     defensible at that size — but it is a systematic bias, not a rounding
     #     error, and a skeletal tension-cost study should either use dt = 0.1 ms
     #     or carry the correction.
+    #
+    #     CONFIRMED BY A SECOND, INDEPENDENT ROUTE 2026-09-11. The figures above
+    #     came from atp_estimator_spy.py, which compares this sum against
+    #     E[# of 3 -> 4 crossings] head by head. atp_balance_spy.py instead
+    #     scores the model's whole ATP ledger — net Pi release (N12 - N21)
+    #     against what is booked (N34 + strong tears), plus net hydrolysis
+    #     (N40 - N04) as a third route — and lands on the same numbers:
+    #     -0.066%/-0.057% cardiac, -1.19%/-1.12% skeletal. The ledger itself
+    #     closes to within the occupancy drift over the window, so the S137 tear
+    #     charge left no residual leak: see that script's header.
     mask_cycling = ((mid_xb_flat >= 1) & (mid_xb_flat <= 3)).astype(jnp.float32)
     atp_expected_p = n_tear_strong + jnp.sum(
         mask_cycling * jnp.take_along_axis(

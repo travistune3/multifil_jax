@@ -359,7 +359,10 @@ changed: one filament-length correction moved `frac_tm_state_3` from 13.5 % to
   an ATP molecule this step (state 3 → state 4, including 3 → 4 → 0 within one
   step), plus the strong closure tears below. Do not use this during imposed
   lengthening: 14–19 % of detachments there take the no-ATP give-up route, versus
-  ~0.1 % isometrically.
+  ~0.1 % isometrically. **It is also badly low at dt = 1 ms** — measured against
+  exact expected crossing counts, −5 % on the cardiac preset but **−25 to −28 %
+  on the skeletal preset**, which cycles ~2.6× faster and so runs far more heads
+  past this counter's window inside one step.
 - `'newly_bound'` — count of crossbridges that newly attached to actin
   (state 0 → state 1)
 - `'atp_expected_p'` — expected ATP consumption using the P-matrix method

@@ -1538,6 +1538,23 @@ def thick_transitions(state: 'State',
         # Binding failed — the site was taken before the step, or another head
         # won it during the step. One line now covers both; the old form saw
         # only the first.
+        #
+        # >>> THIS IS A FLUX THAT IS NOT IN Q, AND IT IS NOT SMALL. A head sent
+        #     back here did not follow its own generator: it is placed in DRX
+        #     regardless of which bound state it sampled. Measured 2026-09-11,
+        #     8x8, z 1100, dt = 1 ms, as a fraction of all heads that sampled a
+        #     bound state from 0/4/5: cardiac 4.8% (pCa 4.5) / 1.2% (pCa 6.2),
+        #     skeletal 7.1% / 5.3%. The realised endpoint histogram therefore
+        #     departs from xb_step_probabilities by ~45 heads per step at
+        #     cardiac pCa 4.5 — all of it moved from Loose into DRX.
+        #     ANY METRIC THAT READS P OR Q AS THE TRUTH ABOUT THE STEP must say
+        #     why that gap does not reach it. For atp_expected_p and
+        #     xb_tear_expected the answer is structural: they mask on mid states
+        #     1-3, which are ALREADY BOUND, so `is_binding` is false for every
+        #     head they read and none of them can be reverted. A metric masked
+        #     on state 0 would not have that protection.
+        #     The residue this leaves in the ATP ledger is bounded and measured
+        #     in local_projects/tension_cost/atp_balance_spy.py.
         new_states_flat = jnp.where(is_binding & (~won), 0, new_states_flat)
         new_xb_states = new_states_flat.reshape(n_thick, n_crowns, n_xb_per_crown).astype(jnp.int8)
     else:
