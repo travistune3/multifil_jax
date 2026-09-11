@@ -113,7 +113,8 @@ PADE6_B = jnp.array([
 def expm_pade6_batch(
     A_batch: jnp.ndarray,
     identity: jnp.ndarray,
-) -> jnp.ndarray:
+    with_integral: bool = False,
+):
     """Matrix exponential of a batch of small matrices, by scaling-and-squaring.
 
     Computes exp(A) for each matrix in the batch. Used to turn rate matrices
@@ -145,14 +146,80 @@ def expm_pade6_batch(
     silently bias. Any NaN that survives is replaced with a uniform distribution
     rather than propagating.
 
+    THE OCCUPANCY-TIME INTEGRAL (with_integral=True). Alongside exp(A) this can
+    return
+
+        phi1(A) = INT_0^1 exp(A u) du = (e^A - 1) / A
+
+    which is what turns a generator into EXPECTED CROSSING COUNTS: for Q held
+    constant over dt, with A = Q*dt,
+
+        E[# of i -> j crossings in dt | started in s] = q_ij * dt * phi1[s, i]
+
+    Counting the EDGE, rather than asking whether a state was reached, is what
+    makes this exact for multi-hop traversals AND for repeat crossings. See
+    matrix_exponential_batch() and xb_expected_crossings().
+
+    It is computed by the same scaling-and-squaring, one level at a time:
+
+        J <- 0.5 * (J + E @ J)      because with X = A/2^k,
+        E <- E @ E                  INT_0^2 exp(Xu)du = INT_0^1 + INT_1^2
+                                                      = J + E @ J,
+    the 0.5 renormalising back to the unit interval so J always means phi1 of
+    the CURRENT level's matrix. The base case reuses the powers step 4 already
+    computed:
+
+        phi1 = (I + X^2/6 + X^4/120 + X^6/5040)
+             + X @ (I/2 + X^2/24 + X^4/720)
+
+    whose leading truncation X^7/40320 is 1.9e-7 at ||X|| = 0.5, at the float32
+    epsilon floor. (A^-1 (E - I) is NOT available: a generator is singular by
+    construction, since its rows sum to zero.)
+
+    Rows of phi1 are renormalized for the same reason rows of exp(A) are, and
+    the justification is NOT by analogy: for a generator every row of exp(Qt)
+    sums to 1 at every t, so every row of INT_0^1 exp(Qu)du sums to 1 as well —
+    it is a mixture of stochastic matrices over the unit interval.
+
+    WHY THE INTEGRAL GETS ITS OWN fori_loop, AND WHY ITS MATMULS ARE PINNED TO
+    precision=HIGHEST. Both were forced by measurement (2026-09-11), and the
+    first version of this code had neither. Carrying J in the SAME loop carry as
+    `result` changes `result` by max |d| = 0.90 — not one ulp. ROOT CAUSE: XLA
+    lowers a loop body holding TWO einsums to the TF32 tensor-core GEMM on this
+    GPU while the one-einsum body here is not so lowered, and TF32's 10-bit
+    mantissa compounds over the 16 squarings the worst bins need (r12 reaches
+    1e4 /ms, so ||Q*dt|| reaches 2e4 on a matrix whose entries span 1e-20 to 1).
+    A separate loop keeps the probability path byte-for-byte identical to the
+    with_integral=False path — which is the whole premise of the metric work
+    this exists for — at the cost of 18 extra matmuls for a second copy of E.
+
+    ACCURACY, scored against float64 (scipy) on real settled Q_bins, 8x8,
+    dt = 1 ms, by local_projects/tension_cost/expm_integral_proto.py:
+        this kernel's phi1*dt   3.2e-04     (cardiac)  2.6e-04 (skeletal)
+        a float32 12x12 expm    2.3e-04                2.3e-04
+        this kernel's own P     6.3e-04                7.0e-04
+    i.e. the integral is MORE accurate than the probabilities it ships beside,
+    and every exported flux is good to < 2e-5 of its own total. 1e-5 absolute is
+    not reachable in float32 on these bins and never was.
+
+    DO NOT REPLACE THIS WITH expm([[A, I], [0, 0]]). Two reasons, both measured:
+    that block matrix's top rows sum to 1 + dt, so step 8's row normalization
+    silently wrecks it (max |d| 0.409 on entries <= 0.831); and it costs 3.5x a
+    6x6 expm and ~+20% of a BATCHED timestep (S138 [H]). It is cheaper than a
+    6x6 expm at batch 1 — 0.65x here — but that is the launch-bound regime, and
+    a sweep is not run at batch 1.
+
     Args:
         A_batch: (batch, n, n) matrices to exponentiate (typically Q * dt)
         identity: (n, n) identity from SarcTopology (eye_4 or eye_6). Passed in
             rather than built with jnp.eye(n) inside, which would make XLA
             materialize a fresh copy per batch element under vmap.
+        with_integral: also return phi1(A). Static — it changes the returned
+            pytree, so flipping it recompiles. The 4x4 tropomyosin call sites
+            leave it off and pay nothing.
 
     Returns:
-        (batch, n, n) matrix exponentials
+        (batch, n, n) matrix exponentials, or (exp(A), phi1(A)) if with_integral
     """
     batch_size, n, _ = A_batch.shape
 
@@ -183,7 +250,10 @@ def expm_pade6_batch(
     V = b[0]*I + b[2]*A2 + b[4]*A4 + b[6]*A6
 
     # Step 6: Solve (V - U) @ R = (V + U)
-    result = jnp.linalg.solve(V - U, V + U)
+    # `pade` is exp(A / 2^s), kept because the integral's loop (step 9) needs
+    # its own copy of E to double alongside J.
+    pade = jnp.linalg.solve(V - U, V + U)
+    result = pade
 
     # Step 7: Square s times using fori_loop for XLA fusion
     # Handles ||A|| up to 2^18 = 262144; 2 extra no-op iters for typical norms
@@ -201,7 +271,32 @@ def expm_pade6_batch(
     # Guard against NaN
     result = jnp.where(jnp.isnan(result), 1.0/n, result)
 
-    return result
+    if not with_integral:
+        return result
+
+    # Step 9 (optional): the occupancy-time integral phi1(A), by the same
+    # scaling-and-squaring one level at a time. Its own loop, at HIGHEST
+    # precision — see the docstring for why neither is negotiable.
+    HI = jax.lax.Precision.HIGHEST
+    phi_even = I + A2/6.0 + A4/120.0 + A6/5040.0
+    phi_odd_inner = I/2.0 + A2/24.0 + A4/720.0
+    J = phi_even + jnp.einsum('...ij,...jk->...ik', A_scaled, phi_odd_inner,
+                              precision=HI)
+
+    def _double_step(i, carry):
+        E, Jc = carry
+        should = i < s
+        J_dbl = 0.5 * (Jc + jnp.einsum('...ij,...jk->...ik', E, Jc, precision=HI))
+        E_sq = jnp.einsum('...ij,...jk->...ik', E, E, precision=HI)
+        return (jnp.where(should[:, None, None], E_sq, E),
+                jnp.where(should[:, None, None], J_dbl, Jc))
+
+    _, J = jax.lax.fori_loop(0, 18, _double_step, (pade, J))
+
+    J = J / jnp.sum(J, axis=2, keepdims=True)
+    J = jnp.where(jnp.isnan(J), 1.0/n, J)
+
+    return result, J
 
 
 # ============================================================================
@@ -324,8 +419,9 @@ def _build_xb_Q_matrix_optimized(r00, r01, r04, r05, r10, r11, r12,
 def matrix_exponential_batch(
     Q: jnp.ndarray,
     dt: float,
-    identity: Optional[jnp.ndarray] = None
-) -> jnp.ndarray:
+    identity: Optional[jnp.ndarray] = None,
+    with_integral: bool = False,
+):
     """Convert rate matrices into transition probability matrices over one step.
 
     P = expm(Q * dt). Entry P[i,j] is the probability that a unit currently in
@@ -334,19 +430,33 @@ def matrix_exponential_batch(
 
     Thin wrapper over expm_pade6_batch(); see there for the algorithm.
 
+    WITH with_integral, also returns the occupancy-time integral
+
+        G = INT_0^dt exp(Qt) dt = dt * phi1(Q*dt)
+
+    whose entry G[s, i] is the expected TIME a unit starting in state s spends in
+    state i during the step. Multiply by q_ij and you have the expected number of
+    i -> j crossings — the exact flux, including repeat crossings, which is what
+    the ATP metrics read. See expm_pade6_batch() for the algorithm and its cost.
+
     Args:
         Q: (n_matrices, n_states, n_states) rate matrices, rows summing to zero
         dt: Timestep length (ms)
         identity: (n_states, n_states) identity from the topology — topology.eye_4
             for tropomyosin, topology.eye_6 for crossbridges. Passing it in
             avoids XLA materializing a fresh identity per batch element.
+        with_integral: also return G. Static.
 
     Returns:
-        P: (n_matrices, n_states, n_states) row-stochastic probability matrices
+        P: (n_matrices, n_states, n_states) row-stochastic probability matrices,
+        or (P, G) if with_integral — G in units of dt (ms), P dimensionless.
     """
     # Scale Q by dt and compute exp using Pade6
     # Row normalization is done inside expm_pade6_batch
-    return expm_pade6_batch(Q * dt, identity=identity)
+    if not with_integral:
+        return expm_pade6_batch(Q * dt, identity=identity)
+    P, phi1 = expm_pade6_batch(Q * dt, identity=identity, with_integral=True)
+    return P, phi1 * dt
 
 
 # ============================================================================
@@ -1262,17 +1372,24 @@ def _gather_per_xb(X: jnp.ndarray, key: jnp.ndarray,
     return X[key] if labels is None else X[labels, key]
 
 
-def _expm_bins(Q: jnp.ndarray, dt: float, eye_6: jnp.ndarray) -> jnp.ndarray:
+def _expm_bins(Q: jnp.ndarray, dt: float, eye_6: jnp.ndarray,
+               with_integral: bool = False):
     """One batched matrix exponential, shape-agnostic in the leading dims.
 
     Accepts either (n_cells, 6, 6) or the stacked (K, n_cells, 6, 6) of an
     explicit subpopulation run, and returns the same shape. Flattening here
     rather than at each call site is what keeps the subpopulation modes from
     each needing their own reshape bookkeeping.
+
+    With with_integral, returns (P, G) in that same shape; see
+    matrix_exponential_batch().
     """
     shape = Q.shape
-    return matrix_exponential_batch(
-        Q.reshape(-1, 6, 6), dt, identity=eye_6).reshape(shape)
+    flat = Q.reshape(-1, 6, 6)
+    if not with_integral:
+        return matrix_exponential_batch(flat, dt, identity=eye_6).reshape(shape)
+    P, G = matrix_exponential_batch(flat, dt, identity=eye_6, with_integral=True)
+    return P.reshape(shape), G.reshape(shape)
 
 
 def xb_step_probabilities(
@@ -1305,6 +1422,77 @@ def xb_step_probabilities(
     Q_bins, key, labels = _xb_Q_resolved(state, constants, topology, xb_subpop)
     P_bins = _expm_bins(Q_bins, dt, topology.eye_6)
     return _gather_per_xb(P_bins, key, labels)
+
+
+#: Ordered pairs whose expected crossing counts the ATP metrics read.
+#: (1,0) free detachment, (1,2) Pi release, (2,1) the strain give-up reversal,
+#: (3,4) ATP-consuming detachment, (0,4)/(4,0) the reversible recovery stroke.
+XB_METRIC_PAIRS = ((1, 0), (1, 2), (2, 1), (3, 4), (0, 4), (4, 0))
+
+
+def xb_expected_crossings(
+    state: 'State',
+    constants: 'DynamicParams',
+    topology: 'SarcTopology',
+    dt: float,
+    xb_subpop=None,
+    pairs=XB_METRIC_PAIRS,
+) -> jnp.ndarray:
+    """How many times each head crosses each edge during the step. Metrics only.
+
+    The companion to xb_step_probabilities(): that one answers "what state is
+    this head in after dt", this one answers "how many times did it make the
+    i -> j transition on the way". For a generator held constant over the step —
+    the same assumption the sampler makes —
+
+        E[# of i -> j crossings in dt | started in s] = q_ij * G[s, i]
+        G = INT_0^dt exp(Qt) dt
+
+    and G comes free alongside P from the same scaling-and-squaring (see
+    expm_pade6_batch, with_integral).
+
+    WHY AN EDGE COUNT AND NOT A REACHABILITY PROBABILITY. Until 2026-09-11 the
+    ATP metrics asked "did this head VISIT Free_2 during the step", read from a
+    generator with rows 0 and 4 made absorbing. That is P(visit >= 1), which is a
+    LOWER BOUND on E(visits), so it was biased low whenever a head could cycle
+    twice inside one step: -0.07% cardiac, -1.2% skeletal at dt = 1 ms, measured
+    by two independent routes (S137 [F], S138 [E]). It also needed the absorbing
+    construction and its row mask purely to stop "reached state 4 from state 0"
+    counting r04, the reverse recovery stroke, as an ATP. Counting the EDGE
+    3 -> 4 cannot make that mistake, so the mask becomes unnecessary rather than
+    merely wrong, and every head can be read — including one that runs
+    0 -> 1 -> 2 -> 3 -> 4 inside a single step, which really does spend an ATP.
+
+    Reads each head's OWN start state from `state`, so pass the mid state from
+    KineticsTrace (the sarcomere as thick_transitions found it), not the state at
+    the top of the step. Built on the same _xb_Q_resolved / _gather_per_xb pair
+    as xb_step_probabilities, so subpopulation handling stays in the one place
+    that owns it.
+
+    Args:
+        state: State whose thick.xb_states give each head's starting state
+        constants: DynamicParams with physics values
+        topology: SarcTopology with xb_bin_edges, xb_bin_centers, eye_6
+        dt: Timestep length (ms)
+        xb_subpop: see _xb_Q_resolved
+        pairs: ordered (i, j) edges to count; defaults to XB_METRIC_PAIRS
+
+    Returns:
+        N: (len(pairs), n_xb_total) expected crossing counts, per head, over dt
+    """
+    Q_bins, key, labels = _xb_Q_resolved(state, constants, topology, xb_subpop)
+    _P_bins, G_bins = _expm_bins(Q_bins, dt, topology.eye_6, with_integral=True)
+
+    s = state.thick.xb_states.reshape(-1).astype(jnp.int32)
+    counts = []
+    for (i, j) in pairs:
+        # Expected time in state i, by starting state, times the i -> j rate.
+        # Ellipsis indexing covers the plain and the stacked (subpopulation)
+        # layouts alike, so neither mode needs its own branch.
+        per_cell = G_bins[..., :, i] * Q_bins[..., i, j][..., None]
+        per_xb = _gather_per_xb(per_cell, key, labels)          # (n_xb_total, 6)
+        counts.append(jnp.take_along_axis(per_xb, s[:, None], axis=1)[:, 0])
+    return jnp.stack(counts)
 
 
 def xb_exit_probabilities(
