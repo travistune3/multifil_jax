@@ -647,14 +647,22 @@ exponential per caller, never two.
   (`mean_field` blends generators, `explicit` keeps them stacked), no
   exponentials. This is the shared stage that guarantees sampling and metrics
   cannot disagree about the physics of a step.
-- `xb_step_probabilities(...)` → `P_all`. One expm of the plain generator. Used
-  by `thick_transitions()`.
-- `xb_exit_probabilities(...)` → `P_abs_all`. One expm of a generator
-  with **rows 4 and 0 both zeroed**, making Free_2 and DRX absorbing. Trapping
-  both exits makes them mutually exclusive, so a single matrix reports two
-  disjoint fluxes: `P_abs[i,3,4]` = detachment that consumed an ATP
-  (`atp_expected`), `P_abs[i,3,0]` = detachment via the reverse route
-  `3→2→1→0` that consumed none (`xb_tear_expected`). Metrics only.
+- `xb_binned_generator(...)` → `XBBins(Q, P, G, key, labels)`. **One** expm per
+  step, taken in `kinetics_step` and carried on `KineticsTrace`. `P = exp(Q·dt)`
+  is what `thick_transitions()` samples from; `G = ∫₀^dt exp(Qt)dt` is the
+  occupancy-time integral, which rides along for ~5 % more wall (measured, 400
+  matrices) and is what the metrics read.
+- `xb_expected_crossings(bins, states)` → `(n_pairs, n_xb)`. Exact expected
+  crossing counts, `E[# i→j | start s] = q_ij · G[s,i]`, for the pairs the ATP
+  metrics need. Metrics only.
+
+Until 2026-09-11 there were **two** exponentials per step: the second was of a
+generator with rows 4 and 0 zeroed (`xb_exit_probabilities`, now deleted), which
+made Free_2 and DRX absorbing so that `P_abs[i,3,4]` read "*visited* Free_2".
+That is `P(visit ≥ 1)`, a lower bound on `E(visits)`, and it was biased low by
+−0.07 % (cardiac) and −1.2 % (skeletal) at dt = 1 ms. Counting the **edge** 3→4
+is exact, needs no absorbing construction, and cannot confuse `r04` — the reverse
+recovery stroke — with hydrolysis.
 
 This replaces one expm per crossbridge with `2 × n_xb_bins` — ~6× fewer expm calls
 at 4×4, where the step was ~71 % matrix exponential. Binning resolution is set by
@@ -802,7 +810,7 @@ reported `lattice_spacing` are post-solve quantities); `trace.constants` carries
 the **pre-solve** one (the rates were evaluated there). Both are correct for
 their own question and must not be unified.
 
-Returns a `MetricsDict` with **57 keys** (same keys every call). Always computed —
+Returns a `MetricsDict` with **61 keys** (same keys every call). Always computed —
 no selection needed.
 
 **Metric groups (57 total):**
@@ -819,7 +827,8 @@ no selection needed.
 | Displacement | `thick_displace_mean/max/min/std`, `thin_displace_mean/max/min/std` | 8 |
 | Energy | `thick_energy_first_avg`, `thick_energy_first_delta_avg`, `titin_energy_avg`, `titin_energy_delta_avg` | 4 |
 | Work | `xb_work_on_filaments`, `sarcomere_work` | 2 |
-| Detachment / ATP | `atp_expected`, `xb_tear_expected`, `xb_work_per_atp` | 3 |
+| Detachment / ATP | `atp_expected`, `xb_work_per_atp` | 2 |
+| Cycle fluxes | `xb_detach_atp`, `xb_detach_free`, `xb_give_up`, `atp_net_pi_release`, `atp_net_hydrolysis` | 5 |
 | Solver | `newton_iters` | 1 |
 
 The **overlap-zone** group (`compute_overlap_tm_fractions()`) restricts the TM
@@ -832,12 +841,19 @@ sites. Prefer the `_overlap` variants whenever comparing across geometries — a
 filament-length change once moved the all-site metric 13.5 %→17.3 % almost
 entirely through that denominator while the true overlap value barely moved.
 
-Both come from the absorbing-state `P_abs` (rows 4 **and** 0 zeroed), built from
-`trace.state` and `trace.constants`: `atp_expected` reads `P_abs[·,s,4]` over
-every cycling start state `s` in 1–3, correctly counting `3→4→0` paths within one
-step, and `xb_tear_expected` reads `P_abs[·,{2,3},0]` — the give-up route, which
-spends no ATP. Trapping both exits makes them mutually exclusive, so one matrix
-exponential yields both. `trace.xb_subpop` carries the per-population rates.
+`atp_expected` is the **exact** expected number of ATP-consuming crossings:
+`q34 · G[s,3]` summed over **every** head, from its own mid state and its own
+generator, with no mask. `G` is the occupancy-time integral carried on
+`trace.xb_bins`, so the metric reads the very generator `thick_transitions`
+sampled from rather than rebuilding one.
+
+Every head is read, including those starting in states 0, 4 and 5, and that is
+correct — a head that runs `0→1→2→3→4` inside one step really does spend an ATP.
+The old mask existed because "reached state 4" *from state 0* would have counted
+`r04`, the non-ATP reverse recovery stroke; an edge count cannot make that
+mistake. A head torn off a closing site sits in state 4 and contributes exactly
+zero, structurally: `r43` is always zero, so it cannot reach Tight_2 within the
+step at all.
 
 `atp_expected` additionally carries the realised **strong closure tears**, as a
 count rather than an expectation: that event is fully observed and its charge is
@@ -937,7 +953,7 @@ global scale, bit-for-bit, in every mode.
 | `multifil_jax/core/sarc_geometry.py` | `SarcTopology` — PyTree topology, `create()`, `valid_xb_targets()` |
 | `multifil_jax/core/subpopulation.py` | `Subpopulation` dataclass + mask generation |
 | `multifil_jax/kernels/geometry.py` | `update_nearest_neighbors()` |
-| `multifil_jax/kernels/transitions.py` | `thin_transitions()`, `thick_transitions()`, `count_neighbor_states_split()`, `xb_step_probabilities()`, `xb_exit_probabilities()`, `expm_pade6_batch()` |
+| `multifil_jax/kernels/transitions.py` | `thin_transitions()`, `thick_transitions()`, `count_neighbor_states_split()`, `xb_binned_generator()`, `xb_expected_crossings()`, `expm_pade6_batch()` |
 | `multifil_jax/kernels/forces.py` | `xb_geometry()`, `xb_springs_for_state()`, `xb_elastic_energy()`, `xb_polar_forces()`, `polar_to_filament()` (the two-spring primitives — the rate path in `transitions.py` imports them too), `xb_axial_work()`, `axial_force_at_mline()`, `compute_forces_vectorized()`, `_xb_radial_force_total()`, `_titin_radial_force_total()` |
 | `multifil_jax/kernels/solver.py` | `solve_equilibrium()` (unified fixed/dynamic LS), Thomas algorithm |
 | `multifil_jax/kernels/rate_functions.py` | Rate functions (absolute values, no multipliers) |

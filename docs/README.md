@@ -365,13 +365,24 @@ changed: one filament-length correction moved `frac_tm_state_3` from 13.5 % to
   past this counter's window inside one step.
 - `'newly_bound'` — count of crossbridges that newly attached to actin
   (state 0 → state 1)
-- `'atp_expected'` — expected ATP consumption using the P-matrix method
-  (a smoother, expected-value estimate rather than stochastic count), plus the
-  strong closure tears. **Prefer this one.**
-- `'xb_tear_expected'` — expected NON-ATP detachments: strongly bound heads that
-  back down the cycle (3→2→1→0) without reaching Free_2. Disjoint from
-  `atp_expected`. ~0.1 % of detachments isometrically, 14–19 % during imposed
-  lengthening. It does **not** count closure tears.
+- `'atp_expected'` — the **exact** expected ATP consumption: the expected number
+  of `3→4` crossings, summed over every head, plus the strong closure tears.
+  **Prefer this one.** (Before 2026-09-11 it was `atp_expected_p` and estimated
+  `P(visit Free_2 at least once)`, a lower bound that ran −0.07 % low on cardiac
+  and −1.2 % on skeletal.)
+- `'xb_detach_atp'` — the ATP-consuming detachment flux alone, i.e.
+  `atp_expected` minus the closure charge.
+- `'xb_detach_free'` — a Loose head falling off having never bound ATP. An
+  ordinary failed weak attachment, not a load-driven event.
+- `'xb_give_up'` — the strain-gated `2→1` reversal, by which a badly-positioned
+  head backs out rather than completing a cycle it cannot afford. **Not a
+  detachment** — the head stays weakly bound. It refunds a phosphate and costs no
+  ATP. ~0.1 % of detachments isometrically, 14–19 % during imposed lengthening.
+- `'atp_net_pi_release'` / `'atp_net_hydrolysis'` — two independent ledger
+  cross-checks (`N12 − N21` and `N40 − N04`). At steady state both must equal
+  `atp_expected`. The residual is a martingale with sd ≈ 1.6 /ms at 8×8 over
+  300 ms, so a within-one-sigma drift is not a bug; and `atp_net_hydrolysis` is a
+  net of two *large* gross fluxes (`N04` is 29–82 % of the booked rate).
 - `'closure_detach_free'` — heads tropomyosin tore off a *weak* (Loose) binding.
   They return to DRX still primed and cost nothing.
 - `'closure_detach_atp'` — heads tropomyosin tore off a Tight_1 or Tight_2
@@ -1119,7 +1130,7 @@ and "active" only during specific steps.
 | `multifil_jax/core/sarc_geometry.py` | `SarcTopology.create()` — topology builder; `valid_xb_targets()` |
 | `multifil_jax/core/subpopulation.py` | `Subpopulation` — mixed motor populations |
 | `multifil_jax/kernels/geometry.py` | `update_nearest_neighbors()` — XB-to-BS distances |
-| `multifil_jax/kernels/transitions.py` | `thin_transitions()`, `thick_transitions()`, `count_neighbor_states_split()`, `xb_step_probabilities()`, `xb_exit_probabilities()` |
+| `multifil_jax/kernels/transitions.py` | `thin_transitions()`, `thick_transitions()`, `count_neighbor_states_split()`, `xb_binned_generator()`, `xb_expected_crossings()` |
 | `multifil_jax/kernels/forces.py` | The two-spring primitives (`xb_geometry()`, `xb_springs_for_state()`, `xb_elastic_energy()`, `xb_polar_forces()`, `polar_to_filament()`) — shared with the rate path — plus `axial_force_at_mline()`, `compute_forces_vectorized()`, `_xb_radial_force_total()`, `_titin_radial_force_total()` |
 | `multifil_jax/kernels/solver.py` | `solve_equilibrium()` (unified fixed/dynamic LS), Thomas algorithm |
 | `multifil_jax/kernels/rate_functions.py` | Crossbridge rate functions (geometry-dependent) |

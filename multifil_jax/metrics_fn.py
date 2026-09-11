@@ -52,10 +52,30 @@ the exact quantity and needs no absorbing construction. The remaining
 approximation is that Q is held constant across the step; that is a DIFFERENT
 error, it did not shrink when this one was removed, and only halving dt tests it.
 
+THAT TEST HAS NOW BEEN RUN (2026-09-11, the first time), AND THE ATP RATE IS NOT
+dt-CONVERGED. Halving dt to 0.5 ms, 8x8, per ms, split into the two terms:
+
+                  N34 (Q route)            closure tear        TOTAL
+    cardiac 4.5   48.07 -> 47.22 (-1.8%)   2.48 -> 3.11 (+26%)  -0.44%
+    cardiac 6.2   22.64 -> 21.14 (-6.6%)   3.32 -> 3.39 ( +2%)  -5.48%
+    skeletal 4.5 126.40 ->125.56 (-0.7%)   5.73 -> 6.80 (+19%)  +0.18%
+    skeletal 6.2  61.08 -> 60.18 (-1.5%)   7.14 -> 7.84 (+10%)  -0.29%
+
+READ THE SPLIT, NOT THE TOTAL. Estimator bias is exactly zero at BOTH timesteps,
+so every number here is a dynamics error: the N34 column is the constant-Q
+error above, and the closure-tear column is a separate, dt-dependent trigger
+(the tear fires on an ENDPOINT comparison, so a smaller step misses fewer
+closures). They have OPPOSITE SIGN and three of the four totals cancel to under
+0.5%, which would read as convergence and is not. Cardiac pCa 6.2 does not
+cancel: -5.5%, at SUBMAXIMAL calcium, which is the regime force-pCa work lives
+in. A cardiac submaximal tension-cost number at dt = 1 ms carries that error.
+
 HOW WRONG IS atp_consumed? THE ANSWER IS PRESET-DEPENDENT AND THE SPREAD IS
 LARGE. This docstring said "~5% low at dt = 1 ms" without qualification until
-2026-09-11. That figure is CARDIAC ONLY. Measured against the exact book side
-(local_projects/tension_cost/atp_balance_spy.py), 8x8, dt = 1 ms:
+2026-09-11. That figure is CARDIAC ONLY. Re-measured 2026-09-11 against the
+now-exact book side (local_projects/tension_cost/atp_balance_spy.py), 8x8,
+dt = 1 ms -- unchanged from the pre-Phase-1 figures, because atp_consumed was
+never the thing Phase 1 touched:
 
     cardiac    pCa 4.5  -5.0%    pCa 6.2  -5.3%
     skeletal   pCa 4.5 -27.6%    pCa 6.2 -25.2%
