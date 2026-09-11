@@ -187,7 +187,8 @@ try:
     plt.tight_layout()
     plt.savefig('hysteresis_analysis.png', dpi=150, bbox_inches='tight')
     print("\nPlot saved to hysteresis_analysis.png")
-    plt.show()
+    # No plt.show() — it blocks until dismissed by hand and the figure is
+    # already saved above. Same reason as examples/dynamic_lattice_spacing.py.
 except ImportError:
     print("\n(matplotlib not available, skipping plots)")
 

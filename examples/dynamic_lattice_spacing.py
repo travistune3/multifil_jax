@@ -264,4 +264,8 @@ plt.tight_layout()
 outfile = 'dynamic_lattice_spacing.png'
 plt.savefig(outfile, dpi=150, bbox_inches='tight')
 print(f"\nFigure saved to: {outfile}")
-plt.show()
+
+# DELIBERATELY NO plt.show(). It BLOCKS until the window is dismissed by hand,
+# which hangs every scripted, headless or CI run of this example — and the
+# figure is already on disk above either way. Open the png, or run this from a
+# notebook / an IDE cell if you want it inline.
