@@ -27,7 +27,7 @@ STEP ORDER
                               their chain neighbours
     4. thick transitions      heads sample new states; binding bookkeeping is
                               updated on both filaments
-    --- kinetics_step() returns here ---
+    --- kinetics_step() returns here, with a KineticsTrace of what it saw ---
     5. solve equilibrium      Newton-CG until net force on every node vanishes
 
 Note that no step of the kinetics phase reads z_line. Ising cooperativity takes
@@ -50,7 +50,7 @@ from typing import Tuple, Optional, TYPE_CHECKING
 from multifil_jax.kernels.geometry import update_nearest_neighbors
 from multifil_jax.kernels.transitions import thin_transitions, thick_transitions
 from multifil_jax.kernels.solver import solve_equilibrium
-from multifil_jax.core.state import Drivers, resolve_value
+from multifil_jax.core.state import Drivers, KineticsTrace, resolve_value
 
 if TYPE_CHECKING:
     from multifil_jax.core.sarc_geometry import SarcTopology
@@ -70,7 +70,7 @@ def kinetics_step(state: 'State',
                   *,
                   dt: float,
                   xb_subpop=None,
-                  tm_subpop=None) -> Tuple['State', jnp.ndarray, 'DynamicParams']:
+                  tm_subpop=None) -> Tuple['State', jnp.ndarray, KineticsTrace]:
     """Run the stochastic half of a timestep: everything except the force solve.
 
     Resolves the drivers, updates crossbridge geometry, then samples new
@@ -87,11 +87,20 @@ def kinetics_step(state: 'State',
         dt: Timestep size (ms) -- keyword-only, JIT static
 
     Returns:
-        (state_after_kinetics, new_rng_key, resolved_constants)
+        (state_after_kinetics, new_rng_key, trace)
 
-        resolved_constants carries the driver values baked in, so callers do not
+        trace is a KineticsTrace: the MID state (after thin_transitions, before
+        thick_transitions), the driver-resolved constants, the resolved
+        subpopulation tuple, and the closure-tear mask. Everything a metric
+        needs to describe the step that actually happened, gathered once here
+        rather than re-derived — see core/state.KineticsTrace.
+
+        trace.constants carries the driver values baked in, so callers do not
         have to redo the NaN-merge. A coupled solver may substitute a different
         z_line before equilibrating, via constants.with_drivers(...).
+
+        THE TRACE IS A WITHIN-STEP VALUE. It holds a whole State, so it must
+        never be put in a scan carry or a scan output.
     """
     # Step 0: Resolve drivers -- merge time-varying overrides with constants
     pCa = resolve_value(drivers.pCa, constants.pCa)
@@ -118,15 +127,22 @@ def kinetics_step(state: 'State',
     # thin_transitions from the current tm_states, so there is nothing to
     # precompute here.
     rng_key, thin_key = jax.random.split(rng_key)
-    state, _P_thin = thin_transitions(state, resolved_constants, topology, thin_key, dt,
-                                      tm_subpop=tm_subpop_r)
+    state, _P_thin, torn = thin_transitions(
+        state, resolved_constants, topology, thin_key, dt, tm_subpop=tm_subpop_r)
+
+    # Capture the trace HERE, between the two transition calls, because `state`
+    # is at this instant exactly what thick_transitions is about to build its
+    # generator from. A metric that rebuilds that generator has to build it from
+    # the same state or it describes a step that never happened.
+    trace = KineticsTrace(state=state, constants=resolved_constants,
+                          xb_subpop=xb_subpop_r, torn=torn)
 
     # Step 3: Thick filament transitions
     rng_key, thick_key = jax.random.split(rng_key)
     state = thick_transitions(state, resolved_constants, topology, thick_key, dt,
                               xb_subpop=xb_subpop_r)
 
-    return state, rng_key, resolved_constants
+    return state, rng_key, trace
 
 
 # ============================================================================
@@ -148,7 +164,8 @@ def timestep(state: 'State',
              precond_params=None,
              prefactored_precond=None,
              xb_subpop=None,
-             tm_subpop=None) -> Tuple['State', jnp.ndarray, jnp.ndarray, float, int]:
+             tm_subpop=None) -> Tuple['State', jnp.ndarray, jnp.ndarray, float,
+                                       int, KineticsTrace]:
     """Execute one timestep of the half-sarcomere simulation.
 
     Tiered Architecture:
@@ -180,14 +197,18 @@ def timestep(state: 'State',
             prescribed one otherwise.
         n_iters: Newton iterations taken, useful for spotting configurations
             where the solve is struggling.
+        trace: KineticsTrace for this step — the mid state, the resolved
+            constants, the resolved subpopulation tuple and the closure-tear
+            mask. Feed it straight to compute_all_metrics. Within-step only;
+            never carry it through a scan. See kinetics_step.
     """
-    state, rng_key, resolved_constants = kinetics_step(
+    state, rng_key, trace = kinetics_step(
         state, constants, drivers, topology, rng_key, dt=dt,
         xb_subpop=xb_subpop, tm_subpop=tm_subpop,
     )
 
     new_state, solver_residual, new_ls, n_iters = solve_equilibrium(
-        state, resolved_constants, topology,
+        state, trace.constants, topology,
         K_lat=K_lat, d_ref=d_ref,
         tolerance=solver_tol,
         n_cg_steps=n_cg_steps,
@@ -196,4 +217,4 @@ def timestep(state: 'State',
         prefactored_precond=prefactored_precond,
     )
 
-    return new_state, rng_key, solver_residual, new_ls, n_iters
+    return new_state, rng_key, solver_residual, new_ls, n_iters, trace

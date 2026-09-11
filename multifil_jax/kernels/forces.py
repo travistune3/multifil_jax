@@ -271,6 +271,157 @@ def compute_thin_passive_forces_vectorized(
 
 
 # ============================================================================
+# CROSSBRIDGE TWO-SPRING PRIMITIVES
+# ============================================================================
+#
+# The head is a linear (globular) spring of length r in series with an angular
+# (converter) spring at angle theta, anchored on the thick filament and reaching
+# to a binding site on the thin filament a lattice spacing d away:
+#
+#     U(r, theta) = 0.5*g_k*(r - g_rest)^2 + 0.5*c_k*(theta - c_rest)^2
+#
+# In the head's OWN polar frame that potential exerts two orthogonal forces:
+#
+#     F_r     = dU/dr        = g_k*(r - g_rest)          along the head
+#     F_theta = (1/r) dU/dtheta = (c_k/r)*(theta - c_rest)   across it
+#
+# and the forces the filaments feel are that pair ROTATED into the filament
+# frame by the head's own angle:
+#
+#     [F_axial ]   [cos(theta)  -sin(theta)] [F_r    ]
+#     [F_radial] = [sin(theta)   cos(theta)] [F_theta]
+#
+# with F_axial = dU/dx and F_radial = dU/dd. Writing it as a rotation is the
+# point: a rotation cannot lose a projection or flip one term's sign without
+# breaking orthonormality, and the invariant
+#
+#     F_axial^2 + F_radial^2 == F_r^2 + F_theta^2
+#
+# catches that whole class of error. It exists because the class was real —
+# the load-dependent rate path in transitions.py fed the Bell exponent
+# `F_r + F_theta`, which is neither an axial force nor any other force: both
+# projections dropped and the converter term's sign flipped relative to the
+# axial law. Every consumer of this potential now goes through these five
+# functions, so a change to the physics reaches all of them or none.
+#
+# All five are ELEMENTWISE. The force path calls them on (n_xb_total,) arrays,
+# the rate path on (n_bins,) grid geometries; nothing here reduces or reshapes.
+
+
+def xb_geometry(x_dist, lattice_spacing):
+    """Head polar geometry from its axial offset and the lattice spacing.
+
+    Args:
+        x_dist: Axial offset from crown to binding site (nm), site minus crown
+        lattice_spacing: Radial offset (nm) — a scalar, or per-element
+
+    Returns:
+        (r, theta, cos_theta, sin_theta). r is floored at 1e-10 in the
+        divisions and the trig ratios so a head sitting exactly on its site
+        cannot produce a NaN; theta comes from atan2 and needs no floor.
+    """
+    r = jnp.sqrt(x_dist**2 + lattice_spacing**2)
+    r_safe = jnp.where(r > 1e-10, r, 1e-10)
+    cos_theta = x_dist / r_safe
+    sin_theta = lattice_spacing / r_safe
+    theta = jnp.arctan2(lattice_spacing, x_dist)
+    return r, theta, cos_theta, sin_theta
+
+
+def xb_springs_for_state(xb_states_flat, params):
+    """The two-spring parameters of whichever configuration a head is in.
+
+    THREE configurations, not two: state 1 Loose (*_weak), state 2 Tight_1
+    (*_tight_1) and state 3 Tight_2 (*_strong). Tight_1 gained its own rest
+    configuration with the split stroke (S129) — see the _DYNAMIC_DEFAULTS
+    block on xb_c_rest_tight_1. A plain three-way select, no interpolation:
+    there is no fraction to forget.
+
+    Detached heads (states 0, 4, 5) fall through to the weak block. Nothing
+    reads their force — every caller masks on `is_bound` — so the value is
+    arbitrary; what matters is that it is finite and needs no branch.
+
+    Args:
+        xb_states_flat: (n,) integer crossbridge states
+        params: DynamicParams carrying the xb_{g,c}_{k,rest}_* fields
+
+    Returns:
+        (g_k, g_rest, c_k, c_rest), each (n,)
+    """
+    is_t2 = (xb_states_flat == 3)
+    is_t1 = (xb_states_flat == 2)
+
+    # Globular domain (linear spring)
+    g_k = jnp.where(is_t2, params.xb_g_k_strong,
+                    jnp.where(is_t1, params.xb_g_k_tight_1, params.xb_g_k_weak))
+    g_rest = jnp.where(is_t2, params.xb_g_rest_strong,
+                       jnp.where(is_t1, params.xb_g_rest_tight_1, params.xb_g_rest_weak))
+
+    # Converter domain (angular spring)
+    c_k = jnp.where(is_t2, params.xb_c_k_strong,
+                    jnp.where(is_t1, params.xb_c_k_tight_1, params.xb_c_k_weak))
+    c_rest = jnp.where(is_t2, params.xb_c_rest_strong,
+                       jnp.where(is_t1, params.xb_c_rest_tight_1, params.xb_c_rest_weak))
+
+    return g_k, g_rest, c_k, c_rest
+
+
+def xb_elastic_energy(r, theta, g_k, g_rest, c_k, c_rest):
+    """Elastic energy stored in the two springs at this geometry.
+
+        U = 0.5*g_k*(r - g_rest)^2 + 0.5*c_k*(theta - c_rest)^2
+
+    Returns pN*nm. The rate path divides by kT to get kT units; the caller
+    does that, not this function, so the mechanical and chemical sides cannot
+    disagree about what a joule is.
+    """
+    return 0.5 * g_k * (r - g_rest)**2 + 0.5 * c_k * (theta - c_rest)**2
+
+
+def xb_polar_forces(r, theta, g_k, g_rest, c_k, c_rest):
+    """The two spring forces in the head's own frame.
+
+        F_r     = g_k*(r - g_rest)             along the head
+        F_theta = (c_k/r)*(theta - c_rest)     perpendicular to it
+
+    These are the gradients of `xb_elastic_energy` in polar coordinates. They
+    are NOT forces on a filament and must never be added together: they are
+    orthogonal components, and summing them is the bug this module's header
+    describes. Rotate them with `polar_to_filament` first.
+
+    `f . r_hat` — the load along the head, if a rate ever wants it — is the
+    first return value, no extra function needed.
+    """
+    r_safe = jnp.where(r > 1e-10, r, 1e-10)
+    F_r = g_k * (r - g_rest)
+    # Written (1/r)*c_k*dtheta rather than (c_k/r)*dtheta: same quantity, but
+    # the reciprocal-first association is what the axial and radial laws used
+    # before they were consolidated, and keeping it makes the consolidation
+    # bit-exact against the golden master instead of last-ulp-different.
+    F_theta = (1.0 / r_safe) * c_k * (theta - c_rest)
+    return F_r, F_theta
+
+
+def polar_to_filament(F_r, F_theta, cos_theta, sin_theta):
+    """Rotate the head's polar forces into the filament frame.
+
+        F_axial  = F_r*cos(theta) - F_theta*sin(theta)   ( = dU/dx )
+        F_radial = F_r*sin(theta) + F_theta*cos(theta)   ( = dU/dd )
+
+    THE MINUS ON THE AXIAL CONVERTER TERM IS THE S50 SIGN AND IS NOT
+    NEGOTIABLE (see the DO-NOT-REGRESS list). It is not a convention: the
+    rotation is orthonormal, and flipping it breaks
+    F_axial^2 + F_radial^2 == F_r^2 + F_theta^2.
+
+    Returns:
+        (F_axial, F_radial), same shape as the inputs.
+    """
+    F_axial = F_r * cos_theta - F_theta * sin_theta
+    F_radial = F_r * sin_theta + F_theta * cos_theta
+    return F_axial, F_radial
+
+
+# ============================================================================
 # CROSSBRIDGE FORCES (Fully Vectorized)
 # ============================================================================
 
@@ -407,11 +558,16 @@ def _xb_axial_forces_flat(
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Axial force exerted by EVERY crossbridge, flat, plus its thin-site index.
 
-    The two-spring force law lives here and only here -- both the solver path
-    (`compute_xb_forces_vectorized`) and the by-state accounting
-    (`xb_axial_force_by_state`) call this, so a change to the physics cannot
-    reach one and miss the other. See `compute_xb_forces_vectorized` for the
-    geometry and the sign conventions, including why the angular term is minus.
+    The two-spring force law lives in the primitives at the top of this module
+    and only there. This function is the flat axial view of it; the solver path
+    (`compute_xb_forces_vectorized`), the by-state accounting
+    (`xb_axial_force_by_state`), the radial path (`_xb_radial_force_total`) and
+    THE LOAD-DEPENDENT RATE PATH (`transitions.xb_rate_matrix`, which imports
+    `xb_polar_forces` and `polar_to_filament` directly) all read the same
+    primitives, so a change to the physics cannot reach one and miss another.
+    The rate path is the one that did miss: it built its own scalar inline and
+    was wrong from the initial commit until 2026-09-09. See the primitives
+    header for the geometry, the sign conventions and the invariant.
 
     Returns:
         forces: (n_xb_total,) axial force per crossbridge, 0 where unbound
@@ -452,56 +608,92 @@ def _xb_axial_forces_flat(
     # Calculate distances
     x_dist = bs_positions - xb_positions_flat
 
-    # Crossbridge force calculation (two-spring model)
-    r = jnp.sqrt(x_dist**2 + lattice_spacing**2)
-
-    # OPTIMIZED: Algebraic substitution for trig functions
-    r_safe = jnp.where(r > 1e-10, r, 1e-10)
-    cos_theta = x_dist / r_safe
-    sin_theta = lattice_spacing / r_safe
-    theta = jnp.arctan2(lattice_spacing, x_dist)
-
-    # Get spring parameters based on state. THREE configurations, not two:
-    # state 1 Loose (*_weak), state 2 Tight_1 (*_tight_1) and state 3 Tight_2
-    # (*_strong). Tight_1 gained its own rest configuration with the split
-    # stroke (S129) — see the _DYNAMIC_DEFAULTS block on xb_c_rest_tight_1.
-    # A plain three-way select, no interpolation: there is no fraction to
-    # forget, so this site and _xb_radial_force_total cannot drift apart.
-    is_t2 = (xb_states_flat == 3)
-    is_t1 = (xb_states_flat == 2)
-
-    # Extract scalar params (attribute access)
-    c_rest_strong = params.xb_c_rest_strong
-    c_rest_weak = params.xb_c_rest_weak
-    c_k_strong = params.xb_c_k_strong
-    c_k_weak = params.xb_c_k_weak
-    g_rest_strong = params.xb_g_rest_strong
-    g_rest_weak = params.xb_g_rest_weak
-    g_k_strong = params.xb_g_k_strong
-    g_k_weak = params.xb_g_k_weak
-
-    # Converter domain (angular spring)
-    c_rest = jnp.where(is_t2, c_rest_strong,
-                       jnp.where(is_t1, params.xb_c_rest_tight_1, c_rest_weak))
-    c_k = jnp.where(is_t2, c_k_strong,
-                    jnp.where(is_t1, params.xb_c_k_tight_1, c_k_weak))
-
-    # Globular domain (linear spring)
-    g_rest = jnp.where(is_t2, g_rest_strong,
-                       jnp.where(is_t1, params.xb_g_rest_tight_1, g_rest_weak))
-    g_k = jnp.where(is_t2, g_k_strong,
-                    jnp.where(is_t1, params.xb_g_k_tight_1, g_k_weak))
-
-    # Calculate axial force using algebraic trig
-    # Sign: F_crown_x = -∂U_g/∂x_crown - ∂U_c/∂x_crown
-    #   = +g_k*(r-g_rest)*cos_theta - (c_k/r)*(theta-c_rest)*sin_theta
-    f_axial = (g_k * (r - g_rest) * cos_theta -
-               (1.0 / r_safe) * c_k * (theta - c_rest) * sin_theta)
+    # Two-spring force law, via the shared primitives at the top of this module.
+    r, theta, cos_theta, sin_theta = xb_geometry(x_dist, lattice_spacing)
+    g_k, g_rest, c_k, c_rest = xb_springs_for_state(xb_states_flat, params)
+    F_r, F_theta = xb_polar_forces(r, theta, g_k, g_rest, c_k, c_rest)
+    f_axial = polar_to_filament(F_r, F_theta, cos_theta, sin_theta)[0]
 
     # Zero force for unbound XBs
     forces = jnp.where(is_bound, f_axial, 0.0)
 
     return forces, thin_flat_idx
+
+
+def xb_axial_work(
+    pos_thick_old: jnp.ndarray,
+    pos_thin_old: jnp.ndarray,
+    ls_old,
+    pos_thick_new: jnp.ndarray,
+    pos_thin_new: jnp.ndarray,
+    ls_new,
+    xb_states: jnp.ndarray,
+    xb_bound_to: jnp.ndarray,
+    params: 'DynamicParams',
+    geometry: 'SarcTopology',
+) -> jnp.ndarray:
+    """Work done ON the filament lattice BY the crossbridges over one step.
+
+    This is the quantity a tension-cost study wants in the numerator of an
+    efficiency: what the motors actually delivered, per ATP they actually spent.
+    It is NOT the work the half-sarcomere does externally — under an isometric
+    hold that is exactly zero while heads are still cycling and spending. Use
+    `sarcomere_work` for the external quantity; the two are different questions
+    and metrics_fn reports both.
+
+    SIGN CONVENTION, derived from this module and not chosen here.
+    `x = site - crown` (see `_xb_axial_forces_flat`) and `F_axial = dU/dx` (see
+    `polar_to_filament`), so the force the SPRING exerts is -F_axial and the
+    work a head does on the lattice is `-F_axial * dx`. A head pulling its site
+    towards the M-line as the lattice moves that way returns a POSITIVE number.
+
+    THE ATTACHED POPULATION IS THE NEW ONE, and both force evaluations use it.
+    States change in the kinetics phase and positions change in the solve, in
+    that order, so the heads that were attached DURING the displacement are the
+    heads `xb_states` names after kinetics. Passing the old states instead would
+    credit a head for a displacement it was not attached for.
+
+    Trapezoid in force: `0.5*(f_old + f_new) * dx`. The force law is nonlinear
+    in position, so this is second-order accurate in the step, not exact — the
+    error falls quadratically as dt shrinks, which
+    `local_projects/regression/xb_force_law_invariant.py` checks against
+    `xb_elastic_energy` directly.
+
+    >>> AXIAL COMPONENT ONLY. In dynamic-LS mode the lattice spacing `d` also
+        changes over the step, and the radial force does real work that this
+        does not capture. `F_radial = dU/dd` is available from the same
+        primitives if that term is ever wanted; it is deliberately not folded in
+        here, because then the number would stop being comparable between fixed
+        and dynamic LS runs without saying so.
+
+    Args:
+        pos_thick_old/pos_thin_old/ls_old: lattice before the equilibrium solve
+        pos_thick_new/pos_thin_new/ls_new: lattice after it
+        xb_states, xb_bound_to: the post-kinetics population (see above)
+        params: DynamicParams carrying the xb_{g,c}_{k,rest}_* fields
+        geometry: SarcTopology, for xb_to_thin_id
+
+    Returns:
+        Scalar work in pN*nm, summed over every crossbridge. Unbound heads carry
+        zero force at both ends, so no mask is applied or needed.
+    """
+    f_old, thin_flat_idx = _xb_axial_forces_flat(
+        pos_thick_old, pos_thin_old, xb_states, xb_bound_to,
+        ls_old, params, geometry)
+    f_new, _ = _xb_axial_forces_flat(
+        pos_thick_new, pos_thin_new, xb_states, xb_bound_to,
+        ls_new, params, geometry)
+
+    # Reuse the site mapping the force helper already resolved rather than
+    # rebuilding it: it is the same clip-and-flatten, and two copies could drift.
+    n_xb_per_crown = xb_states.shape[2]
+
+    def _x(pos_thick, pos_thin):
+        return (pos_thin.reshape(-1)[thin_flat_idx]
+                - jnp.repeat(pos_thick.reshape(-1), n_xb_per_crown))
+
+    dx = _x(pos_thick_new, pos_thin_new) - _x(pos_thick_old, pos_thin_old)
+    return -jnp.sum(0.5 * (f_old + f_new) * dx)
 
 
 # ============================================================================
@@ -779,29 +971,15 @@ def _xb_radial_force_total(
     bs_positions = positions_thin_flat[thin_flat_idx]
     x_dist = bs_positions - xb_positions_flat
 
-    r = jnp.sqrt(x_dist**2 + lattice_spacing**2)
-    r_safe = jnp.where(r > 1e-10, r, 1e-10)
-    cos_theta = x_dist / r_safe
-    sin_theta = lattice_spacing / r_safe
-    theta = jnp.arctan2(lattice_spacing, x_dist)
-
-    # Same three-way spring select as _xb_axial_forces_flat. The S129 prototype
-    # patch could not reach this function (it rewrote one function's source);
-    # splitting it here removes the axial/radial mismatch that would otherwise
-    # exist for every state-2 head under dynamic lattice spacing.
-    is_t2 = (xb_states_flat == 3)
-    is_t1 = (xb_states_flat == 2)
-    c_rest = jnp.where(is_t2, params.xb_c_rest_strong,
-                       jnp.where(is_t1, params.xb_c_rest_tight_1, params.xb_c_rest_weak))
-    c_k = jnp.where(is_t2, params.xb_c_k_strong,
-                    jnp.where(is_t1, params.xb_c_k_tight_1, params.xb_c_k_weak))
-    g_rest = jnp.where(is_t2, params.xb_g_rest_strong,
-                       jnp.where(is_t1, params.xb_g_rest_tight_1, params.xb_g_rest_weak))
-    g_k = jnp.where(is_t2, params.xb_g_k_strong,
-                    jnp.where(is_t1, params.xb_g_k_tight_1, params.xb_g_k_weak))
-
-    f_radial = (g_k * (r - g_rest) * sin_theta +
-                (1.0 / r_safe) * c_k * (theta - c_rest) * cos_theta)
+    # The SAME primitives as _xb_axial_forces_flat, taking the other component
+    # of the same rotation. The S129 prototype patch could not reach this
+    # function (it rewrote one function's source); sharing the law here removes
+    # the axial/radial mismatch that would otherwise exist for every state-2
+    # head under dynamic lattice spacing.
+    r, theta, cos_theta, sin_theta = xb_geometry(x_dist, lattice_spacing)
+    g_k, g_rest, c_k, c_rest = xb_springs_for_state(xb_states_flat, params)
+    F_r, F_theta = xb_polar_forces(r, theta, g_k, g_rest, c_k, c_rest)
+    f_radial = polar_to_filament(F_r, F_theta, cos_theta, sin_theta)[1]
 
     forces_radial = jnp.where(is_bound, f_radial, 0.0)
     return jnp.sum(forces_radial)

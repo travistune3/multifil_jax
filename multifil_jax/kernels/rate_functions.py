@@ -132,28 +132,26 @@ Two distinct mechanisms, easy to conflate:
   and consistent with Caremani 2025 (Front. Physiol.), who find the working
   stroke rate constant depends solely on load.
 
-  Bell / load-dependent — used for 2->3 and 3->4. The rate depends on the FORCE
-  the head is currently carrying, via exp(+/- f*delta/kT), where delta is the
-  distance to the transition state.
+  Bell / load-dependent — used for 3 -> 4, and for that step ONLY. The rate
+  depends on the axial FORCE the head is currently carrying, via
+  exp(f*delta_34/kT), where delta_34 is the distance to the transition state.
+  The load fed to it is the axial force from the same rotation the force law
+  uses (forces.polar_to_filament), not the head's radial spring force — see the
+  note at the call site in transitions.py for the bug that distinction fixed.
 
-  A CAVEAT ON delta_23. Because states 2 and 3 are mechanically identical, the
-  net displacement across 2 -> 3 is zero, so the elastic terms cancel in the
-  reverse rate and K_23 = r23/r32 is LOAD-INDEPENDENT. That is thermodynamically
-  required, not an approximation. But it also means a non-zero delta_23 describes
-  a reaction coordinate that travels out and returns to the same place: load
-  slows BOTH directions equally and never shifts the population. For a chemical
-  isomerization that is tolerable; for a lever-arm swing it has no structural
-  referent. The self-consistent choices are (a) delta_23 = 0 with 2 and 3
-  mechanically identical, or (b) give state 3 its own rest configuration, in
-  which case 0 < delta_23 < the net displacement and K_23 becomes load-dependent
-  on its own. The current pairing (identical mechanics, delta_23 = 1.0 nm) is
-  neither, and it is not inert: at the ~1.8 pN mean strong-state force it
-  suppresses r23 by ~35%, and since state 2 has no detachment exit, that acts as
-  a load-gated retention in the pre-ADP-release state — the only place in the
-  model where load slows the forward cycle.
+  Barrier / elastic-energy — used for 2 -> 3. The barrier is the elastic energy
+  difference between the flanking configurations, floored at zero, so the uphill
+  direction is slowed and the downhill one is strain-free. This is Smith &
+  Geeves' treatment of the force-generating isomerisation and it carries NO
+  transition-state distance. It replaced a Bell factor and its unsourced
+  delta_23 on 2026-09-09; see xb_rate_23 for the derivation, and note that under
+  it the pre-exponential A23 is the rate's CEILING rather than its
+  mid-distribution value.
 
-  For 3 -> 4 the sign is positive: load accelerates detachment. See xb_rate_34
-  for why that sign is contested for cardiac myosin.
+  For 3 -> 4 the sign of delta_34 is NEGATIVE at the shipped defaults: a catch
+  bond, in which resistive load SLOWS detachment. See xb_rate_34 for the five
+  measurements behind that sign and for the model lineage that took the other
+  one.
 
 Reverse rates are derived from forward rates and free-energy differences rather
 than being free parameters, so the cycle cannot violate detailed balance and
@@ -638,85 +636,78 @@ def xb_rate_21(r12, U_loose, U_tight_1):
     return jnp.minimum(r21, upper)
 
 
-def xb_rate_23(A23, f_strong, delta23, k_t):
+def xb_rate_23(A23, E_tight_1, E_tight_2):
     """Rate 2->3: chemical transition between the two strongly-bound states.
 
     NOT the whole working stroke, despite the state names — most of the stroke
     is on 1 -> 2; see the module docstring. What this step always does is commit
     the head to the ~6 kT drop that makes the stroke effectively irreversible,
     and move it into the only state from which ADP release and detachment are
-    possible.
+    possible. At the shipped (split-stroke) defaults it also carries 2.099 nm of
+    the 8.791 nm axial swing (23.9%), so it does work and changes force.
 
-    WHETHER IT ALSO MOVES THE HEAD DEPENDS ON THE PARAMETERS, and the two cases
-    are worth separating because the second one is new (2026-09-01).
+    THE ELASTIC-ENERGY FORM, NOT A BELL DISTANCE (changed 2026-09-09).
 
-    Control case, *_tight_1 springs EQUAL to the *_strong ones. Tight_1 and
-    Tight_2 then share a spring configuration and a pair of spring constants, so
-    the transition produces no displacement, does no work and changes no force.
-    The same Bell factor appears in the reverse rate (xb_rate_32), so K_23 is
-    load-independent and load never redistributes heads between the pre- and
-    post-ADP-release states: the Huxley-Simmons redistribution between attached
-    states is absent from THIS leg and lives entirely on 1 -> 2, via E_diff.
-    There is no E_diff term here because the elastic energy is unchanged.
+        dE   = E_tight_2 - E_tight_1        elastic, in kT
+        r23  = A23 * exp(-max(dE, 0))
 
-    Shipped case, the split stroke. Tight_1 has its own rest configuration, so
-    this step carries 2.099 nm of the 8.791 nm axial swing (23.9%), does work,
-    and changes force. K_23 = exp(U_tight_1 - U_tight_2) is then strain-
-    dependent, because the two configurations differ elastically, and load DOES
-    redistribute heads between them. The elastic energy difference still does
-    not appear explicitly in this expression — it enters through U_tight_1 in
-    xb_rate_32, and the f fed to the Bell factor here is state 2's force
-    (f_tight1), not state 3's.
+    Smith & Geeves 1995 Biophys J 69:528 (Eqs. 2a/2b/3) treat the
+    force-generating isomerisation with the elastic energy DIFFERENCE between
+    the flanking states, placing the transition state at the top of the
+    higher-energy well. There is therefore no transition-state distance to
+    parameterise: the strain dependence falls entirely on the uphill direction,
+    and the downhill rate is strain-FREE. Smith 1998 (p. 193, Fig. 3 caption)
+    confirms the reverse rate carries the same factor when the flanking states
+    share elastic energy, and floors the barrier at zero — which is the `max`
+    here, and is real physics rather than a numerical guard: a barrier cannot be
+    negative, so a downhill step can be strain-independent but never
+    strain-ACCELERATED.
 
-    Bell model: r23 = A23 * exp(-f * delta_23 / kT). A load resisting the head
-    (f > 0) slows it. Physically, external load tilts the energy landscape
-    against the transition state, and delta_23 is how far along the reaction
-    coordinate that transition state sits.
+    WHAT THIS REPLACED, AND WHY. The step used a Bell factor exp(-f*delta_23/kT)
+    fed by a scalar that was not a force (see the note at the call site in
+    transitions.py). Correcting the force alone leaves delta_23 — an unsourced
+    [I] parameter whose cited literature (Pate & Cooke 1989; Huxley & Simmons
+    1971) describes the STROKE, which in this model is r12, not this step. The
+    energy form removes the parameter instead of re-anchoring it, and gives the
+    step a ceiling of A23 that the Bell form did not have.
 
-    delta_23 IS NOW COHERENT, which it was not before. A Bell transition-state
-    distance on a step with zero displacement had nothing to be a fraction of;
-    on a step carrying ~2.10 nm of swing, delta_23 = 1.0 nm is admissible as a
-    transition-state distance precisely because it is less than that
-    displacement. That is a new argument for the value, not a derivation of it:
-    1.0 nm was inherited from the stroke literature and has never been
-    re-derived for this step. See the module docstring's caveat before changing
-    it, and note xb_delta_34's coupling to it.
+    delta_23's reputation as a major lever was STALE. The "-78%/-83% if zeroed"
+    table in xb_rate_34's docstring was measured before the split stroke, with
+    states 2 and 3 mechanically identical AND on the old slip bond; the same
+    table shows the cost collapsing to -46%/-19% under the shipped catch bond,
+    and the note itself said delta_23 "has been standing in for the missing
+    catch bond". Under this form the lever does not vanish — it moves into the
+    tight_1/tight_2 REST-CONFIGURATION difference that sets dE, which is
+    structural and sourced where delta_23 was not.
 
-    OPEN, AND OUT OF SCOPE HERE: 1 -> 2 and 2 -> 3 now both carry displacement
-    but use two different formalisms for the same kind of physics — r12 is
-    A12*exp(E_diff/2), an elastic-energy difference with a symmetric barrier,
-    while this step is a Bell distance. Do NOT add an xb_delta_12 to "fix" it:
-    r12 does not use the Bell formalism at all and already has strain dependence
-    through E_diff, so a Bell distance there would either double-count against
-    E_diff or require reformulating the step. The question the split exposes is
-    genuine and is new physics.
+    r32 IS DELIBERATELY LEFT AS PLAIN DETAILED BALANCE (xb_rate_32). Substitute
+    this rate into it and the strain factor lands on whichever direction climbs,
+    in both directions — S&G Eq. 2b exactly, with K_23 preserved. Adding a
+    barrier term to r32 as well would double-count it.
 
     Args:
         A23: Zero-load rate (ms^-1) - params.xb_r23_coeff.
-             [G] The usual citation for this value (Millar & Homsher 1990,
-             ~70-100 s^-1) measured k_Pi from caged-phosphate photolysis, i.e.
-             Pi release coupled to force generation. In this model that is the
-             1 -> 2 step, not this one, so the citation does not apply here.
-             Treat as unsourced pending a value for the chemical transition
-             between the two strongly-bound states.
-        f_strong: Force carried in the strong state (pN); positive = resisting
-        delta23: Transition-state distance (nm) - params.xb_delta_23.
-                 [G] 1.0 nm. Pate & Cooke 1989 JMRCM 10:181 and Huxley & Simmons
-                 1971 Nature 233:533 (1-2 nm) describe the transition state of
-                 the LEVER SWING, which in this model is on 1 -> 2. With zero net
-                 displacement across 2 -> 3 this parameter has no structural
-                 referent — see the module docstring's caveat.
-        k_t: Thermal energy kT (pN*nm)
+             [G] UNSOURCED, and now the binding uncertainty on this step. The
+             usual citation (Millar & Homsher 1990, ~70-100 s^-1) measured k_Pi
+             from caged-phosphate photolysis, i.e. Pi release coupled to force
+             generation, which in this model is 1 -> 2. Under this form A23 is
+             additionally the CEILING of the rate, not its mid-distribution
+             value as it was under Bell, so its numerical meaning has changed
+             even though the symbol has not.
+        E_tight_1: Elastic energy of state 2's configuration at this geometry (kT)
+        E_tight_2: Elastic energy of state 3's configuration at this geometry (kT)
 
     Returns:
         Rate r23 (ms^-1), capped at 10000 ms^-1
 
     References:
-        Bell 1978 Science 200:618; Piazzesi 2007 Cell 131:784;
-        Reconditi 2011 PNAS 108:7236; Walcott 2010 Biophys J 99:1129.
+        Smith DA, Geeves MA (1995), "Strain-dependent cross-bridge cycle for
+        muscle", Biophys J 69:524-537, Eqs. 2a/2b/3;
+        Smith DA (1998), J Muscle Res Cell Motil 19:189-211, p. 193 Fig. 3.
     """
     upper = 10000.0
-    r23 = A23 * jnp.exp(-f_strong * delta23 / k_t)
+    barrier = jnp.maximum(E_tight_2 - E_tight_1, 0.0)
+    r23 = A23 * jnp.exp(-barrier)
     return jnp.minimum(r23, upper)
 
 
@@ -733,21 +724,31 @@ def xb_rate_32(r23, U_tight_1, U_tight_2):
     asymmetry is what keeps heads in the ADP-release-competent state long enough
     to bear load and complete the cycle, rather than rattling back and forth.
 
-    IN THE CONTROL CONFIGURATION both free energies include the SAME elastic
-    term, so it cancels IN THE DIFFERENCE. What that makes strain-independent is
-    the RATIO, not this rate: K_23 = r23/r32 is fixed at
-    exp(-(U_tight_2 - U_tight_1)) everywhere, so load cannot shift the 2/3
-    population in either direction. r32 ITSELF is strongly strain-dependent,
-    because it inherits r23's exp(-f*delta_23/kT) factor — measured over
-    x in [-4, 21.5] nm it varies by ~8.5e5-fold. Load therefore slows both
-    directions of this transition equally, which is the anomaly described in the
-    module docstring's caveat on delta_23.
+    THIS LINE IS DELIBERATELY UNCHANGED BY THE MOVE TO THE ENERGY FORM, and it
+    is what makes that form correct in both directions. Write dE = E_tight_2 -
+    E_tight_1 (elastic, kT) and dU_base for the chemical part of
+    U_tight_2 - U_tight_1. Substituting r23 = A23*exp(-max(dE, 0)) here gives
 
-    AT THE SHIPPED DEFAULTS the elastic terms differ — U_tight_1 carries
-    E_tight1 and U_tight_2 carries E_strong — so the cancellation is only
-    partial, K_23 becomes strain-dependent, and load does redistribute heads
-    between states 2 and 3. That is the split stroke doing its job; the anomaly
-    above is the control-path statement.
+        dE > 0 (2->3 uphill):   r32 = A23*exp(dU_base)             strain-FREE
+        dE < 0 (2->3 downhill): r32 = A23*exp(dU_base)*exp(dE)     the barrier
+
+    so the strain factor always lands on whichever direction climbs, and never
+    ACCELERATES either — which is Smith & Geeves Eq. 2b, reproduced exactly, with
+    K_23 = exp(-(U_tight_2 - U_tight_1)) preserved. Adding a barrier term here
+    as well would double-count it.
+
+    THAT THE REVERSE RATE INHERITS THE FORWARD FACTOR IS NOT AN ANOMALY. An
+    earlier version of this docstring called it one. Smith 1998's Fig. 3 caption
+    (p. 193) states exactly this behaviour, and gives the reason: when the two
+    flanking states share elastic energy the barrier is common to both
+    directions. It is correct physics, not an artefact of the parameterisation.
+
+    IN THE CONTROL CONFIGURATION (*_tight_1 springs equal to *_strong) both free
+    energies carry the SAME elastic term, so dE = 0, both rates are strain-free,
+    and K_23 is fixed everywhere: load cannot shift the 2/3 population in either
+    direction. AT THE SHIPPED DEFAULTS the elastic terms differ, K_23 becomes
+    strain-dependent, and load does redistribute heads between states 2 and 3.
+    That is the split stroke doing its job.
 
     Args:
         r23: Forward working-stroke rate (ms^-1)
@@ -774,11 +775,18 @@ def xb_rate_34(A34, f_strong, delta34, k_t):
     the rate-limiting step of the cycle for most myosins, and it consumes the
     ATP: state 4 is the model's accounting point for ATP turnover.
 
-    Slip bond: r34 = A34 * exp(+f * delta_34 / kT). Tensile load ACCELERATES
-    detachment. The positive sign is not interchangeable with r23's negative one
-    — a catch bond here (load suppressing detachment) would make heads cling
-    harder the more they resist, which contradicts the fast unloaded shortening
-    velocities and rapid tension redevelopment seen in skeletal muscle.
+    Bell form: r34 = A34 * exp(f * delta_34 / kT), where f is the head's AXIAL
+    force (positive = resisting). CATCH BOND at the shipped defaults, because
+    delta_34 = -0.80 nm is negative: resistive load SLOWS detachment. That sign
+    landed in S129 and is sourced three independent ways — see THE SIGN IS
+    CONTESTED below, and note that all three sources measure axial load, which
+    is exactly the quantity this rate is now fed (the load handed to it was not
+    an axial force until 2026-09-09; see the call site in transitions.py).
+
+    This is the model's ONLY Bell rate. 2 -> 3 used to be the other one; it
+    moved to Smith & Geeves' elastic-energy barrier and lost its
+    transition-state distance, so delta_34 no longer has a partner to trade
+    against. See xb_rate_23.
 
     Args:
         A34: Zero-load detachment rate (ms^-1) - params.xb_r34_coeff.
@@ -864,24 +872,29 @@ def xb_rate_34(A34, f_strong, delta34, k_t):
     detachment-limited. What the catch bond does change is sub-V0 force, ~3x the
     power output at 0.1 nm/ms.
 
-    IT IS NOT SEPARABLE FROM delta_23, and how strongly they couple depends on
-    the MAGNITUDE of this rate's Bell distance, not just its sign. Measured
-    (8x8 lattice, pCa 4.5 vs pCa 9 passive reference, z_line = 1100 nm, 3
-    replicates), the cost in active force of setting delta_23 = 0:
+    IT IS NOW SEPARABLE, which it was not. delta_23 was deleted on 2026-09-09
+    when 2 -> 3 moved to the elastic-energy barrier, so this parameter has no
+    partner left to trade against and can be swept alone.
+
+    HISTORICAL, kept because it is the measurement that justified the deletion.
+    The cost in active force of setting delta_23 = 0, at three values of this
+    parameter (8x8 lattice, pCa 4.5 vs pCa 9 passive reference, z_line = 1100
+    nm, 3 replicates):
 
                                  skeletal    cardiac
         delta_34 = +0.5 (slip)     -78%        -83%
         delta_34 = -0.5 (catch)    -67%        -45%
         delta_34 = -0.9 (catch)    -46%        -19%
 
-    A catch bond takes over delta_23's job of retaining strained force-bearing
-    heads, and the deeper the catch the more of that job it absorbs -- but at
-    -0.5 it absorbs only part of it. delta_23 was doing real load-dependent work
-    in the old (slip) configuration, which is why zeroing it there cost ~80%.
-    The table was measured BEFORE the split stroke, on a two-configuration
-    model; the direction holds, the percentages have not been re-measured.
-    Sweep the two TOGETHER over both sign and magnitude; neither parameter is
-    interpretable alone, and a single-sign test will mislead.
+    Read at the time as "delta_23 is a major lever". Read correctly it is the
+    opposite: delta_23's authority COLLAPSES as this rate becomes a deeper
+    catch, because a catch bond retains strained force-bearing heads and that
+    was the only job delta_23 was doing — the note that accompanied this table
+    said as much, that delta_23 "has been standing in for the missing catch
+    bond". The catch bond has since landed at -0.80, in the -46%/-19% row.
+    The table was also measured BEFORE the split stroke, on a model in which
+    states 2 and 3 were mechanically identical, so the step delta_23 sat on had
+    zero displacement and no structural referent at all. Both premises are gone.
 
     References:
         Bell 1978 Science 200:618 (the functional form); Siemankowski & White 1984
@@ -1033,71 +1046,3 @@ def xb_rate_05(r05_rate):
         Rate r05 (ms^-1)
     """
     return r05_rate
-
-
-# =============================================================================
-# ENERGY CALCULATIONS (used by rate functions)
-# =============================================================================
-
-def compute_xb_energies(r, theta, g_k_weak, g_r_weak, c_k_weak, c_r_weak,
-                        g_k_strong, g_r_strong, c_k_strong, c_r_strong, k_t):
-    """Elastic energy a crossbridge would store in each spring configuration.
-
-    Evaluates the two-spring head potential (see core/params.py for the geometry)
-    at a head's CURRENT position, once for the weak rest configuration and once
-    for the strong one:
-
-        E = [ 0.5*g_k*(r - g_rest)^2  +  0.5*c_k*(theta - c_rest)^2 ] / kT
-
-    Both are computed for every head regardless of which state it is actually in,
-    because the rates need the comparison: E_weak controls attachment
-    (xb_rate_01), and E_diff = E_weak - E_strong controls the weak-to-strong
-    isomerization (xb_rate_12). A head sitting where the strong configuration is
-    the relaxed one has large positive E_diff and isomerizes readily; a head
-    reaching awkwardly does not.
-
-    E_diff is accumulated term by term rather than as E_weak - E_strong. At
-    typical geometries the two energies are large and nearly equal, so the naive
-    subtraction loses most of its significant digits in float32 — and E_diff then
-    goes straight into an exponential, where that error is amplified.
-
-    In state terms: the weak configuration applies to state 1 (Loose) and the
-    strong configuration to states 2 (Tight_1) and 3 (Tight_2). States 0, 4 and
-    5 are detached; forces.py bears no force for them and no rate reads a free
-    energy for state 4, so no spring configuration applies to them at all.
-
-    Because states 2 and 3 share the strong configuration, ONE E_strong serves
-    both — which is why the 2 -> 3 transition is mechanically silent. If state 3
-    is ever given its own rest configuration (the ~1.5 nm ADP-linked lever swing
-    of cardiac myosin; see the module docstring), this function is where the
-    third energy would be computed.
-
-    Args:
-        r: Head length, sqrt(axial^2 + lattice_spacing^2) (nm) — NOT the radial
-           distance alone
-        theta: Head angle from the filament axis, atan2(radial, axial) (radians)
-        g_k_weak, g_r_weak: Globular linear spring constant and rest length (weak)
-        c_k_weak, c_r_weak: Converter angular spring constant and rest angle (weak)
-        g_k_strong, g_r_strong: Globular spring, strong configuration
-        c_k_strong, c_r_strong: Converter spring, strong configuration
-        k_t: Thermal energy kT (pN*nm)
-
-    Returns:
-        E_weak: Elastic energy in the weak configuration (kT)
-        E_strong: Elastic energy in the strong configuration (kT)
-        E_diff: E_weak - E_strong, computed term-wise for float32 precision (kT)
-    """
-    # Weak configuration — states 1 (Loose) and 4 (Free_2)
-    E_weak = (0.5 * g_k_weak * (r - g_r_weak)**2 +
-              0.5 * c_k_weak * (theta - c_r_weak)**2) / k_t
-
-    # Strong configuration — states 2 (Tight_1) and 3 (Tight_2)
-    E_strong = (0.5 * g_k_strong * (r - g_r_strong)**2 +
-                0.5 * c_k_strong * (theta - c_r_strong)**2) / k_t
-
-    # Term-wise difference — avoids catastrophic cancellation, see docstring
-    delta_g_energy = 0.5 * (g_k_weak * (r - g_r_weak)**2 - g_k_strong * (r - g_r_strong)**2)
-    delta_c_energy = 0.5 * (c_k_weak * (theta - c_r_weak)**2 - c_k_strong * (theta - c_r_strong)**2)
-    E_diff = (delta_g_energy + delta_c_energy) / k_t
-
-    return E_weak, E_strong, E_diff

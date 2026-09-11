@@ -123,6 +123,43 @@ class Drivers(NamedTuple):
     z_line: jnp.ndarray          # scalar per timestep, NaN if in Constants
     lattice_spacing: jnp.ndarray # scalar per timestep, NaN if in Constants
 
+class KineticsTrace(NamedTuple):
+    """What the kinetics phase saw, handed forward so metrics need not guess.
+
+    A WITHIN-STEP VALUE ONLY. It carries a whole `State`, so it must never be
+    put in a scan carry or a scan output — `kinetics_step` builds it and
+    `compute_all_metrics` consumes it inside the same scan body, and nothing
+    stacks it over time.
+
+    WHY `state` IS THE MID STATE AND NOT `old_state`. `thick_transitions`
+    samples its 6x6 generator from the sarcomere as it stands AFTER
+    `update_nearest_neighbors` and `thin_transitions` have run. Metrics that
+    rebuild that generator — `atp_expected_p`, `xb_tear_expected` — must build
+    it from the same state, or they describe a step that never happened. Read
+    off `old_state` instead, the error is small (0.06%-0.46% measured, cardiac
+    and skeletal, dt 1.0 and 0.1) but it is systematic and free to avoid.
+
+    `constants` are the driver-resolved ones the kinetics phase used, at the
+    PRE-solve lattice spacing. The mechanics path deliberately does NOT use
+    these: `axial_force_at_mline` and the reported `lattice_spacing` are
+    post-solve quantities and must be read at the SOLVED spacing. Both are
+    correct; they are answering different questions.
+
+    Fields:
+        state: post-thin_transitions, pre-thick_transitions State
+        constants: driver-resolved DynamicParams at the pre-solve lattice spacing
+        xb_subpop: the already-resolved (mode, constants_k, extra) tuple, or None
+        torn: (n_thick, n_crowns, n_xb_per_crown) bool, heads tropomyosin tore
+            off this step. Not recoverable from the before/after states — a torn
+            head lands where an ordinary one does — so it is carried, not
+            re-derived. See transitions.thin_transitions.
+    """
+    state: 'State'
+    constants: 'DynamicParams'
+    xb_subpop: object
+    torn: jnp.ndarray
+
+
 class MetricsDict(dict):
     """dict subclass with attribute access.
 

@@ -29,23 +29,42 @@ geometries — see compute_overlap_tm_fractions() for why the difference bites.
 ATP consumption is reported two ways, which will not agree exactly, and should
 not:
 
-    atp_expected_p   the expected number, from transition probabilities. Smooth,
-                     and correctly counts heads that passed through detachment
-                     and out again within one timestep. PREFER THIS.
-    atp_consumed     a stochastic count of heads observed to detach this step.
-                     Noisy, and it undercounts multi-hop traversals (measured
-                     ~5% low at dt = 1 ms against a dt = 0.1 ms reference).
+    atp_expected_p   the expected number, from transition probabilities, PLUS
+                     the realised strong closure tears. Smooth, and correctly
+                     counts heads that passed through detachment and out again
+                     within one timestep. PREFER THIS.
+    atp_consumed     a stochastic count of realised events: heads observed to
+                     leave Tight_2 via Free_2 or DRX, plus the same strong
+                     closure tears. Noisy, and it undercounts multi-hop
+                     traversals (measured ~5% low at dt = 1 ms against a
+                     dt = 0.1 ms reference).
 
 Use atp_expected_p for rates and efficiencies, atp_consumed only when you
-specifically want realised events.
+specifically want realised events. Both are read against the MID state — the
+sarcomere as thick_transitions found it — not against the state at the top of
+the step; see compute_all_metrics.
 
-NOT EVERY DETACHMENT COSTS AN ATP. A strongly bound head can back down the cycle,
-3 -> 2 -> 1 -> 0, without ever reaching Free_2, and pay nothing. That route is
-strain-gated at 2 -> 1 (see xb_rate_21) — it is how a badly-positioned head gives
-up rather than completing a cycle it cannot afford. xb_tear_expected counts it,
-atp_expected_p excludes it. Measured on the cardiac preset, tearing is ~0.1% of
-detachments isometrically but 14-19% during imposed lengthening, so it is
-negligible for isometric work and emphatically not for work loops.
+TWO WAYS OUT OF THE CYCLE COST NOTHING, AND BOTH ARE REPORTED SEPARATELY.
+
+  The give-up route. A strongly bound head can back down the cycle,
+  3 -> 2 -> 1 -> 0, without ever reaching Free_2. That route is strain-gated at
+  2 -> 1 (see xb_rate_21) — it is how a badly-positioned head gives up rather
+  than completing a cycle it cannot afford. `xb_tear_expected` counts it and
+  atp_expected_p excludes it. Measured on the cardiac preset, this is ~0.1% of
+  detachments isometrically but 14-19% during imposed lengthening, so it is
+  negligible for isometric work and emphatically not for work loops — which
+  also makes `atp_consumed` unusable as an ATP figure during lengthening.
+
+  A weak closure tear. Tropomyosin closing over a Loose head returns it to DRX
+  still primed, owing nothing. `closure_tear_weak` counts those.
+
+A STRONG CLOSURE TEAR DOES COST ONE, and is counted by `closure_tear_strong`.
+Tropomyosin closing over a Tight_1 or Tight_2 head sends it to Free_2, because
+it has already released its phosphate and swung its lever; returning it to DRX
+(= M.ADP.Pi) would hand back that phosphate for free. Before this was booked
+(2026-09-10), 8.0% of all the ATP the model spent was never counted anywhere —
+4.3 points from state-2 tears, 2.7 from state-3 tears, the remaining 1.0% being
+the give-up route above, which is a genuine refund and not a leak.
 
 THE TWO DO NOT SUM TO TOTAL STRONG DETACHMENT, and this docstring claimed they
 did until 2026-09-08. They are disjoint OUTCOMES — reached Free_2, versus
@@ -60,22 +79,26 @@ detachment nor of all detachment.
 (A third metric, atp_expected_q, was removed in Session 108. It capped each
 head's detachment rate at its zero-load value, which silently encoded a DIFFERENT
 model — "load-accelerated detachment is mechanical, not ATP-driven" — that this
-model does not hold: xb_rate_34 is a slip bond where load accelerates the same
-ATP-consuming step. Its documented use as a timestep-adequacy check was also
-wrong; the p/q gap tracked load, not dt.)
+model does not hold: xb_rate_34 is load-dependent and it is the ATP-consuming
+step, so capping it at its zero-load value discards real cycling either way.
+That the shipped sign is now a CATCH bond (xb_delta_34 = -0.80 since S129, so
+load SLOWS detachment) does not rescue the removed metric — it inverts which
+direction the cap bites, nothing more. Its documented use as a timestep-adequacy
+check was also wrong; the p/q gap tracked load, not dt.)
 
 Usage:
     from multifil_jax.metrics_fn import compute_all_metrics
     metrics = compute_all_metrics(old_state, new_state, constants, drivers,
-                                  topology, pre_solve_thick_pos, force,
-                                  solver_residual, newton_iters, dt)
+                                  topology, force, solver_residual,
+                                  newton_iters, dt, trace)
 """
 
 import jax
 import jax.numpy as jnp
 from typing import Dict, TYPE_CHECKING
 
-from multifil_jax.kernels.forces import axial_force_at_mline, xb_axial_force_by_state
+from multifil_jax.kernels.forces import (axial_force_at_mline, xb_axial_force_by_state,
+                                         xb_axial_work)
 from multifil_jax.kernels.transitions import xb_exit_probabilities
 from multifil_jax.core.state import Drivers, resolve_value, MetricsDict
 
@@ -166,12 +189,12 @@ def compute_all_metrics(
     constants: 'DynamicParams',
     drivers: Drivers,
     topology: 'SarcTopology',
-    pre_solve_thick_pos: jnp.ndarray,
     force: jnp.ndarray,
     solver_residual: jnp.ndarray,
     newton_iters,
     dt: float,
-    xb_subpop=None,
+    trace: 'KineticsTrace',
+    delta_z: jnp.ndarray,
 ) -> 'MetricsDict':
     """Compute all metrics for a single timestep.
 
@@ -184,18 +207,38 @@ def compute_all_metrics(
         constants: DynamicParams with resolved physics values
         drivers: Drivers NamedTuple with per-step pCa/z_line/ls
         topology: SarcTopology for structural lookups
-        pre_solve_thick_pos: (n_thick, n_crowns) positions before equilibrium solve
         force: Scalar M-line force (already computed)
         solver_residual: Scalar equilibrium solver residual (pN)
         newton_iters: Number of Newton iterations used by solver
         dt: Timestep size (ms)
+        trace: KineticsTrace from kinetics_step — the MID state (post
+            thin_transitions, pre thick_transitions), the driver-resolved
+            constants at the PRE-solve lattice spacing, the resolved
+            subpopulation tuple, and the closure-tear mask. Required, not
+            optional: every realised transition count and every Q-matrix metric
+            below reads it, because those are the state and the generator that
+            actually drove this step.
+        delta_z: scalar z-line displacement applied at the START of this step
+            (nm). Negative is shortening. Needed for `sarcomere_work` and for
+            nothing else.
+
+    THE TWO CONSTANTS OBJECTS DIFFER ON PURPOSE. `constants`/`drivers` carry the
+    SOLVED lattice spacing, and the mechanics metrics must use them —
+    `xb_axial_force_by_state` and the reported `lattice_spacing` are post-solve
+    quantities. `trace.constants` carries the PRE-solve spacing, and the Q-matrix
+    metrics must use that, because it is the spacing the rates were evaluated at.
+    Do not "unify" them; in fixed-LS mode they agree anyway, and in dynamic-LS
+    mode each is right for its own question.
 
     Returns:
         MetricsDict with all metric values (supports both dict and attribute access)
     """
-    old_xb = old_state.thick.xb_states
+    # `old_state` still means "before the timestep" and is used as such below,
+    # for the energy and work deltas. It is NOT what the transitions were drawn
+    # from: `trace.state` is. Every realised-event count and every Q-matrix
+    # metric reads the mid state.
     new_xb = new_state.thick.xb_states
-    old_tm = old_state.thin.tm_states
+    mid_xb = trace.state.thick.xb_states
     new_tm = new_state.thin.tm_states
 
     n_total_xb = jnp.float32(jnp.size(new_xb))
@@ -236,11 +279,41 @@ def compute_all_metrics(
     # ========================================================================
     # TRANSITION EVENT COUNTS
     # ========================================================================
-    # Count XBs that visited state 4 (Free_2) this timestep, including those that continued
-    # to state 0 (4→4→0) within the same timestep. State 3→2→1→0 reversal also
-    # lands in state 0 but is negligibly rare compared to the 3→4→0 path.
-    atp_consumed = jnp.sum((old_xb == 3) & ((new_xb == 4) | (new_xb == 0))).astype(jnp.float32)
-    newly_bound = jnp.sum((old_xb == 0) & (new_xb == 1)).astype(jnp.float32)
+    # READ AGAINST THE MID STATE, NOT old_state. Every transition counted here
+    # happens inside thick_transitions, so the "before" endpoint is the state
+    # thick_transitions was handed — after update_nearest_neighbors and
+    # thin_transitions have run. Reading old_state instead conflates the tear
+    # (which happens in thin_transitions) with the cycle.
+    #
+    # No closure mask is needed and none is applied. A head torn off by
+    # tropomyosin is already out of state 3 in `mid_xb`, because the tear
+    # happened in thin_transitions, one phase earlier. The old expression
+    # subtracted the mask precisely because it read the PRE-step states, where
+    # the torn head was still in state 3.
+    #
+    # CLOSURE TEARS, SPLIT BY WHAT THE HEAD HAD ALREADY SPENT. thin_transitions
+    # sends a torn Loose head to state 0 (still primed, owes nothing) and a torn
+    # Tight_1/Tight_2 head to state 4 Free_2 (post-stroke, owes one ATP), so the
+    # state a torn head is in AFTER that call is exactly the split. Nothing else
+    # can put a head in state 4 within thin_transitions, so `torn & (mid == 4)`
+    # is unambiguous.
+    n_tear_strong = jnp.sum(trace.torn & (mid_xb == 4)).astype(jnp.float32)
+    n_tear_weak = jnp.sum(trace.torn).astype(jnp.float32) - n_tear_strong
+
+    # Counts XBs that visited state 4 (Free_2) this timestep, including those
+    # that continued to state 0 within the same timestep. The 3 -> 2 -> 1 -> 0
+    # reversal also lands in state 0 but is negligibly rare next to 3 -> 4 -> 0.
+    # Strong closure tears are added on: they are a real turnover booked in
+    # thin_transitions, one phase before this comparison window opens.
+    atp_consumed = n_tear_strong + jnp.sum(
+        (mid_xb == 3) & ((new_xb == 4) | (new_xb == 0))
+    ).astype(jnp.float32)
+    # Binding only ever happens in thick_transitions, so this too reads the mid
+    # state. It moved when the trace landed, for a reason that has nothing to do
+    # with ATP: a head that ran 3 -> 0 in thin_transitions (torn) and then
+    # 0 -> 1 in thick_transitions is a genuine new attachment, and the old
+    # old_state-based form could not see it.
+    newly_bound = jnp.sum((mid_xb == 0) & (new_xb == 1)).astype(jnp.float32)
 
     # ========================================================================
     # DISPLACEMENT STATISTICS
@@ -288,32 +361,58 @@ def compute_all_metrics(
     titin_energy_delta_avg = jnp.mean(titin_energy_new - titin_energy_old)
 
     # ========================================================================
-    # WORK METRICS
+    # WORK METRICS — TWO DIFFERENT QUANTITIES, REPORTED SEPARATELY
     # ========================================================================
-    post_pos = new_state.thick.axial
-    dx = post_pos - pre_solve_thick_pos
-    work_thick = force * jnp.mean(dx)
-    n_thick, n_crowns = post_pos.shape
-    work_thick_mean = work_thick / jnp.float32(n_thick * n_crowns)
+    # These replace `work_thick`/`work_thick_mean`, which were M-line force
+    # times the MEAN displacement of every thick crown — neither of the two
+    # quantities below, and under an isometric hold dominated by internal
+    # backbone strain redistribution rather than by anything a motor did.
+    #
+    # 1. xb_work_on_filaments: work done ON the lattice BY the crossbridges.
+    #    Path-dependent and per-head, so it cannot be reconstructed afterwards
+    #    from the returned traces — it has to be computed here. This is the
+    #    numerator for an efficiency, because ATP is spent by crossbridges.
+    #
+    # 2. sarcomere_work: work done externally by the half-sarcomere at the
+    #    driven z-line, -F*dz, positive when shortening against tension. This
+    #    one IS exactly reconstructible afterwards from the axial_force and
+    #    z_line traces (docs/README.md section 6 gives the expression);
+    #    shipping it is a convenience and an anchor for the documentation, not
+    #    independent information.
+    #
+    # old_state.thick.axial IS the pre-solve thick position: between the
+    # previous step's solve and this one the only change is the z-line shift,
+    # which touches thin.axial alone, and no kinetics call moves a filament.
+    ls_old = trace.constants.lattice_spacing
+    work_xb = xb_axial_work(
+        old_state.thick.axial, old_state.thin.axial, ls_old,
+        new_state.thick.axial, new_state.thin.axial, lattice_spacing,
+        new_xb, new_state.thick.xb_bound_to, constants, topology)
+
+    # An honest trapezoid without carrying a force through the scan.
+    # `force_old` is one backbone spring strain and is EXACTLY the previous
+    # step's reported axial_force: dz is applied to thin.axial only, while
+    # axial_force_at_mline reads thick.axial[:, 0].
+    force_old = axial_force_at_mline(old_state, constants, topology)
+    sarcomere_work = -0.5 * (force_old + force) * delta_z
 
     # ========================================================================
     # ATP EXPECTED (P-matrix method) — recompute per-XB P via shared helper
     # ========================================================================
-    # Use resolved constants (same as timestep.py passed to thick_transitions)
-    # so Q/P matrices match what actually drove the transitions this step.
-    resolved_constants = constants.with_drivers(pCa_val, z_line, lattice_spacing)
-    if xb_subpop is None:
-        xb_subpop_r = None
-    else:
-        _mode, _constants_k, _extra = xb_subpop
-        xb_subpop_r = (_mode,
-                       [ck.with_drivers(pCa_val, z_line, lattice_spacing) for ck in _constants_k],
-                       _extra)
+    # BUILT FROM THE TRACE, which is the whole point of the trace. Both the
+    # state and the constants come from kinetics_step, so this generator is the
+    # one thick_transitions actually sampled from — same mid state, same
+    # driver-resolved constants at the same PRE-solve lattice spacing, same
+    # already-resolved subpopulation tuple. Rebuilding any of the three here
+    # (which is what this did until 2026-09-10) both duplicated work and got a
+    # different answer: reading off old_state biased atp_expected_p by
+    # 0.06%-0.46%, and in dynamic-LS mode the rebuilt constants carried the
+    # SOLVED spacing, which the rates were never evaluated at.
     P_abs_all = xb_exit_probabilities(
-        old_state, resolved_constants, topology, dt, xb_subpop=xb_subpop_r
+        trace.state, trace.constants, topology, dt, xb_subpop=trace.xb_subpop
     )
 
-    old_xb_flat = old_xb.reshape(-1)
+    mid_xb_flat = mid_xb.reshape(-1)
 
     # Expected ATP, from transition probabilities.
     #
@@ -327,7 +426,7 @@ def compute_all_metrics(
     # READ FOR EVERY CYCLING HEAD, not only for heads that begin the step in
     # Tight_2. There is no direct 2 -> 4 or 1 -> 4 transition; the point is that
     # a head can clear two or three stages inside one timestep (2 -> 3 -> 4, or
-    # 1 -> 2 -> 3 -> 4) and spend a real ATP doing it. Masking on old_xb == 3,
+    # 1 -> 2 -> 3 -> 4) and spend a real ATP doing it. Masking on state 3 alone,
     # as this did until 2026-09-08, dropped every one of those. It is a
     # discretisation bias rather than a missing pathway, and it scales as
     # dt * r23 * r34 — largest on exactly the axes a tension-cost study sweeps.
@@ -341,15 +440,63 @@ def compute_all_metrics(
     # heads completing the entire cycle within one step. Same defect, strictly
     # larger correction.
     #
-    # States 0 and 5 are outside the mask and would contribute nothing anyway:
-    # row 0 is absorbing, and SRX can only reach DRX, which is also absorbing.
+    # STATES 0 AND 5 ARE OUTSIDE THE MASK FOR TWO MEASURED REASONS, not for the
+    # circular one this comment used to give ("row 0 is absorbing" — it is
+    # absorbing only because xb_exit_probabilities zeroed it, which says nothing
+    # about the physics).
+    #   1. It costs nothing. A head that starts the step in DRX contributes
+    #      between 1e-7 and 6e-5 expected ATP over the step. Heads really do run
+    #      0 -> 1 -> 2 inside one dt (27% of state-2 arrivals at pCa 4.5), but
+    #      almost none of them get all the way to Free_2.
+    #   2. Unzeroing row 0 would make it WORSE, not better. Row 0 has a direct
+    #      0 -> 4 transition, `r04` — the reverse recovery stroke, re-priming a
+    #      detached lever arm. It is not ATP-consuming. Any estimator that reads
+    #      "reached state 4" from state 0 counts it and is wrong. A probe
+    #      written this way (drx_start_atp_spy.py, deleted 2026-09-10) did
+    #      exactly that.
     # State 4 is outside the mask and MUST be — row 4 is absorbing, so
     # P_abs[4,4] = 1, and a head waiting in Free_2 for xb_rate_40 to fire would
     # otherwise be charged a fresh ATP on every step it lingered there.
-    mask_cycling = ((old_xb_flat >= 1) & (old_xb_flat <= 3)).astype(jnp.float32)
-    atp_expected_p = jnp.sum(
+    # THE TWO TERMS ARE DISJOINT BY CONSTRUCTION, not by an approximation. A
+    # head torn off by tropomyosin is in state 0 or state 4 in `trace.state`, so
+    # it is outside the 1..3 mask below and cannot be counted twice.
+    #
+    # THE TEAR TERM IS A REALISED COUNT, NOT AN EXPECTATION, and that is not an
+    # inconsistency. The tear is fully observed and the charge is deterministic
+    # given it, so the realised count IS this step's tear ATP — there is nothing
+    # to take an expectation over. The 3 -> 4 term must stay an expectation for
+    # the opposite reason: the sampler reports only endpoints, so a head that
+    # traverses 3 -> 4 -> 0 inside one step is invisible to any realised count.
+    #
+    # >>> WHAT IS STILL BIASED, AND BY HOW MUCH. The second term is
+    #     P(visit state 4 at least once), read from a generator with rows 0 and
+    #     4 zeroed — not E(number of visits), which is the exact quantity
+    #     (`q34 * INT_0^dt [exp(Qt)]_{s,3} dt`, the top-right block of
+    #     expm([[Q, I], [0, 0]] dt); see
+    #     local_projects/tension_cost/atp_estimator_spy.py). At dt = 1 ms a head
+    #     can make the transition more than once, and P(at least one) is then a
+    #     LOWER BOUND on E(visits) — which is why every measured gap below is
+    #     negative.
+    #
+    #     MEASURED 2026-09-10, 4x4, dt = 1 ms, pCa 4.5 and 6.2, over isometric,
+    #     lengthening (+0.05 nm/ms) and shortening (-0.05 nm/ms):
+    #         cardiac   -0.06% to -0.08%   (all three regimes)
+    #         skeletal  -1.17% to -1.39%   (all three regimes)
+    #     The split is by CYCLING RATE, not by protocol: skeletal turns over
+    #     ~2.6x faster (31 vs 12 ATP/ms at pCa 4.5), so many more heads complete
+    #     3 -> 4 twice inside one step. Imposed shortening or lengthening moves
+    #     it by only ~0.1 points on top of that.
+    #
+    #     So the honest bound is ~0.1% for cardiac and ~1.4% for skeletal at
+    #     dt = 1 ms, NOT the "~1%" that an isometric-cardiac-only measurement
+    #     would have suggested. It shrinks with dt. Not fixed here, and
+    #     defensible at that size — but it is a systematic bias, not a rounding
+    #     error, and a skeletal tension-cost study should either use dt = 0.1 ms
+    #     or carry the correction.
+    mask_cycling = ((mid_xb_flat >= 1) & (mid_xb_flat <= 3)).astype(jnp.float32)
+    atp_expected_p = n_tear_strong + jnp.sum(
         mask_cycling * jnp.take_along_axis(
-            P_abs_all[:, :, 4], old_xb_flat[:, None].astype(jnp.int32), axis=1
+            P_abs_all[:, :, 4], mid_xb_flat[:, None].astype(jnp.int32), axis=1
         )[:, 0]
     )
 
@@ -367,15 +514,25 @@ def compute_all_metrics(
     # Restricted to the strongly bound states 2 and 3 on purpose: a state-1
     # (Loose) head falling off is an ordinary failed weak attachment, not a
     # load-driven tear, and pooling them would obscure both.
-    mask_strong = ((old_xb_flat == 2) | (old_xb_flat == 3)).astype(jnp.float32)
+    #
+    # DESPITE THE NAME, THIS DOES NOT COUNT CLOSURE TEARS. It counts the
+    # strain-gated 3 -> 2 -> 1 -> 0 give-up route and nothing else. Heads
+    # tropomyosin tore off are `closure_tear_weak` / `closure_tear_strong`, and
+    # they are already out of the generator's reach by the time it is built.
+    mask_strong = ((mid_xb_flat == 2) | (mid_xb_flat == 3)).astype(jnp.float32)
     xb_tear_expected = jnp.sum(
         mask_strong * jnp.take_along_axis(
-            P_abs_all[:, :, 0], old_xb_flat[:, None].astype(jnp.int32), axis=1
+            P_abs_all[:, :, 0], mid_xb_flat[:, None].astype(jnp.int32), axis=1
         )[:, 0]
     )
 
-    # Work per ATP
-    work_per_atp = jnp.where(atp_expected_p > 0.01, work_thick / atp_expected_p, 0.0)
+    # Work per ATP. The numerator is the CROSSBRIDGE work, because ATP is spent
+    # by crossbridges — and because it stays meaningful under an isometric hold,
+    # where external work is exactly zero while heads are still cycling and
+    # spending. For whole-sarcomere efficiency divide the two exported keys
+    # yourself: sarcomere_work / atp_expected_p. There is no third key for it.
+    xb_work_per_atp = jnp.where(atp_expected_p > 0.01,
+                                work_xb / atp_expected_p, 0.0)
 
     # ========================================================================
     # ASSEMBLE RESULT DICT (fixed keys — same pytree every call)
@@ -436,6 +593,14 @@ def compute_all_metrics(
         'atp_consumed': atp_consumed,
         'newly_bound': newly_bound,
 
+        # Heads tropomyosin tore off this step, split by what they had spent.
+        # `closure_tear_weak` is free; each `closure_tear_strong` is one ATP,
+        # already included in atp_consumed and atp_expected_p. Both are
+        # identically zero when xb_tm_K2 is jnp.inf (the hard lock makes closure
+        # over a bound head unreachable).
+        'closure_tear_weak': n_tear_weak,
+        'closure_tear_strong': n_tear_strong,
+
         # Displacement statistics
         'thick_displace_mean': jnp.mean(thick_displace_flat),
         'thick_displace_max': jnp.max(thick_displace_flat),
@@ -452,14 +617,15 @@ def compute_all_metrics(
         'titin_energy_avg': titin_energy_avg,
         'titin_energy_delta_avg': titin_energy_delta_avg,
 
-        # Work metrics
-        'work_thick': work_thick,
-        'work_thick_mean': work_thick_mean,
+        # Work metrics (pN*nm). Different quantities — see the WORK METRICS
+        # block above and docs/README.md section 6.
+        'xb_work_on_filaments': work_xb,
+        'sarcomere_work': sarcomere_work,
 
         # ATP expected metrics
         'atp_expected_p': atp_expected_p,
         'xb_tear_expected': xb_tear_expected,
-        'work_per_atp': work_per_atp,
+        'xb_work_per_atp': xb_work_per_atp,
 
         # Solver diagnostics
         'newton_iters': newton_iters,

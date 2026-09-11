@@ -686,8 +686,6 @@ def _run_sim_kernel(
                 )
             )
 
-            pre_solve_thick_pos = old_state.thick.axial
-
             if is_dynamic_ls:
                 drivers = Drivers(pCa=pCa_val, z_line=z_val, lattice_spacing=current_ls)
                 d_ref = ls_val * (l0 / z_val) ** nu_val
@@ -695,7 +693,7 @@ def _run_sim_kernel(
                 drivers = Drivers(pCa=pCa_val, z_line=z_val, lattice_spacing=ls_val)
                 d_ref = None
 
-            new_state, new_k, solver_residual, new_ls, n_iters = timestep(
+            new_state, new_k, solver_residual, new_ls, n_iters, trace = timestep(
                 old_state, constants, drivers, topology, k, dt=dt,
                 K_lat=K_lat_val if is_dynamic_ls else None,
                 d_ref=d_ref,
@@ -707,15 +705,19 @@ def _run_sim_kernel(
                 tm_subpop=tm_subpop,
             )
 
-            # Build metrics with emergent new_ls for correct force computation
+            # POST-SOLVE constants: these carry the emergent new_ls, and must,
+            # because force and the reported lattice_spacing are post-solve
+            # quantities. The Q-matrix metrics deliberately do NOT use them —
+            # they read trace.constants, which carries the PRE-solve spacing the
+            # rates were actually evaluated at. Both are right for their own
+            # question; do not unify them. See compute_all_metrics.
             constants_for_metrics = constants.with_drivers(pCa_val, z_val, new_ls)
             drivers_for_metrics = Drivers(pCa=pCa_val, z_line=z_val, lattice_spacing=new_ls)
             force = axial_force_at_mline(new_state, constants_for_metrics, topology)
 
             all_metrics = compute_all_metrics(
                 old_state, new_state, constants_for_metrics, drivers_for_metrics,
-                topology, pre_solve_thick_pos, force, solver_residual, n_iters, dt,
-                xb_subpop=xb_subpop,
+                topology, force, solver_residual, n_iters, dt, trace, dz,
             )
 
             return (new_state, new_k, new_ls), all_metrics

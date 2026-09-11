@@ -841,21 +841,6 @@ _DYNAMIC_DEFAULTS = {
                              #     their own measurement: the sentence carries their
                              #     ref (14). Their own data are bovine ventricle.
                              #     Retagged [M] → [I] 2026-08-19.
-    'xb_delta_23': 1.0,      # [I] nm, Bell transition-state distance for the
-                             #     Tight_1 -> Tight_2 isomerization. NOT the working
-                             #     stroke — that is r12 (stale-index fix 2026-08-27,
-                             #     S127; old 1-indexed r23 == today's r12). The
-                             #     literature below is about the STROKE and therefore
-                             #     supports xb_delta_12's role, not this one; it is
-                             #     kept here only because the value has never been
-                             #     re-derived for the step this actually is.
-                             #     Pate & Cooke 1989 JMRCM 10:181.
-                             #     Huxley & Simmons 1971 Nature 233:533 give
-                             #     1/a = 2 nm and h = 8 nm (the stroke); there is no
-                             #     "1–2 nm" range in the paper, and 1/a is one of "the
-                             #     parameters used in obtaining this degree of
-                             #     agreement", i.e. a FIT to tension transients (frog,
-                             #     4 °C), not a measurement. Retagged [M] → [I].
     'xb_delta_34': -0.80,    # [M] nm, distance to the detachment transition state.
                              #     NEGATIVE = CATCH BOND: r34 = A34*exp(+f*δ₃₄/kT), so
                              #     δ₃₄ < 0 means a resistive load SLOWS detachment.
@@ -897,11 +882,14 @@ _DYNAMIC_DEFAULTS = {
                              #     distances are also larger in magnitude than 0.5 —
                              #     Sung 0.8, Wang 2024 1.53–1.87 nm.
                              #     NEVER ZERO THIS ALONE. It trades off against
-                             #     xb_g_k_strong when fitting (stiffness and Bell
-                             #     distance compensate to the same load sensitivity),
-                             #     and xb_delta_23 has been observed to silently
-                             #     compensate for changes here — see the coupling table
-                             #     in rate_functions.xb_rate_34's docstring.
+                             #     xb_g_k_strong when fitting: stiffness and Bell
+                             #     distance compensate to the same load sensitivity.
+                             #     This is now the model's ONLY Bell transition-state
+                             #     distance — xb_delta_23 was deleted 2026-09-09 when
+                             #     2 -> 3 moved to Smith & Geeves' elastic-energy form
+                             #     (rate_functions.xb_rate_23), so the delta_23/delta_34
+                             #     coupling that used to hide changes here is gone and
+                             #     this axis is now interpretable alone.
     'xb_r40': 0.1,           # [G] ms⁻¹ recovery stroke. Unsourced, inherited as a
                              #     hardcoded constant from an earlier version.
                              #     Caps the maximum cycling rate
