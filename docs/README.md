@@ -250,7 +250,7 @@ regardless of ordering. `result.coords` maps each axis name to its values.
 primary output of a mechanical simulation. It is a property that returns
 `result.metrics['axial_force']`.
 
-`result.metrics` — a `MetricsDict` containing 56 quantities computed
+`result.metrics` — a `MetricsDict` containing 57 quantities computed
 at every timestep (described fully in the next section). `MetricsDict` supports
 both dict-style access (`result.metrics['n_bound']`) and attribute access
 (`result.metrics.n_bound`).
@@ -299,7 +299,7 @@ into a single result with a new outer sweep dimension.
 ## 6. What Is in results.metrics?
 
 Every timestep, after the mechanical state has been updated, `compute_all_metrics()`
-(`multifil_jax/metrics_fn.py`) computes 56 scalar quantities and accumulates
+(`multifil_jax/metrics_fn.py`) computes 57 scalar quantities and accumulates
 them into arrays. These are returned in `result.metrics` as a `MetricsDict`.
 Every key in this dictionary maps to an array with the same shape as
 `result.axial_force`.
@@ -696,7 +696,7 @@ calls the same compiled kernel, so there is no recompilation. The default
 `"auto"` setting chunks batches of 16384+ into groups of 4096, which
 benchmarks show is ~2% faster due to better L2 cache utilization. The primary
 reason to use minibatching is to bound peak GPU VRAM on memory-constrained GPUs
-(e.g. 8 GB): peak VRAM ≈ minibatch_size × n_steps × 56 metrics × 4 bytes × 2.
+(e.g. 8 GB): peak VRAM ≈ minibatch_size × n_steps × 57 metrics × 4 bytes × 2.
 
 ---
 
@@ -863,7 +863,7 @@ After all steps complete, the new state, solver residual, emergent lattice
 spacing, and iteration count are returned. The scan loop in `run_single_sim`
 carries the state forward to the next timestep. Immediately after `timestep()`
 returns, `compute_all_metrics()` is called inside the scan body, comparing the
-state before and after the step to produce all 56 scalar metrics. These are
+state before and after the step to produce all 57 scalar metrics. These are
 accumulated as arrays across time and returned as `result.metrics`.
 
 ---
@@ -1110,7 +1110,7 @@ and "active" only during specific steps.
 | `multifil_jax/simulation.py` | `BATCH_BUCKETS`, `get_bucket_size()`, `_run_sim_kernel()` |
 | `multifil_jax/timestep.py` | `kinetics_step()` — stochastic phase (driver resolution through transitions), returns a `KineticsTrace` |
 | `multifil_jax/timestep.py` | `timestep()` — full step orchestrator (kinetics + solve) |
-| `multifil_jax/metrics_fn.py` | `compute_all_metrics()` — 56-metric MetricsDict |
+| `multifil_jax/metrics_fn.py` | `compute_all_metrics()` — 57-metric MetricsDict |
 | `multifil_jax/core/state.py` | `State`, `realize_state()`, `Drivers`, `resolve_value()`, `MetricsDict` |
 | `multifil_jax/core/params.py` | `StaticParams`, `DynamicParams`, and the four species presets |
 | `multifil_jax/core/sarc_geometry.py` | `SarcTopology.create()` — topology builder; `valid_xb_targets()` |

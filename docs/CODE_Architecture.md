@@ -164,7 +164,7 @@ skeletal-inherited placeholders, not fitted values.
 
 ```
 result.axial_force      # property → metrics['axial_force'] (pN)
-result.metrics          # MetricsDict of 56 metric arrays, same shape
+result.metrics          # MetricsDict of 57 metric arrays, same shape
 result.z_line           # z_line trace used
 result.pCa              # pCa trace used
 result.metrics['solver_residual']  # Newton solver residual at each step
@@ -239,7 +239,7 @@ When a subpopulation is active, `subpop_arrays` joins the vmap as one extra
 (dict) axis; when inactive the vmap signature is unchanged, so the WT trace is
 byte-identical to a build without the feature.
 
-All 56 metrics are always computed. No `metrics`/`manifest` in JIT
+All 57 metrics are always computed. No `metrics`/`manifest` in JIT
 `static_argnames` — changing metric selection never triggers recompilation.
 
 ---
@@ -355,7 +355,7 @@ convention (`xb_r01_coeff`, `xb_r12_coeff`, `xb_r23_coeff`, `xb_r34_coeff`,
 `xb_r40`, `xb_r04`, `xb_r05`).
 
 **MetricsDict** — scan output. A dict subclass with attribute access, registered
-as a JAX PyTree. Contains all 56 metric scalars per timestep (including
+as a JAX PyTree. Contains all 57 metric scalars per timestep (including
 `axial_force`, `solver_residual`, `newton_iters`).
 
 **Immutable updates** via `._replace()`:
@@ -802,15 +802,16 @@ reported `lattice_spacing` are post-solve quantities); `trace.constants` carries
 the **pre-solve** one (the rates were evaluated there). Both are correct for
 their own question and must not be unified.
 
-Returns a `MetricsDict` with **56 keys** (same keys every call). Always computed —
+Returns a `MetricsDict` with **57 keys** (same keys every call). Always computed —
 no selection needed.
 
-**Metric groups (56 total):**
+**Metric groups (57 total):**
 | Group | Keys | n |
 |-------|------|---|
 | Protocol | `axial_force`, `solver_residual`, `z_line`, `pCa`, `lattice_spacing` | 5 |
 | XB counts | `n_bound`, `n_xb_drx`, `n_xb_loose`, `n_xb_tight_1`, `n_xb_tight_2`, `n_xb_free_2`, `n_xb_srx` | 7 |
 | XB fractions | `frac_xb_bound`, `frac_xb_drx`, `frac_xb_loose`, `frac_xb_tight_1`, `frac_xb_tight_2`, `frac_xb_free_2`, `frac_xb_srx` | 7 |
+| XB force by state | `force_xb_loose`, `force_xb_tight_1`, `force_xb_tight_2` | 3 |
 | TM counts | `n_tm_state_0` … `n_tm_state_3` | 4 |
 | TM fractions | `frac_tm_state_0` … `frac_tm_state_3`, `actin_permissiveness` | 5 |
 | TM overlap-zone | `frac_tm_state_2_overlap`, `frac_tm_state_3_overlap`, `frac_tm_available_overlap`, `n_overlap_sites` | 4 |
@@ -930,7 +931,7 @@ global scale, bit-for-bit, in every mode.
 |------|---------|
 | `multifil_jax/simulation.py` | `run()`, `SimulationResult`, `_run_sim_kernel`, `BATCH_BUCKETS` |
 | `multifil_jax/timestep.py` | `kinetics_step()`, `timestep()` — single step orchestrator |
-| `multifil_jax/metrics_fn.py` | `compute_all_metrics()` — 56-metric MetricsDict |
+| `multifil_jax/metrics_fn.py` | `compute_all_metrics()` — 57-metric MetricsDict |
 | `multifil_jax/core/state.py` | State hierarchy, `realize_state()`, `Drivers`, `KineticsTrace`, `resolve_value()`, `MetricsDict`, `PreconditionerParams` |
 | `multifil_jax/core/params.py` | `StaticParams`, `DynamicParams`/`Constants`, `_DYNAMIC_DEFAULTS`, the four species presets |
 | `multifil_jax/core/sarc_geometry.py` | `SarcTopology` — PyTree topology, `create()`, `valid_xb_targets()` |
