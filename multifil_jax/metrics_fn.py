@@ -29,7 +29,7 @@ geometries — see compute_overlap_tm_fractions() for why the difference bites.
 ATP consumption is reported two ways, which will not agree exactly, and should
 not:
 
-    atp_expected_p   the EXACT expected number of ATP-consuming crossings,
+    atp_expected   the EXACT expected number of ATP-consuming crossings,
                      q34 * INT_0^dt exp(Qt)dt summed over every head, PLUS the
                      realised strong closure tears. Smooth, and it counts a head
                      that passed through detachment and out again — or twice —
@@ -39,10 +39,10 @@ not:
                      closure tears. Noisy, and it undercounts multi-hop
                      traversals badly.
 
-Use atp_expected_p for rates and efficiencies, atp_consumed only when you
+Use atp_expected for rates and efficiencies, atp_consumed only when you
 specifically want realised events.
 
-atp_expected_p BECAME EXACT ON 2026-09-11, AND IT WAS NOT BEFORE. Until then it
+atp_expected BECAME EXACT ON 2026-09-11, AND IT WAS NOT BEFORE. Until then it
 summed P(VISIT state 4 at least once) over heads in mid states 1-3, read from a
 generator with rows 0 and 4 made absorbing. P(at least one) is a LOWER BOUND on
 E(visits), so it was biased low by exactly the heads that cycled twice inside one
@@ -74,7 +74,7 @@ instead of needing a spy script. All are exact expected crossing counts per step
     xb_detach_atp        N34, the Q-route ATP-consuming detachment alone
     xb_detach_free       N10, a Loose head falling off having never bound ATP
     xb_give_up           N21, and this is NOT A DETACHMENT — see below
-    atp_net_pi_release   N12 - N21, which must equal atp_expected_p at steady
+    atp_net_pi_release   N12 - N21, which must equal atp_expected at steady
                          state; a gap is a real leak, not a counter artefact
     atp_net_hydrolysis   N40 - N04, a third route touching no state 1/2/3
 
@@ -97,9 +97,9 @@ TWO WAYS OUT OF THE CYCLE COST NOTHING, AND BOTH ARE REPORTED SEPARATELY.
   during lengthening.
 
   A weak closure tear. Tropomyosin closing over a Loose head returns it to DRX
-  still primed, owing nothing. `closure_tear_weak` counts those.
+  still primed, owing nothing. `closure_detach_free` counts those.
 
-A STRONG CLOSURE TEAR DOES COST ONE, and is counted by `closure_tear_strong`.
+A STRONG CLOSURE TEAR DOES COST ONE, and is counted by `closure_detach_atp`.
 Tropomyosin closing over a Tight_1 or Tight_2 head sends it to Free_2, because
 it has already released its phosphate and swung its lever; returning it to DRX
 (= M.ADP.Pi) would hand back that phosphate for free. Before this was booked
@@ -514,15 +514,15 @@ def compute_all_metrics(
     # WHAT IS STILL APPROXIMATE. Q is held constant across the step. That is a
     # different error from the estimator bias just removed, and it does not
     # shrink because this sum became exact — only halving dt tests it.
-    atp_expected_p = n_tear_strong + N34
+    atp_expected = n_tear_strong + N34
 
     # Work per ATP. The numerator is the CROSSBRIDGE work, because ATP is spent
     # by crossbridges — and because it stays meaningful under an isometric hold,
     # where external work is exactly zero while heads are still cycling and
     # spending. For whole-sarcomere efficiency divide the two exported keys
-    # yourself: sarcomere_work / atp_expected_p. There is no third key for it.
-    xb_work_per_atp = jnp.where(atp_expected_p > 0.01,
-                                work_xb / atp_expected_p, 0.0)
+    # yourself: sarcomere_work / atp_expected. There is no third key for it.
+    xb_work_per_atp = jnp.where(atp_expected > 0.01,
+                                work_xb / atp_expected, 0.0)
 
     # ========================================================================
     # ASSEMBLE RESULT DICT (fixed keys — same pytree every call)
@@ -584,12 +584,12 @@ def compute_all_metrics(
         'newly_bound': newly_bound,
 
         # Heads tropomyosin tore off this step, split by what they had spent.
-        # `closure_tear_weak` is free; each `closure_tear_strong` is one ATP,
-        # already included in atp_consumed and atp_expected_p. Both are
+        # `closure_detach_free` is free; each `closure_detach_atp` is one ATP,
+        # already included in atp_consumed and atp_expected. Both are
         # identically zero when xb_tm_K2 is jnp.inf (the hard lock makes closure
         # over a bound head unreachable).
-        'closure_tear_weak': n_tear_weak,
-        'closure_tear_strong': n_tear_strong,
+        'closure_detach_free': n_tear_weak,
+        'closure_detach_atp': n_tear_strong,
 
         # Displacement statistics
         'thick_displace_mean': jnp.mean(thick_displace_flat),
@@ -613,7 +613,7 @@ def compute_all_metrics(
         'sarcomere_work': sarcomere_work,
 
         # ATP expected metrics
-        'atp_expected_p': atp_expected_p,
+        'atp_expected': atp_expected,
         'xb_work_per_atp': xb_work_per_atp,
 
         # THE CYCLE FLUXES, as exact expected crossing counts per step. Each is
@@ -623,7 +623,7 @@ def compute_all_metrics(
         # on any run instead of needing a spy script.
         #
         # `xb_detach_atp` is the Q-route ATP-consuming detachment ALONE, i.e.
-        # atp_expected_p minus the closure charge. Exported so the composition
+        # atp_expected minus the closure charge. Exported so the composition
         # of the ATP number is visible without doing arithmetic against
         # closure_detach_atp.
         'xb_detach_atp': N34,
@@ -641,11 +641,11 @@ def compute_all_metrics(
         'xb_give_up': N21,
         # LEDGER CROSS-CHECK 1 — gross Pi release minus what was handed back.
         # ATP is spent on arrival in Tight_1 and refunded by going back down, so
-        # at steady state this must equal atp_expected_p. A gap is a real leak in
+        # at steady state this must equal atp_expected. A gap is a real leak in
         # the model's accounting, not a counter artefact.
         'atp_net_pi_release': N12 - N21,
         # LEDGER CROSS-CHECK 2 — net hydrolysis, a THIRD route that touches no
-        # state 1, 2 or 3 at all. Equals atp_expected_p minus the change in the
+        # state 1, 2 or 3 at all. Equals atp_expected minus the change in the
         # Free_2 population. READ IT KNOWING IT IS A NET OF TWO LARGE NUMBERS:
         # the reverse recovery stroke N04 runs at 28-56 /ms at 8x8, which is
         # 29-82% of the booked rate.

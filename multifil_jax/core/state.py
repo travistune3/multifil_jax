@@ -134,8 +134,10 @@ class KineticsTrace(NamedTuple):
     WHY `state` IS THE MID STATE AND NOT `old_state`. `thick_transitions`
     samples its 6x6 generator from the sarcomere as it stands AFTER
     `update_nearest_neighbors` and `thin_transitions` have run. Metrics that
-    rebuild that generator — `atp_expected_p`, `xb_tear_expected` — must build
-    it from the same state, or they describe a step that never happened. Read
+    rebuild that generator — `atp_expected` and the exported cycle fluxes
+    (`xb_detach_atp`, `xb_detach_free`, `xb_give_up`, `atp_net_pi_release`,
+    `atp_net_hydrolysis`) — must build it from the same state, or they describe
+    a step that never happened. Read
     off `old_state` instead, the error is small (0.06%-0.46% measured, cardiac
     and skeletal, dt 1.0 and 0.1) but it is systematic and free to avoid.
 

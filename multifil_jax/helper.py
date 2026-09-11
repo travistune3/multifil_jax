@@ -104,7 +104,7 @@ def count_transitions(old_state: 'State', new_state: 'State') -> Dict[str, int]:
       - A head completing 3 -> 4 -> 0 in one step lands in 'xb_trans_other',
         not in 'xb_trans_34'. That is precisely why ATP consumption is NOT
         measured this way; metrics_fn uses an absorbing-state construction to
-        catch such traversals. Use 'atp_consumed' or 'atp_expected_p' for
+        catch such traversals. Use 'atp_consumed' or 'atp_expected' for
         turnover, never these counts.
       - A head that leaves and returns within one step counts as 'static'.
 

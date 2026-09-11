@@ -273,7 +273,7 @@ layer needs to describe the step that actually happened:
 `state` is the mid one because that is what `thick_transitions` builds its
 generator from; a metric that rebuilds that generator off the pre-step state
 describes a step that never happened (measured bias 0.06–0.46 % on
-`atp_expected_p`). `torn` is carried rather than re-derived because a torn head
+`atp_expected`). `torn` is carried rather than re-derived because a torn head
 lands where an ordinary one does. The trace **holds a whole `State`**, so it is a
 within-step value only — never a scan carry or a scan output.
 
@@ -653,7 +653,7 @@ exponential per caller, never two.
   with **rows 4 and 0 both zeroed**, making Free_2 and DRX absorbing. Trapping
   both exits makes them mutually exclusive, so a single matrix reports two
   disjoint fluxes: `P_abs[i,3,4]` = detachment that consumed an ATP
-  (`atp_expected_p`), `P_abs[i,3,0]` = detachment via the reverse route
+  (`atp_expected`), `P_abs[i,3,0]` = detachment via the reverse route
   `3→2→1→0` that consumed none (`xb_tear_expected`). Metrics only.
 
 This replaces one expm per crossbridge with `2 × n_xb_bins` — ~6× fewer expm calls
@@ -815,11 +815,11 @@ no selection needed.
 | TM counts | `n_tm_state_0` … `n_tm_state_3` | 4 |
 | TM fractions | `frac_tm_state_0` … `frac_tm_state_3`, `actin_permissiveness` | 5 |
 | TM overlap-zone | `frac_tm_state_2_overlap`, `frac_tm_state_3_overlap`, `frac_tm_available_overlap`, `n_overlap_sites` | 4 |
-| Transitions | `atp_consumed`, `newly_bound`, `closure_tear_weak`, `closure_tear_strong` | 4 |
+| Transitions | `atp_consumed`, `newly_bound`, `closure_detach_free`, `closure_detach_atp` | 4 |
 | Displacement | `thick_displace_mean/max/min/std`, `thin_displace_mean/max/min/std` | 8 |
 | Energy | `thick_energy_first_avg`, `thick_energy_first_delta_avg`, `titin_energy_avg`, `titin_energy_delta_avg` | 4 |
 | Work | `xb_work_on_filaments`, `sarcomere_work` | 2 |
-| Detachment / ATP | `atp_expected_p`, `xb_tear_expected`, `xb_work_per_atp` | 3 |
+| Detachment / ATP | `atp_expected`, `xb_tear_expected`, `xb_work_per_atp` | 3 |
 | Solver | `newton_iters` | 1 |
 
 The **overlap-zone** group (`compute_overlap_tm_fractions()`) restricts the TM
@@ -833,13 +833,13 @@ filament-length change once moved the all-site metric 13.5 %→17.3 % almost
 entirely through that denominator while the true overlap value barely moved.
 
 Both come from the absorbing-state `P_abs` (rows 4 **and** 0 zeroed), built from
-`trace.state` and `trace.constants`: `atp_expected_p` reads `P_abs[·,s,4]` over
+`trace.state` and `trace.constants`: `atp_expected` reads `P_abs[·,s,4]` over
 every cycling start state `s` in 1–3, correctly counting `3→4→0` paths within one
 step, and `xb_tear_expected` reads `P_abs[·,{2,3},0]` — the give-up route, which
 spends no ATP. Trapping both exits makes them mutually exclusive, so one matrix
 exponential yields both. `trace.xb_subpop` carries the per-population rates.
 
-`atp_expected_p` additionally carries the realised **strong closure tears**, as a
+`atp_expected` additionally carries the realised **strong closure tears**, as a
 count rather than an expectation: that event is fully observed and its charge is
 deterministic, so there is nothing to take an expectation over. The two terms are
 disjoint by construction — a torn head is in state 0 or 4 in `trace.state`, so it
@@ -875,7 +875,7 @@ and *is* exactly reconstructible afterwards. `xb_work_per_atp` divides by the
 crossbridge work, because ATP is spent by crossbridges and because that stays
 meaningful under an isometric hold where external work is zero. For
 whole-sarcomere efficiency divide the two exported keys: `sarcomere_work /
-atp_expected_p`. These replace `work_thick`/`work_thick_mean`/`work_per_atp`,
+atp_expected`. These replace `work_thick`/`work_thick_mean`/`work_per_atp`,
 which were M-line force times the mean displacement of *every* thick crown —
 neither quantity, and dominated by internal backbone strain redistribution.
 

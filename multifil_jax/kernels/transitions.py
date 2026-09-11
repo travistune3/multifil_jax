@@ -782,14 +782,15 @@ def thin_transitions(state: 'State',
 
     ATP: A WEAK TEAR IS FREE, A STRONG TEAR COSTS ONE, AND IT IS BOOKED IN
     metrics_fn FROM THE `torn` MASK THIS FUNCTION RETURNS — as
-    `closure_tear_weak` and `closure_tear_strong`, and added into both
-    `atp_consumed` and `atp_expected_p`. It needs no expectation: the tear is
+    `closure_detach_free` and `closure_detach_atp`, and added into both
+    `atp_consumed` and `atp_expected`. It needs no expectation: the tear is
     fully observed and the charge is deterministic given it, unlike the 3 -> 4
     term, where the sampler gives only endpoints and multi-hop traversals are
-    unobservable. `xb_tear_expected` does NOT count this route; it counts the
-    non-ATP 3 -> 2 -> 1 -> 0 give-up route only.
+    unobservable. Neither is `xb_give_up` this route: that key is the 2 -> 1
+    crossing count, i.e. the non-ATP strain-gated reversal, and a head it counts
+    is still weakly bound afterwards.
 
-    This paragraph used to claim "atp_expected_p is computed from the Q matrix
+    This paragraph used to claim "atp_expected is computed from the Q matrix
     (P_abs_all[:, 3, 4]) so nothing is miscounted". That was wrong three ways:
     the index named a metric that no longer exists, the metric was itself off by
     0.06-0.46% (it was read from a stale state), and under the rule above a
@@ -842,8 +843,8 @@ def thin_transitions(state: 'State',
             recoverable downstream — a torn head lands in state 0 or state 4,
             both of which an ordinary head also reaches — so it is returned
             rather than re-derived, and travels to metrics_fn inside the
-            KineticsTrace. metrics_fn splits it into `closure_tear_weak` (free)
-            and `closure_tear_strong` (one ATP each) by the state the head is in
+            KineticsTrace. metrics_fn splits it into `closure_detach_free` (free)
+            and `closure_detach_atp` (one ATP each) by the state the head is in
             after this call.
     """
     tm_states = state.thin.tm_states                    # (n_thin, n_sites) int8
@@ -1693,11 +1694,24 @@ def thick_transitions(state: 'State',
         #     departs from xb_step_probabilities by ~45 heads per step at
         #     cardiac pCa 4.5 — all of it moved from Loose into DRX.
         #     ANY METRIC THAT READS P OR Q AS THE TRUTH ABOUT THE STEP must say
-        #     why that gap does not reach it. For atp_expected_p and
-        #     xb_tear_expected the answer is structural: they mask on mid states
-        #     1-3, which are ALREADY BOUND, so `is_binding` is false for every
-        #     head they read and none of them can be reverted. A metric masked
-        #     on state 0 would not have that protection.
+        #     why that gap does not reach it.
+        #     >>> UNTIL 2026-09-11 THE ANSWER HERE WAS STRUCTURAL AND IT NO
+        #         LONGER IS. atp_expected masked on mid states 1-3, which are
+        #         ALREADY BOUND, so `is_binding` was false for every head it
+        #         read. The exact estimator drops that mask and reads every
+        #         head, states 0/4/5 included — which is correct for the ATP
+        #         (a head really can run 0 -> 1 -> 2 -> 3 -> 4 in one step) but
+        #         removes the immunity along with it. The answer is now a
+        #         measured BOUND, not a structural argument.
+        #         8x8, dt = 1 ms: heads in mid states 0/4/5 contribute
+        #         0.028% (cardiac 4.5) / 0.024% (6.2) and 0.567% (skeletal 4.5)
+        #         / 0.593% (6.2) of total N34. Only the reverted subset of those
+        #         is misattributed, and reverts are 4.8-7.1% of binding
+        #         attempts, so the exposure is at most ~0.002% cardiac and
+        #         ~0.04% skeletal — an order below the noise floor on the
+        #         ledger, and an order below the bias the exact estimator
+        #         removed. It is a bound, not a measurement of the effect
+        #         itself; a tighter figure needs `won` exported.
         #     The residue this leaves in the ATP ledger is bounded and measured
         #     in local_projects/tension_cost/atp_balance_spy.py.
         new_states_flat = jnp.where(is_binding & (~won), 0, new_states_flat)

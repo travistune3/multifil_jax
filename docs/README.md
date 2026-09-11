@@ -365,16 +365,16 @@ changed: one filament-length correction moved `frac_tm_state_3` from 13.5 % to
   past this counter's window inside one step.
 - `'newly_bound'` — count of crossbridges that newly attached to actin
   (state 0 → state 1)
-- `'atp_expected_p'` — expected ATP consumption using the P-matrix method
+- `'atp_expected'` — expected ATP consumption using the P-matrix method
   (a smoother, expected-value estimate rather than stochastic count), plus the
   strong closure tears. **Prefer this one.**
 - `'xb_tear_expected'` — expected NON-ATP detachments: strongly bound heads that
   back down the cycle (3→2→1→0) without reaching Free_2. Disjoint from
-  `atp_expected_p`. ~0.1 % of detachments isometrically, 14–19 % during imposed
+  `atp_expected`. ~0.1 % of detachments isometrically, 14–19 % during imposed
   lengthening. It does **not** count closure tears.
-- `'closure_tear_weak'` — heads tropomyosin tore off a *weak* (Loose) binding.
+- `'closure_detach_free'` — heads tropomyosin tore off a *weak* (Loose) binding.
   They return to DRX still primed and cost nothing.
-- `'closure_tear_strong'` — heads tropomyosin tore off a Tight_1 or Tight_2
+- `'closure_detach_atp'` — heads tropomyosin tore off a Tight_1 or Tight_2
   binding. They have already released phosphate and swung the lever, so they go
   to Free_2 and each costs one ATP, already included in the two totals above.
   Both keys are identically zero when `xb_tm_K2` is infinite.
@@ -426,9 +426,9 @@ genuinely different quantities and conflating them is the mistake the old
   `F[i-1]` really *is* the force at the start of step `i`, with no need to carry
   a force through the scan. Step 0 has `dz = 0` and no predecessor, so its
   `sarcomere_work` is exactly zero.
-- `'xb_work_per_atp'` — `xb_work_on_filaments / atp_expected_p`, guarded to 0
+- `'xb_work_per_atp'` — `xb_work_on_filaments / atp_expected`, guarded to 0
   when almost no ATP was spent. For whole-sarcomere efficiency divide the two
-  exported keys yourself: `sarcomere_work / atp_expected_p`.
+  exported keys yourself: `sarcomere_work / atp_expected`.
 
 **Solver diagnostics:**
 - `'newton_iters'` — number of Newton iterations used by the equilibrium solver
@@ -477,7 +477,7 @@ is a dict subclass, you can add new keys:
 
 ```python
 result.metrics['efficiency'] = (
-    result.metrics['sarcomere_work'] / (result.metrics['atp_expected_p'] + 1e-9)
+    result.metrics['sarcomere_work'] / (result.metrics['atp_expected'] + 1e-9)
 )
 ```
 
