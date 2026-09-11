@@ -19,8 +19,11 @@ whose entry P[i,j] is the probability of being in state j after dt given state i
 now. Taking the matrix exponential — rather than the cheaper Euler step
 P ~ I + Q*dt — matters here: it stays a valid probability matrix at any dt, and
 it correctly accounts for units that pass through an intermediate state within a
-single timestep. Metrics that count ATP consumption depend on exactly that (see
-the absorbing-state construction in xb_exit_probabilities).
+single timestep. Metrics that count ATP consumption depend on exactly that, and
+go one step further: the same scaling-and-squaring also yields the occupancy-time
+integral INT_0^dt exp(Qt)dt, from which the EXACT expected number of crossings of
+any edge follows (see expm_pade6_batch's with_integral and
+xb_expected_crossings).
 
 Each unit then samples its next state from its own row of P.
 
@@ -1322,11 +1325,17 @@ def _xb_Q_resolved(
     """Effective binned rate matrices, and how to gather them per head.
 
     Everything subpopulation-related lives here, and nothing else does. No
-    matrix exponentials are taken — that is deliberate, because the two callers
-    below need exponentials of DIFFERENT generators, and this is the part they
-    must share. Rates come from _build_xb_Q_bins in every branch, so the
-    sampling path and the metrics path cannot disagree about the physics of a
-    given step no matter how they diverge afterwards.
+    matrix exponentials are taken — that is deliberate, because it is the part
+    every caller must share. Rates come from _build_xb_Q_bins in every branch,
+    so the sampling path and the metrics path cannot disagree about the physics
+    of a given step no matter how they diverge afterwards.
+
+    UNTIL 2026-09-11 THIS DOCSTRING SAID the two callers "need exponentials of
+    DIFFERENT generators" — the sampler wanted plain Q, the metrics wanted Q with
+    rows 0 and 4 zeroed (the absorbing construction, deleted with
+    xb_exit_probabilities). They now need the SAME generator: exp(Q*dt) and its
+    occupancy-time integral come out of one call. That is what makes a single
+    exponential per step possible.
 
     Args:
         state: Current State NamedTuple
@@ -1493,58 +1502,6 @@ def xb_expected_crossings(
         per_xb = _gather_per_xb(per_cell, key, labels)          # (n_xb_total, 6)
         counts.append(jnp.take_along_axis(per_xb, s[:, None], axis=1)[:, 0])
     return jnp.stack(counts)
-
-
-def xb_exit_probabilities(
-    state: 'State',
-    constants: 'DynamicParams',
-    topology: 'SarcTopology',
-    dt: float,
-    xb_subpop=None,
-) -> jnp.ndarray:
-    """Which way a crossbridge LEFT the cycle, not where it ended up. Metrics only.
-
-    The companion to xb_step_probabilities(): that one answers "what state is
-    this head in after dt", this one answers "did it leave, and by which route".
-
-    WHY AN ABSORBING VARIANT EXISTS. Counting detachment by comparing states
-    before and after a step undercounts: a head can pass 3 -> 4 -> 0 within one
-    timestep, consuming an ATP but appearing to have gone 3 -> 0. Zeroing a row
-    of the generator traps any head that reaches that state, so the resulting
-    matrix reports whether a state was VISITED during the step, not merely where
-    the head ended up.
-
-    BOTH EXITS ARE TRAPPED, and that is what makes one exponential enough. A
-    bound head can leave the cycle two ways, and they mean different things:
-
-        P_abs[i, 3, 4]   reached Free_2  -> detached by binding ATP
-        P_abs[i, 3, 0]   reached DRX     -> backed out via 3 -> 2 -> 1 -> 0,
-                                            NO ATP spent (see xb_rate_21, which
-                                            is the strain-gated route for a
-                                            badly-positioned head to give up)
-
-    Trapping both makes the two outcomes mutually exclusive, so a single
-    absorbing generator reports the ATP-consuming and non-ATP-consuming
-    detachment fluxes at once. These feed atp_expected_p and xb_tear_expected in
-    metrics_fn. The cost is one .at[].set() on the bin grid, not an extra
-    exponential.
-
-    Args:
-        state: Current State NamedTuple
-        constants: DynamicParams with physics values
-        topology: SarcTopology with xb_bin_edges, xb_bin_centers, eye_6
-        dt: Timestep length (ms)
-        xb_subpop: see _xb_Q_resolved
-
-    Returns:
-        P_abs_all: (n_xb_total, 6, 6) probabilities from the generator with rows
-                   4 and 0 zeroed
-    """
-    Q_bins, key, labels = _xb_Q_resolved(state, constants, topology, xb_subpop)
-    # Ellipsis indexing covers both the plain and the stacked (subpopulation)
-    # layouts, so neither mode needs its own branch here.
-    Q_abs_bins = Q_bins.at[..., 4, :].set(0.0).at[..., 0, :].set(0.0)
-    return _gather_per_xb(_expm_bins(Q_abs_bins, dt, topology.eye_6), key, labels)
 
 
 def thick_transitions(state: 'State',

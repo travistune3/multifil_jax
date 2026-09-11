@@ -29,9 +29,10 @@ geometries — see compute_overlap_tm_fractions() for why the difference bites.
 ATP consumption is reported two ways, which will not agree exactly, and should
 not:
 
-    atp_expected_p   the expected number, from transition probabilities, PLUS
-                     the realised strong closure tears. Smooth, and correctly
-                     counts heads that passed through detachment and out again
+    atp_expected_p   the EXACT expected number of ATP-consuming crossings,
+                     q34 * INT_0^dt exp(Qt)dt summed over every head, PLUS the
+                     realised strong closure tears. Smooth, and it counts a head
+                     that passed through detachment and out again — or twice —
                      within one timestep. PREFER THIS.
     atp_consumed     a stochastic count of realised events: heads observed to
                      leave Tight_2 via Free_2 or DRX, plus the same strong
@@ -41,10 +42,20 @@ not:
 Use atp_expected_p for rates and efficiencies, atp_consumed only when you
 specifically want realised events.
 
+atp_expected_p BECAME EXACT ON 2026-09-11, AND IT WAS NOT BEFORE. Until then it
+summed P(VISIT state 4 at least once) over heads in mid states 1-3, read from a
+generator with rows 0 and 4 made absorbing. P(at least one) is a LOWER BOUND on
+E(visits), so it was biased low by exactly the heads that cycled twice inside one
+step — -0.07% cardiac, -1.2% skeletal at dt = 1 ms, measured by two independent
+routes. It now counts the 3 -> 4 EDGE, over every head with no mask, which is
+the exact quantity and needs no absorbing construction. The remaining
+approximation is that Q is held constant across the step; that is a DIFFERENT
+error, it did not shrink when this one was removed, and only halving dt tests it.
+
 HOW WRONG IS atp_consumed? THE ANSWER IS PRESET-DEPENDENT AND THE SPREAD IS
 LARGE. This docstring said "~5% low at dt = 1 ms" without qualification until
-2026-09-11. That figure is CARDIAC ONLY. Measured against exact expected
-crossing counts (local_projects/tension_cost/atp_balance_spy.py), 8x8, dt = 1 ms:
+2026-09-11. That figure is CARDIAC ONLY. Measured against the exact book side
+(local_projects/tension_cost/atp_balance_spy.py), 8x8, dt = 1 ms:
 
     cardiac    pCa 4.5  -5.0%    pCa 6.2  -5.3%
     skeletal   pCa 4.5 -27.6%    pCa 6.2 -25.2%
@@ -52,21 +63,38 @@ crossing counts (local_projects/tension_cost/atp_balance_spy.py), 8x8, dt = 1 ms
 Skeletal turns over ~2.6x faster, so far more heads clear two or three stages
 inside one step and land outside the (mid == 3) -> {4, 0} window this counter
 reads. Do not carry the 5% figure into a skeletal tension-cost study; it is off
-by a factor of five. atp_expected_p over the same runs is -0.07% (cardiac) and
--1.2% (skeletal), which is the reason it is the preferred key. Both are read against the MID state — the
-sarcomere as thick_transitions found it — not against the state at the top of
-the step; see compute_all_metrics.
+by a factor of five. Both are read against the MID state — the sarcomere as
+thick_transitions found it — not against the state at the top of the step; see
+compute_all_metrics.
+
+THE CYCLE FLUXES ARE EXPORTED TOO, so the ATP books self-verify on any run
+instead of needing a spy script. All are exact expected crossing counts per step
+(see kernels/transitions.xb_expected_crossings):
+
+    xb_detach_atp        N34, the Q-route ATP-consuming detachment alone
+    xb_detach_free       N10, a Loose head falling off having never bound ATP
+    xb_give_up           N21, and this is NOT A DETACHMENT — see below
+    atp_net_pi_release   N12 - N21, which must equal atp_expected_p at steady
+                         state; a gap is a real leak, not a counter artefact
+    atp_net_hydrolysis   N40 - N04, a third route touching no state 1/2/3
+
+The residual on either cross-check is a MARTINGALE with sd ~ sqrt(n_4)/sqrt(n_steps),
+about 1.6 /ms at 8x8 over 300 ms. A within-one-sigma drift is not a bug.
 
 TWO WAYS OUT OF THE CYCLE COST NOTHING, AND BOTH ARE REPORTED SEPARATELY.
 
-  The give-up route. A strongly bound head can back down the cycle,
-  3 -> 2 -> 1 -> 0, without ever reaching Free_2. That route is strain-gated at
-  2 -> 1 (see xb_rate_21) — it is how a badly-positioned head gives up rather
-  than completing a cycle it cannot afford. `xb_tear_expected` counts it and
-  atp_expected_p excludes it. Measured on the cardiac preset, this is ~0.1% of
-  detachments isometrically but 14-19% during imposed lengthening, so it is
-  negligible for isometric work and emphatically not for work loops — which
-  also makes `atp_consumed` unusable as an ATP figure during lengthening.
+  The give-up route, `xb_give_up`. A strongly bound head can back down the
+  cycle, 3 -> 2 -> 1 -> 0, without ever reaching Free_2. The route is
+  strain-gated at 2 -> 1 (see xb_rate_21) — it is how a badly-positioned head
+  gives up rather than completing a cycle it cannot afford. It refunds a
+  phosphate and costs no ATP: 3 -> 2 -> 1 -> 0 is the microscopic reverse of the
+  forward path, so charging it would be the opposite error. NOTE WHAT THE METRIC
+  IS: the 2 -> 1 crossing count, so the head is still weakly bound afterwards
+  and may well climb straight back. It is NOT a detachment count. Measured on
+  the cardiac preset the route is ~0.1% of detachments isometrically but 14-19%
+  during imposed lengthening — negligible for isometric work and emphatically
+  not for work loops, which also makes `atp_consumed` unusable as an ATP figure
+  during lengthening.
 
   A weak closure tear. Tropomyosin closing over a Loose head returns it to DRX
   still primed, owing nothing. `closure_tear_weak` counts those.
@@ -76,18 +104,22 @@ Tropomyosin closing over a Tight_1 or Tight_2 head sends it to Free_2, because
 it has already released its phosphate and swung its lever; returning it to DRX
 (= M.ADP.Pi) would hand back that phosphate for free. Before this was booked
 (2026-09-10), 8.0% of all the ATP the model spent was never counted anywhere —
-4.3 points from state-2 tears, 2.7 from state-3 tears, the remaining 1.0% being
+4.3 points from state-2 tears, 2.7 from state-3 tears, the remaining 0.4% being
 the give-up route above, which is a genuine refund and not a leak.
 
-THE TWO DO NOT SUM TO TOTAL STRONG DETACHMENT, and this docstring claimed they
-did until 2026-09-08. They are disjoint OUTCOMES — reached Free_2, versus
-reached DRX without passing through it, made mutually exclusive by trapping both
-in the same absorbing generator — but they are read over different STARTING
-sets. atp_expected_p runs over states 1-3, because a head can complete the whole
-cycle inside one step; xb_tear_expected runs over states 2-3 only, because a
-Loose head falling off is an ordinary failed weak attachment and not a
-load-driven tear. Their sum is therefore neither a partition of strong
-detachment nor of all detachment.
+THE CLOSURE CHARGE STAYS A REALISED COUNT and must not become an expectation.
+The tear is fully observed and its charge is deterministic given it, so there is
+nothing to take an expectation over; charging an expectation would bill heads
+that are still bound. The 3 -> 4 term is an expectation for the opposite reason:
+the sampler reports only endpoints, so a head that traverses 3 -> 4 -> 0 inside
+one step is invisible to any realised count.
+
+(A retired metric, `xb_tear_expected`, was removed on 2026-09-11 along with the
+absorbing generator it was the sole reason for. It asked "reached DRX WITHOUT
+passing through Free_2", read over mid states 2-3 — a first-passage question, and
+its own docstring had to shout that despite the name it did not count closure
+tears. `xb_give_up` is what it was reaching for, measured directly as a crossing
+count rather than inferred from a first-passage probability.)
 
 (A third metric, atp_expected_q, was removed in Session 108. It capped each
 head's detachment rate at its zero-load value, which silently encoded a DIFFERENT
@@ -112,7 +144,7 @@ from typing import Dict, TYPE_CHECKING
 
 from multifil_jax.kernels.forces import (axial_force_at_mline, xb_axial_force_by_state,
                                          xb_axial_work)
-from multifil_jax.kernels.transitions import xb_exit_probabilities
+from multifil_jax.kernels.transitions import xb_expected_crossings
 from multifil_jax.core.state import Drivers, resolve_value, MetricsDict
 
 if TYPE_CHECKING:
@@ -410,7 +442,7 @@ def compute_all_metrics(
     sarcomere_work = -0.5 * (force_old + force) * delta_z
 
     # ========================================================================
-    # ATP EXPECTED (P-matrix method) — recompute per-XB P via shared helper
+    # ATP AND THE CYCLE FLUXES — exact expected crossing counts
     # ========================================================================
     # BUILT FROM THE TRACE, which is the whole point of the trace. Both the
     # state and the constants come from kinetics_step, so this generator is the
@@ -418,144 +450,71 @@ def compute_all_metrics(
     # driver-resolved constants at the same PRE-solve lattice spacing, same
     # already-resolved subpopulation tuple. Rebuilding any of the three here
     # (which is what this did until 2026-09-10) both duplicated work and got a
-    # different answer: reading off old_state biased atp_expected_p by
+    # different answer: reading off old_state biased the ATP number by
     # 0.06%-0.46%, and in dynamic-LS mode the rebuilt constants carried the
     # SOLVED spacing, which the rates were never evaluated at.
-    P_abs_all = xb_exit_probabilities(
+    #
+    # WHAT THIS RETURNS. For each head, and for each ordered pair (i, j), the
+    # EXPECTED NUMBER of i -> j transitions it makes during the step:
+    #
+    #     E[# i -> j | started in s] = q_ij * INT_0^dt [exp(Qt)]_{s,i} dt
+    #
+    # exact for a generator held constant over the step, which is the same
+    # assumption the sampler itself makes. Multi-hop traversals and repeat
+    # crossings are both counted correctly. See xb_expected_crossings().
+    N = xb_expected_crossings(
         trace.state, trace.constants, topology, dt, xb_subpop=trace.xb_subpop
     )
+    N10, N12, N21, N34, N04, N40 = [jnp.sum(N[k]) for k in range(6)]
 
-    mid_xb_flat = mid_xb.reshape(-1)
-
-    # Expected ATP, from transition probabilities.
+    # Expected ATP consumed this step.
     #
-    # The naive quantity, P[3,4], is the probability of ENDING the step in
-    # Free_2, which undercounts: a head can go 3 -> 4 -> 0 within one timestep,
-    # spending an ATP but ending where a before/after comparison sees no
-    # detachment at all. P_abs comes from a generator with states 4 and 0 made
-    # absorbing, so P_abs[i,4] is the probability of VISITING Free_2 at any
-    # point during the step, having started in state i — the quantity wanted.
+    # ATP is booked on the 3 -> 4 crossing (xb_r34_coeff; Tight_2 -> Free_2 is
+    # where the nucleotide is exchanged), plus one per strong closure tear.
     #
-    # READ FOR EVERY CYCLING HEAD, not only for heads that begin the step in
-    # Tight_2. There is no direct 2 -> 4 or 1 -> 4 transition; the point is that
-    # a head can clear two or three stages inside one timestep (2 -> 3 -> 4, or
-    # 1 -> 2 -> 3 -> 4) and spend a real ATP doing it. Masking on state 3 alone,
-    # as this did until 2026-09-08, dropped every one of those. It is a
-    # discretisation bias rather than a missing pathway, and it scales as
-    # dt * r23 * r34 — largest on exactly the axes a tension-cost study sweeps.
+    # NO MASK, AND EVERY HEAD IS READ. Until 2026-09-11 this summed
+    # P_abs[s, 4] over heads in mid states 1-3 only, read from a generator with
+    # rows 0 and 4 zeroed — i.e. P(VISIT state 4 at least once), not E(number of
+    # visits). P(at least one) is a LOWER BOUND on E(visits), so the estimator
+    # was biased low by exactly the heads that cycled twice inside one step:
+    # -0.07% cardiac, -1.2% skeletal at dt = 1 ms, confirmed by two independent
+    # routes (atp_estimator_spy head-by-head, atp_balance_spy whole-ledger).
+    # Counting the EDGE removes that bias, and removes the need for the mask
+    # along with it. Two arguments that used to be load-bearing FOR the mask no
+    # longer apply, and both are worth stating because they look like they do:
     #
-    # SIZE, measured 2026-09-08, pCa 4.5, dt = 1 ms, as a fraction of the
-    # corrected flux:  cardiac 7.6% (2x2), skeletal 33.5% (2x2).
-    # DO NOT quote the S115 figures (2.31% cardiac / 13.37% skeletal) for this
-    # change. Those were measured for the state-2 starters ALONE — see
-    # local_projects/tension_cost/old/audit_atp.py, whose whole premise is that
-    # P_abs[2,4] exists and is not read — and this mask also picks up state-1
-    # heads completing the entire cycle within one step. Same defect, strictly
-    # larger correction.
+    #   * Heads starting in 0, 4 or 5 are now INCLUDED, and that is correct. A
+    #     head that runs 0 -> 1 -> 2 -> 3 -> 4 inside one step really does spend
+    #     an ATP. Row 0 was excluded because "reached state 4" from state 0 would
+    #     have counted `r04` — the reverse recovery stroke, which re-primes a
+    #     detached lever arm and consumes nothing. An edge count cannot confuse
+    #     the two: r04 is the 0 -> 4 edge and this reads the 3 -> 4 edge. Row 4
+    #     was excluded because a head parked in Free_2 sat in an absorbing state
+    #     and would have been charged afresh every step it lingered; a crossing
+    #     count charges it only when it crosses.
+    #   * A head torn off a closing site is in state 4 in `trace.state`, so it is
+    #     now inside the sum rather than outside it. That is NOT double-counting
+    #     the tear: its own E[# 3 -> 4] is a SECOND, fresh cycle within the same
+    #     step, not the one already charged, and from state 4 it would have to
+    #     run 4 -> 3 -> 4 to earn it. MEASURED at 8x8, dt = 1 ms, both presets,
+    #     pCa 4.5 and 6.2: it is EXACTLY zero, and structurally so rather than
+    #     merely small — r43 is always zero (see _build_xb_Q_matrix_optimized:
+    #     re-attaching directly into the post-stroke state would run the ATPase
+    #     backwards), so G[4, 3] is identically 0 and a head in Free_2 cannot
+    #     reach Tight_2 within the step at all.
     #
-    # STATES 0 AND 5 ARE OUTSIDE THE MASK FOR TWO MEASURED REASONS, not for the
-    # circular one this comment used to give ("row 0 is absorbing" — it is
-    # absorbing only because xb_exit_probabilities zeroed it, which says nothing
-    # about the physics).
-    #   1. It costs nothing. A head that starts the step in DRX contributes
-    #      between 1e-7 and 6e-5 expected ATP over the step. Heads really do run
-    #      0 -> 1 -> 2 inside one dt (27% of state-2 arrivals at pCa 4.5), but
-    #      almost none of them get all the way to Free_2.
-    #   2. Unzeroing row 0 would make it WORSE, not better. Row 0 has a direct
-    #      0 -> 4 transition, `r04` — the reverse recovery stroke, re-priming a
-    #      detached lever arm. It is not ATP-consuming. Any estimator that reads
-    #      "reached state 4" from state 0 counts it and is wrong. A probe
-    #      written this way (drx_start_atp_spy.py, deleted 2026-09-10) did
-    #      exactly that.
-    # State 4 is outside the mask and MUST be — row 4 is absorbing, so
-    # P_abs[4,4] = 1, and a head waiting in Free_2 for xb_rate_40 to fire would
-    # otherwise be charged a fresh ATP on every step it lingered there.
-    # THE MASK ALSO IMMUNISES THIS METRIC AGAINST THE ONE FLUX THAT IS NOT IN
-    # Q. thick_transitions sends a head that sampled a bound state but lost the
-    # site race back to DRX (`is_binding & ~won`), which no generator predicts
-    # and which is 4.8-7.1% of binding attempts at dt = 1 ms. It cannot touch
-    # the sum below, because `is_binding` requires the head to start the step
-    # UNBOUND and this mask reads only states 1-3. That is an argument from the
-    # mask, not from the size of the effect — see the comment at that line.
+    # THE TEAR TERM STAYS A REALISED COUNT, and that is not an inconsistency.
+    # The tear is fully observed and its charge is deterministic given it, so the
+    # realised count IS this step's tear ATP — there is nothing to take an
+    # expectation over, and charging an expectation would bill heads that are
+    # still bound. The 3 -> 4 term must be an expectation for the opposite
+    # reason: the sampler reports only endpoints, so a head that traverses
+    # 3 -> 4 -> 0 inside one step is invisible to any realised count.
     #
-    # THE TWO TERMS ARE DISJOINT BY CONSTRUCTION, not by an approximation. A
-    # head torn off by tropomyosin is in state 0 or state 4 in `trace.state`, so
-    # it is outside the 1..3 mask below and cannot be counted twice.
-    #
-    # THE TEAR TERM IS A REALISED COUNT, NOT AN EXPECTATION, and that is not an
-    # inconsistency. The tear is fully observed and the charge is deterministic
-    # given it, so the realised count IS this step's tear ATP — there is nothing
-    # to take an expectation over. The 3 -> 4 term must stay an expectation for
-    # the opposite reason: the sampler reports only endpoints, so a head that
-    # traverses 3 -> 4 -> 0 inside one step is invisible to any realised count.
-    #
-    # >>> WHAT IS STILL BIASED, AND BY HOW MUCH. The second term is
-    #     P(visit state 4 at least once), read from a generator with rows 0 and
-    #     4 zeroed — not E(number of visits), which is the exact quantity
-    #     (`q34 * INT_0^dt [exp(Qt)]_{s,3} dt`, the top-right block of
-    #     expm([[Q, I], [0, 0]] dt); see
-    #     local_projects/tension_cost/atp_estimator_spy.py). At dt = 1 ms a head
-    #     can make the transition more than once, and P(at least one) is then a
-    #     LOWER BOUND on E(visits) — which is why every measured gap below is
-    #     negative.
-    #
-    #     MEASURED 2026-09-10, 4x4, dt = 1 ms, pCa 4.5 and 6.2, over isometric,
-    #     lengthening (+0.05 nm/ms) and shortening (-0.05 nm/ms):
-    #         cardiac   -0.06% to -0.08%   (all three regimes)
-    #         skeletal  -1.17% to -1.39%   (all three regimes)
-    #     The split is by CYCLING RATE, not by protocol: skeletal turns over
-    #     ~2.6x faster (31 vs 12 ATP/ms at pCa 4.5), so many more heads complete
-    #     3 -> 4 twice inside one step. Imposed shortening or lengthening moves
-    #     it by only ~0.1 points on top of that.
-    #
-    #     So the honest bound is ~0.1% for cardiac and ~1.4% for skeletal at
-    #     dt = 1 ms, NOT the "~1%" that an isometric-cardiac-only measurement
-    #     would have suggested. It shrinks with dt. Not fixed here, and
-    #     defensible at that size — but it is a systematic bias, not a rounding
-    #     error, and a skeletal tension-cost study should either use dt = 0.1 ms
-    #     or carry the correction.
-    #
-    #     CONFIRMED BY A SECOND, INDEPENDENT ROUTE 2026-09-11. The figures above
-    #     came from atp_estimator_spy.py, which compares this sum against
-    #     E[# of 3 -> 4 crossings] head by head. atp_balance_spy.py instead
-    #     scores the model's whole ATP ledger — net Pi release (N12 - N21)
-    #     against what is booked (N34 + strong tears), plus net hydrolysis
-    #     (N40 - N04) as a third route — and lands on the same numbers:
-    #     -0.066%/-0.057% cardiac, -1.19%/-1.12% skeletal. The ledger itself
-    #     closes to within the occupancy drift over the window, so the S137 tear
-    #     charge left no residual leak: see that script's header.
-    mask_cycling = ((mid_xb_flat >= 1) & (mid_xb_flat <= 3)).astype(jnp.float32)
-    atp_expected_p = n_tear_strong + jnp.sum(
-        mask_cycling * jnp.take_along_axis(
-            P_abs_all[:, :, 4], mid_xb_flat[:, None].astype(jnp.int32), axis=1
-        )[:, 0]
-    )
-
-    # Expected NON-ATP detachment ("tearing"), from the same absorbing matrix.
-    #
-    # A strongly bound head has a second way out: back down the cycle,
-    # 3 -> 2 -> 1 -> 0, without ever reaching Free_2 and so without spending an
-    # ATP. That route is strain-gated at the 2 -> 1 step (see xb_rate_21), which
-    # is how a badly-positioned head gives up rather than completing a cycle it
-    # cannot afford. Because state 0 is absorbing in the same generator that
-    # traps state 4, P_abs[i, 0] is the probability of reaching DRX WITHOUT
-    # passing through Free_2 — mutually exclusive with the ATP route above, and
-    # free of any extra matrix exponential.
-    #
-    # Restricted to the strongly bound states 2 and 3 on purpose: a state-1
-    # (Loose) head falling off is an ordinary failed weak attachment, not a
-    # load-driven tear, and pooling them would obscure both.
-    #
-    # DESPITE THE NAME, THIS DOES NOT COUNT CLOSURE TEARS. It counts the
-    # strain-gated 3 -> 2 -> 1 -> 0 give-up route and nothing else. Heads
-    # tropomyosin tore off are `closure_tear_weak` / `closure_tear_strong`, and
-    # they are already out of the generator's reach by the time it is built.
-    mask_strong = ((mid_xb_flat == 2) | (mid_xb_flat == 3)).astype(jnp.float32)
-    xb_tear_expected = jnp.sum(
-        mask_strong * jnp.take_along_axis(
-            P_abs_all[:, :, 0], mid_xb_flat[:, None].astype(jnp.int32), axis=1
-        )[:, 0]
-    )
+    # WHAT IS STILL APPROXIMATE. Q is held constant across the step. That is a
+    # different error from the estimator bias just removed, and it does not
+    # shrink because this sum became exact — only halving dt tests it.
+    atp_expected_p = n_tear_strong + N34
 
     # Work per ATP. The numerator is the CROSSBRIDGE work, because ATP is spent
     # by crossbridges — and because it stays meaningful under an isometric hold,
@@ -655,8 +614,47 @@ def compute_all_metrics(
 
         # ATP expected metrics
         'atp_expected_p': atp_expected_p,
-        'xb_tear_expected': xb_tear_expected,
         'xb_work_per_atp': xb_work_per_atp,
+
+        # THE CYCLE FLUXES, as exact expected crossing counts per step. Each is
+        # summed over every head from its own mid state and its own generator;
+        # see xb_expected_crossings(). They are informational — nothing else in
+        # the model reads them — and they exist so the ATP books can be checked
+        # on any run instead of needing a spy script.
+        #
+        # `xb_detach_atp` is the Q-route ATP-consuming detachment ALONE, i.e.
+        # atp_expected_p minus the closure charge. Exported so the composition
+        # of the ATP number is visible without doing arithmetic against
+        # closure_detach_atp.
+        'xb_detach_atp': N34,
+        # A Loose head falling off having never bound ATP: an ordinary failed
+        # weak attachment, NOT a load-driven event, and it costs nothing.
+        'xb_detach_free': N10,
+        # NOT A DETACHMENT — the head stays weakly bound. This is the
+        # strain-gated 2 -> 1 reversal (Pi rebinding; see xb_rate_21) by which a
+        # badly-positioned head backs out of a cycle it cannot afford rather than
+        # completing it. It REFUNDS a phosphate and costs no ATP: 3 -> 2 -> 1 -> 0
+        # is the microscopic reverse of the forward path, so charging it would be
+        # the opposite error. This is the quantity the retired `xb_tear_expected`
+        # was reaching for, and it is measured rather than inferred from a
+        # first-passage probability.
+        'xb_give_up': N21,
+        # LEDGER CROSS-CHECK 1 — gross Pi release minus what was handed back.
+        # ATP is spent on arrival in Tight_1 and refunded by going back down, so
+        # at steady state this must equal atp_expected_p. A gap is a real leak in
+        # the model's accounting, not a counter artefact.
+        'atp_net_pi_release': N12 - N21,
+        # LEDGER CROSS-CHECK 2 — net hydrolysis, a THIRD route that touches no
+        # state 1, 2 or 3 at all. Equals atp_expected_p minus the change in the
+        # Free_2 population. READ IT KNOWING IT IS A NET OF TWO LARGE NUMBERS:
+        # the reverse recovery stroke N04 runs at 28-56 /ms at 8x8, which is
+        # 29-82% of the booked rate.
+        'atp_net_hydrolysis': N40 - N04,
+        #
+        # NOISE FLOOR ON BOTH CROSS-CHECKS. Realised-minus-expected occupancy is
+        # a MARTINGALE, so the residual has sd ~ sqrt(n_4)/sqrt(n_steps) — about
+        # 1.6 /ms at 8x8 over 300 ms. A within-one-sigma drift is not a bug; S138
+        # nearly reported one as such.
 
         # Solver diagnostics
         'newton_iters': newton_iters,
