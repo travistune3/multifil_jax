@@ -70,7 +70,7 @@ Tanner BCW, Regnier M, Daniel TL (2012), "Filament compliance influences
 import jax
 import jax.numpy as jnp
 import jax.scipy as jsp
-from typing import Tuple, Dict, Optional, Union, TYPE_CHECKING
+from typing import Tuple, Dict, NamedTuple, Optional, Union, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from multifil_jax.core.sarc_geometry import SarcTopology
@@ -1402,22 +1402,50 @@ def _expm_bins(Q: jnp.ndarray, dt: float, eye_6: jnp.ndarray,
     return P.reshape(shape), G.reshape(shape)
 
 
-def xb_step_probabilities(
+class XBBins(NamedTuple):
+    """The one binned crossbridge generator a step is built on, and both
+    exponentials of it.
+
+    THERE IS EXACTLY ONE PER STEP. Until 2026-09-11 there were two: the sampler
+    exponentiated Q for the endpoint probabilities and the metrics path
+    exponentiated a DIFFERENT, absorbing generator for the ATP estimate. The
+    exact estimator needs no absorbing construction, so both now want exp(Q*dt)
+    of the same matrix — and its occupancy-time integral comes out of the same
+    scaling-and-squaring. `kinetics_step` builds this once and hands it to both.
+
+    Fields:
+        Q: (n_cells, 6, 6) rate matrices on the bin grid, or the stacked
+            (K, n_cells, 6, 6) of an explicit subpopulation run
+        P: exp(Q*dt), same shape — what the sampler draws from
+        G: INT_0^dt exp(Qt)dt, same shape — expected time in each state, from
+            which q_ij * G[s, i] gives exact expected crossing counts
+        key: (n_xb_total,) each head's index into the bin grid
+        labels: (n_xb_total,) population index for mode=='explicit', else None
+    """
+    Q: jnp.ndarray
+    P: jnp.ndarray
+    G: jnp.ndarray
+    key: jnp.ndarray
+    labels: object
+
+
+def xb_binned_generator(
     state: 'State',
     constants: 'DynamicParams',
     topology: 'SarcTopology',
     dt: float,
     xb_subpop=None,
-) -> jnp.ndarray:
-    """Per-crossbridge transition probabilities over dt — what the sampler draws from.
+) -> XBBins:
+    """Build the step's crossbridge generator and exponentiate it, once.
 
-    P[i, j] is the probability that a head in state i is in state j after dt.
-    This is the ONLY thing thick_transitions needs, and taking a single
-    exponential of the plain generator is the whole job.
+    Evaluates 2 * n_xb_bins matrix exponentials instead of one per head — on the
+    distance grid rather than per head, so the cost does not grow with lattice
+    size. Bin resolution is a genuine accuracy/cost tradeoff; see
+    _build_xb_Q_bins and StaticParams.n_xb_bins / xb_bin_lo / xb_bin_hi.
 
-    Evaluates 2 * n_xb_bins matrix exponentials instead of one per head — at a
-    4x4 lattice roughly a sixfold reduction, on the grid rather than per head,
-    so the cost does not grow with lattice size.
+    The occupancy-time integral G rides along for ~5% more wall than P alone
+    (measured, 400 matrices), which is what lets the metrics path drop its own
+    second exponential entirely.
 
     Args:
         state: Current State NamedTuple
@@ -1427,11 +1455,11 @@ def xb_step_probabilities(
         xb_subpop: see _xb_Q_resolved
 
     Returns:
-        P_all: (n_xb_total, 6, 6) transition probability matrices per crossbridge
+        XBBins
     """
     Q_bins, key, labels = _xb_Q_resolved(state, constants, topology, xb_subpop)
-    P_bins = _expm_bins(Q_bins, dt, topology.eye_6)
-    return _gather_per_xb(P_bins, key, labels)
+    P_bins, G_bins = _expm_bins(Q_bins, dt, topology.eye_6, with_integral=True)
+    return XBBins(Q=Q_bins, P=P_bins, G=G_bins, key=key, labels=labels)
 
 
 #: Ordered pairs whose expected crossing counts the ATP metrics read.
@@ -1441,11 +1469,8 @@ XB_METRIC_PAIRS = ((1, 0), (1, 2), (2, 1), (3, 4), (0, 4), (4, 0))
 
 
 def xb_expected_crossings(
-    state: 'State',
-    constants: 'DynamicParams',
-    topology: 'SarcTopology',
-    dt: float,
-    xb_subpop=None,
+    bins: XBBins,
+    states: jnp.ndarray,
     pairs=XB_METRIC_PAIRS,
 ) -> jnp.ndarray:
     """How many times each head crosses each edge during the step. Metrics only.
@@ -1473,45 +1498,38 @@ def xb_expected_crossings(
     merely wrong, and every head can be read — including one that runs
     0 -> 1 -> 2 -> 3 -> 4 inside a single step, which really does spend an ATP.
 
-    Reads each head's OWN start state from `state`, so pass the mid state from
-    KineticsTrace (the sarcomere as thick_transitions found it), not the state at
-    the top of the step. Built on the same _xb_Q_resolved / _gather_per_xb pair
-    as xb_step_probabilities, so subpopulation handling stays in the one place
-    that owns it.
+    Reads each head's OWN start state, so pass the MID state — the sarcomere as
+    thick_transitions found it, carried on KineticsTrace — not the state at the
+    top of the step. Takes the already-built XBBins rather than rebuilding them,
+    so the sampler and the metrics cannot disagree about the step and only one
+    matrix exponential is ever taken.
 
     Args:
-        state: State whose thick.xb_states give each head's starting state
-        constants: DynamicParams with physics values
-        topology: SarcTopology with xb_bin_edges, xb_bin_centers, eye_6
-        dt: Timestep length (ms)
-        xb_subpop: see _xb_Q_resolved
+        bins: XBBins from xb_binned_generator(), for THIS step
+        states: (n_xb_total,) or any shape reshapeable to it — each head's
+            starting state
         pairs: ordered (i, j) edges to count; defaults to XB_METRIC_PAIRS
 
     Returns:
         N: (len(pairs), n_xb_total) expected crossing counts, per head, over dt
     """
-    Q_bins, key, labels = _xb_Q_resolved(state, constants, topology, xb_subpop)
-    _P_bins, G_bins = _expm_bins(Q_bins, dt, topology.eye_6, with_integral=True)
-
-    s = state.thick.xb_states.reshape(-1).astype(jnp.int32)
+    s = states.reshape(-1).astype(jnp.int32)
     counts = []
     for (i, j) in pairs:
         # Expected time in state i, by starting state, times the i -> j rate.
         # Ellipsis indexing covers the plain and the stacked (subpopulation)
         # layouts alike, so neither mode needs its own branch.
-        per_cell = G_bins[..., :, i] * Q_bins[..., i, j][..., None]
-        per_xb = _gather_per_xb(per_cell, key, labels)          # (n_xb_total, 6)
+        per_cell = bins.G[..., :, i] * bins.Q[..., i, j][..., None]
+        per_xb = _gather_per_xb(per_cell, bins.key, bins.labels)  # (n_xb_total, 6)
         counts.append(jnp.take_along_axis(per_xb, s[:, None], axis=1)[:, 0])
     return jnp.stack(counts)
 
 
 def thick_transitions(state: 'State',
-                     constants: 'DynamicParams',
+                     bins: XBBins,
                      topology: 'SarcTopology',
                      rng_key: jax.random.PRNGKey,
-                     dt: float,
-                     random_values: Optional[jnp.ndarray] = None,
-                     xb_subpop=None):
+                     random_values: Optional[jnp.ndarray] = None):
     """Advance every crossbridge one timestep, and update what it is bound to.
 
     Two things happen here, and the second is easy to overlook: heads sample new
@@ -1522,24 +1540,21 @@ def thick_transitions(state: 'State',
     (see thin_transitions) and what lets forces.py know where to apply
     crossbridge force.
 
-    Rates come from xb_step_probabilities(), which evaluates them on a distance
+    Rates come from xb_binned_generator(), which evaluates them on a distance
     grid rather than per head; see there and in _build_xb_Q_bins for how that
-    works and what it costs in accuracy.
+    works and what it costs in accuracy. The bins are built by `kinetics_step`
+    and passed in, because the metrics path reads the same ones.
 
     Heads flagged invalid by topology.xb_valid are held at permissiveness 0
     throughout, so they can never enter a bound state and never claim a site.
 
     Args:
         state: Current State
-        constants: DynamicParams with pCa, lattice_spacing and the xb_* rates
+        bins: XBBins for this step, from xb_binned_generator(). Carries the
+            subpopulation resolution already applied; see _xb_Q_resolved().
         topology: SarcTopology with xb_to_thin_id, xb_valid, eye_6
         rng_key: JAX random key for sampling
-        dt: Timestep length (ms)
         random_values: Optional pre-drawn uniforms, for deterministic testing
-        xb_subpop: Optional (mode, constants_k, extra) for mixed populations;
-            None runs the single-population path verbatim, at zero cost. See
-            _xb_Q_resolved() for the tuple contract and core/subpopulation.py
-            for how these are built.
 
     Returns:
         new_state: State with updated xb_states, xb_bound_to, and thin bound_to
@@ -1552,9 +1567,8 @@ def thick_transitions(state: 'State',
     xb_states_flat = xb_states.reshape(-1)  # (n_thick * n_crowns * n_xb_per_crown,)
     n_xb_total = xb_states_flat.shape[0]
 
-    # Per-XB transition probabilities via shared helper (subpop-aware)
-    P_all = xb_step_probabilities(
-        state, constants, topology, dt, xb_subpop=xb_subpop)
+    # Per-XB transition probabilities, gathered from the step's bin grid
+    P_all = _gather_per_xb(bins.P, bins.key, bins.labels)
 
     # Sample new states (same logic as thin_transitions)
     current_states = xb_states_flat.astype(jnp.int32)
@@ -1691,7 +1705,7 @@ def thick_transitions(state: 'State',
         #     8x8, z 1100, dt = 1 ms, as a fraction of all heads that sampled a
         #     bound state from 0/4/5: cardiac 4.8% (pCa 4.5) / 1.2% (pCa 6.2),
         #     skeletal 7.1% / 5.3%. The realised endpoint histogram therefore
-        #     departs from xb_step_probabilities by ~45 heads per step at
+        #     departs from the sampled P by ~45 heads per step at
         #     cardiac pCa 4.5 — all of it moved from Loose into DRX.
         #     ANY METRIC THAT READS P OR Q AS THE TRUTH ABOUT THE STEP must say
         #     why that gap does not reach it.

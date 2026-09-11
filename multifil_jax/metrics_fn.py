@@ -444,15 +444,17 @@ def compute_all_metrics(
     # ========================================================================
     # ATP AND THE CYCLE FLUXES — exact expected crossing counts
     # ========================================================================
-    # BUILT FROM THE TRACE, which is the whole point of the trace. Both the
-    # state and the constants come from kinetics_step, so this generator is the
-    # one thick_transitions actually sampled from — same mid state, same
-    # driver-resolved constants at the same PRE-solve lattice spacing, same
-    # already-resolved subpopulation tuple. Rebuilding any of the three here
-    # (which is what this did until 2026-09-10) both duplicated work and got a
-    # different answer: reading off old_state biased the ATP number by
+    # READ STRAIGHT OFF THE TRACE, which is the whole point of the trace. The
+    # generator and its two exponentials were built once in kinetics_step, from
+    # the mid state, at the driver-resolved constants and the PRE-solve lattice
+    # spacing, with the subpopulation tuple already resolved — so this IS the
+    # step thick_transitions took, not a reconstruction of it. Rebuilding it
+    # here (which is what this did until 2026-09-10) both duplicated work and
+    # got a different answer: reading off old_state biased the ATP number by
     # 0.06%-0.46%, and in dynamic-LS mode the rebuilt constants carried the
-    # SOLVED spacing, which the rates were never evaluated at.
+    # SOLVED spacing, which the rates were never evaluated at. Until 2026-09-11
+    # it also cost a SECOND matrix exponential, of a different (absorbing)
+    # generator; the exact estimator needs no such generator.
     #
     # WHAT THIS RETURNS. For each head, and for each ordered pair (i, j), the
     # EXPECTED NUMBER of i -> j transitions it makes during the step:
@@ -462,9 +464,7 @@ def compute_all_metrics(
     # exact for a generator held constant over the step, which is the same
     # assumption the sampler itself makes. Multi-hop traversals and repeat
     # crossings are both counted correctly. See xb_expected_crossings().
-    N = xb_expected_crossings(
-        trace.state, trace.constants, topology, dt, xb_subpop=trace.xb_subpop
-    )
+    N = xb_expected_crossings(trace.xb_bins, trace.state.thick.xb_states)
     N10, N12, N21, N34, N04, N40 = [jnp.sum(N[k]) for k in range(6)]
 
     # Expected ATP consumed this step.

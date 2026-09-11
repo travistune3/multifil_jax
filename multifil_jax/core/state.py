@@ -155,11 +155,18 @@ class KineticsTrace(NamedTuple):
             off this step. Not recoverable from the before/after states — a torn
             head lands where an ordinary one does — so it is carried, not
             re-derived. See transitions.thin_transitions.
+        xb_bins: transitions.XBBins — the binned crossbridge generator the step
+            was taken with, and both exponentials of it. Carried rather than
+            rebuilt so the sampler and the metrics cannot disagree about the
+            step, and so only ONE matrix exponential is taken per step. The bin
+            grid is (2 * n_xb_bins, 6, 6) = (400, 6, 6) plus one index per head
+            — small, and a within-step value, which is what this trace is for.
     """
     state: 'State'
     constants: 'DynamicParams'
     xb_subpop: object
     torn: jnp.ndarray
+    xb_bins: object
 
 
 class MetricsDict(dict):

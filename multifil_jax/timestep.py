@@ -48,7 +48,8 @@ import jax.numpy as jnp
 from typing import Tuple, Optional, TYPE_CHECKING
 
 from multifil_jax.kernels.geometry import update_nearest_neighbors
-from multifil_jax.kernels.transitions import thin_transitions, thick_transitions
+from multifil_jax.kernels.transitions import (thin_transitions, thick_transitions,
+                                              xb_binned_generator)
 from multifil_jax.kernels.solver import solve_equilibrium
 from multifil_jax.core.state import Drivers, KineticsTrace, resolve_value
 
@@ -130,17 +131,26 @@ def kinetics_step(state: 'State',
     state, _P_thin, torn = thin_transitions(
         state, resolved_constants, topology, thin_key, dt, tm_subpop=tm_subpop_r)
 
-    # Capture the trace HERE, between the two transition calls, because `state`
-    # is at this instant exactly what thick_transitions is about to build its
-    # generator from. A metric that rebuilds that generator has to build it from
-    # the same state or it describes a step that never happened.
-    trace = KineticsTrace(state=state, constants=resolved_constants,
-                          xb_subpop=xb_subpop_r, torn=torn)
+    # Step 3: build the crossbridge generator and exponentiate it — ONCE.
+    # `state` is at this instant exactly what the generator must be built from.
+    # Both consumers read these same bins: thick_transitions samples from
+    # bins.P, and the ATP metrics read expected crossing counts out of bins.G.
+    # Until 2026-09-11 metrics_fn took a SECOND exponential of its own, of a
+    # different (absorbing) generator; the exact estimator needs no such
+    # generator, so the duplication went with it.
+    bins = xb_binned_generator(state, resolved_constants, topology, dt,
+                               xb_subpop=xb_subpop_r)
 
-    # Step 3: Thick filament transitions
+    # Capture the trace HERE, between the two transition calls, because `state`
+    # and `bins` together are exactly the step thick_transitions is about to
+    # take. A metric that describes that step has to read these, or it describes
+    # a step that never happened.
+    trace = KineticsTrace(state=state, constants=resolved_constants,
+                          xb_subpop=xb_subpop_r, torn=torn, xb_bins=bins)
+
+    # Step 4: Thick filament transitions
     rng_key, thick_key = jax.random.split(rng_key)
-    state = thick_transitions(state, resolved_constants, topology, thick_key, dt,
-                              xb_subpop=xb_subpop_r)
+    state = thick_transitions(state, bins, topology, thick_key)
 
     return state, rng_key, trace
 
