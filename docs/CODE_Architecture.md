@@ -164,7 +164,7 @@ skeletal-inherited placeholders, not fitted values.
 
 ```
 result.axial_force      # property → metrics['axial_force'] (pN)
-result.metrics          # MetricsDict of 52 metric arrays, same shape
+result.metrics          # MetricsDict of 56 metric arrays, same shape
 result.z_line           # z_line trace used
 result.pCa              # pCa trace used
 result.metrics['solver_residual']  # Newton solver residual at each step
@@ -239,7 +239,7 @@ When a subpopulation is active, `subpop_arrays` joins the vmap as one extra
 (dict) axis; when inactive the vmap signature is unchanged, so the WT trace is
 byte-identical to a build without the feature.
 
-All 52 metrics are always computed. No `metrics`/`manifest` in JIT
+All 56 metrics are always computed. No `metrics`/`manifest` in JIT
 `static_argnames` — changing metric selection never triggers recompilation.
 
 ---
@@ -253,13 +253,29 @@ Two public functions:
 ### `kinetics_step()` — stochastic phase (steps 0–5)
 
 ```python
-state, rng_key, resolved_constants = kinetics_step(
+state, rng_key, trace = kinetics_step(
     state, constants, drivers, topology, rng_key, dt=dt,
     xb_subpop=None, tm_subpop=None,
 )
 ```
 
-Performs driver resolution, nearest neighbors, and stochastic TM/XB transitions. Returns `resolved_constants` with driver values baked in.
+Performs driver resolution, nearest neighbors, and stochastic TM/XB transitions.
+Returns a **`KineticsTrace`** (`core/state.py`) carrying everything the metrics
+layer needs to describe the step that actually happened:
+
+| field | what it is |
+|---|---|
+| `state` | the **mid** state — after `thin_transitions`, before `thick_transitions` |
+| `constants` | driver-resolved `DynamicParams`, at the **pre-solve** lattice spacing |
+| `xb_subpop` | the already-resolved `(mode, constants_k, extra)` tuple, or `None` |
+| `torn` | per-head bool mask of heads tropomyosin tore off this step |
+
+`state` is the mid one because that is what `thick_transitions` builds its
+generator from; a metric that rebuilds that generator off the pre-step state
+describes a step that never happened (measured bias 0.06–0.46 % on
+`atp_expected_p`). `torn` is carried rather than re-derived because a torn head
+lands where an ordinary one does. The trace **holds a whole `State`**, so it is a
+within-step value only — never a scan carry or a scan output.
 
 Separated from the mechanical solve to support future FE coupling: run kinetics
 across all coupled sarcomeres, then perform a coupled equilibration.
@@ -267,7 +283,7 @@ across all coupled sarcomeres, then perform a coupled equilibration.
 ### `timestep()` — full step (kinetics + equilibrium)
 
 ```python
-new_state, new_key, residual, new_ls, n_iters = timestep(
+new_state, new_key, residual, new_ls, n_iters, trace = timestep(
     state, constants, drivers, topology, rng_key, dt=dt,
     K_lat=None, d_ref=None,
     solver_tol=None, n_cg_steps=6, n_newton_steps=16,
@@ -276,7 +292,8 @@ new_state, new_key, residual, new_ls, n_iters = timestep(
 )
 ```
 
-Returns a 5-tuple. `K_lat is None` selects fixed LS mode (resolved at trace time,
+Returns a 6-tuple, the last element being the `KineticsTrace` above — feed it
+straight to `compute_all_metrics()`. `K_lat is None` selects fixed LS mode (resolved at trace time,
 no runtime branch). When `K_lat` is not None, passes `K_lat` and `d_ref` to
 `solve_equilibrium()` which handles the augmented (n+1)-DOF dynamic LS solve.
 
@@ -284,7 +301,7 @@ no runtime branch). When `K_lat` is not None, passes `K_lat` and `d_ref` to
 
 1. **resolve_value** — merge Drivers (Tier 3) with Constants (Tier 2) via `with_drivers()`
 2. **update_nearest_neighbors** — per-XB geometry (axial/radial distance to nearest site)
-3. **thin_transitions** — TM 4-state Markov transitions, 27 unique Q matrices
+3. **thin_transitions** — TM 4-state Markov transitions, 54 unique Q matrices
 4. **thick_transitions** — XB 6-state Markov transitions (binned Q → gather)
 5. **solve_equilibrium** — Newton-CG solver (unified fixed/dynamic LS)
 
@@ -338,7 +355,7 @@ convention (`xb_r01_coeff`, `xb_r12_coeff`, `xb_r23_coeff`, `xb_r34_coeff`,
 `xb_r40`, `xb_r04`, `xb_r05`).
 
 **MetricsDict** — scan output. A dict subclass with attribute access, registered
-as a JAX PyTree. Contains all 52 metric scalars per timestep (including
+as a JAX PyTree. Contains all 56 metric scalars per timestep (including
 `axial_force`, `solver_residual`, `newton_iters`).
 
 **Immutable updates** via `._replace()`:
@@ -595,13 +612,18 @@ argument, making the anti-cooperative mistake structurally unrepresentable.
 
 ### `thin_transitions(state, constants, topology, rng_key, dt, tm_subpop=None)`
 - 4-state TM chain Markov model with symmetric Ising coupling (§9)
-- 27 unique Q matrices indexed by `(n_2, n_3, n_closed)`, each capped at 2
+- 54 unique Q matrices indexed by `(n_2, n_3, n_closed)` (each capped at 2) **× whether a crossbridge is bound**, as `(n_2*9 + n_3*3 + n_c) + 27*is_bound`
 - One batched `expm_pade6_batch` call, then a per-site gather by config index
-- Sites in state 3 **and** bound to an XB are locked (probability `[0,0,0,1]`),
-  applied after the exponential so the 27-matrix reduction survives
+- The crossbridge lock is applied **to rates, inside Q**: the locked half has
+  `k_30 /= (1+K2)`, `k_32 /= (1+K2)`, `k_33 = -(k_30+k_32)`. McKillop & Geeves'
+  `K_T(1+K2)` is an *equilibrium ratio*, and this is the form that reproduces it
+  at any `dt`. It was applied to probabilities after the exponential until S136,
+  which equals this only to first order in `dt` — at `dt = 1 ms` a nominal
+  `xb_tm_K2 = 79` ran as an effective ~174. `xb_tm_K2 = jnp.inf` still gives the
+  hard `[0,0,0,1]` lock bit-exactly
 - Neighbor counts come from `count_neighbor_states_split()` in this same module
 - `tm_subpop` supports mean-field (`Q_eff = Σ f_k Q_k`, one exponential) and
-  explicit per-site label select (`(K, 27, 4, 4)` → gather)
+  explicit per-site label select (`(K, 54, 4, 4)` → gather). Each population now uses its own `xb_tm_K2`, which the post-hoc form could not do
 
 ### `thick_transitions(state, constants, topology, rng_key, dt)`
 - 6-state XB Markov model (states 0–5, see §6)
@@ -673,8 +695,11 @@ springs for states 2-4), titin (exponential model).
 - `_xb_radial_force_total(...)` — total XB radial force Σ dV_XB/dd (pN). Differentiable w.r.t. lattice_spacing for the augmented Newton JVP.
 - `_titin_radial_force_total(...)` — total titin radial force from all thick filaments
 
-Both functions replicate the geometry from their axial counterparts but accumulate
-the radial component instead. Used by `_radial_residual()` in `solver.py`.
+`_xb_radial_force_total` shares the two-spring primitives with the axial path
+rather than replicating them — it is the *other component of the same rotation*,
+`polar_to_filament(...)[1]` where the axial path takes `[0]`. Used by
+`_radial_residual()` in `solver.py`, and differentiated there, so it must stay
+`jax.grad`-able w.r.t. `lattice_spacing`.
 
 ---
 
@@ -768,15 +793,19 @@ Single function:
 ```python
 metrics = compute_all_metrics(
     old_state, new_state, constants, drivers, topology,
-    pre_solve_thick_pos, force, solver_residual, newton_iters, dt,
-    xb_subpop=None,
+    force, solver_residual, newton_iters, dt, trace, delta_z,
 )
 ```
 
-Returns a `MetricsDict` with **52 keys** (same keys every call). Always computed —
+`constants`/`drivers` carry the **solved** lattice spacing (force and the
+reported `lattice_spacing` are post-solve quantities); `trace.constants` carries
+the **pre-solve** one (the rates were evaluated there). Both are correct for
+their own question and must not be unified.
+
+Returns a `MetricsDict` with **56 keys** (same keys every call). Always computed —
 no selection needed.
 
-**Metric groups (52 total):**
+**Metric groups (56 total):**
 | Group | Keys | n |
 |-------|------|---|
 | Protocol | `axial_force`, `solver_residual`, `z_line`, `pCa`, `lattice_spacing` | 5 |
@@ -785,11 +814,11 @@ no selection needed.
 | TM counts | `n_tm_state_0` … `n_tm_state_3` | 4 |
 | TM fractions | `frac_tm_state_0` … `frac_tm_state_3`, `actin_permissiveness` | 5 |
 | TM overlap-zone | `frac_tm_state_2_overlap`, `frac_tm_state_3_overlap`, `frac_tm_available_overlap`, `n_overlap_sites` | 4 |
-| Transitions | `atp_consumed`, `newly_bound` | 2 |
+| Transitions | `atp_consumed`, `newly_bound`, `closure_tear_weak`, `closure_tear_strong` | 4 |
 | Displacement | `thick_displace_mean/max/min/std`, `thin_displace_mean/max/min/std` | 8 |
 | Energy | `thick_energy_first_avg`, `thick_energy_first_delta_avg`, `titin_energy_avg`, `titin_energy_delta_avg` | 4 |
-| Work | `work_thick`, `work_thick_mean` | 2 |
-| Detachment / ATP | `atp_expected_p`, `xb_tear_expected`, `work_per_atp` | 3 |
+| Work | `xb_work_on_filaments`, `sarcomere_work` | 2 |
+| Detachment / ATP | `atp_expected_p`, `xb_tear_expected`, `xb_work_per_atp` | 3 |
 | Solver | `newton_iters` | 1 |
 
 The **overlap-zone** group (`compute_overlap_tm_fractions()`) restricts the TM
@@ -802,12 +831,52 @@ sites. Prefer the `_overlap` variants whenever comparing across geometries — a
 filament-length change once moved the all-site metric 13.5 %→17.3 % almost
 entirely through that denominator while the true overlap value barely moved.
 
-Both come from the absorbing-state `P_abs` (rows 4 **and** 0 zeroed):
-`atp_expected_p` reads `P_abs[·,3,4]`, correctly counting 3→4→0 paths within one
-step, and `xb_tear_expected` reads `P_abs[·,{2,3},0]` — detachment via the
-reverse route, which spends no ATP. Trapping both exits makes them mutually
-exclusive, so one matrix exponential yields both. `xb_subpop` is threaded through
-so each XB's metrics use its own population's rates.
+Both come from the absorbing-state `P_abs` (rows 4 **and** 0 zeroed), built from
+`trace.state` and `trace.constants`: `atp_expected_p` reads `P_abs[·,s,4]` over
+every cycling start state `s` in 1–3, correctly counting `3→4→0` paths within one
+step, and `xb_tear_expected` reads `P_abs[·,{2,3},0]` — the give-up route, which
+spends no ATP. Trapping both exits makes them mutually exclusive, so one matrix
+exponential yields both. `trace.xb_subpop` carries the per-population rates.
+
+`atp_expected_p` additionally carries the realised **strong closure tears**, as a
+count rather than an expectation: that event is fully observed and its charge is
+deterministic, so there is nothing to take an expectation over. The two terms are
+disjoint by construction — a torn head is in state 0 or 4 in `trace.state`, so it
+falls outside the 1–3 mask.
+
+**The one bias that remains.** `P_abs[·,s,4]` is P(visit Free_2 at least once),
+not E(visits). The exact quantity is
+`q34 · ∫₀^dt [exp(Qt)]_{s,3} dt`, the top-right block of `expm([[Q, I],[0, 0]]·dt)`
+— see `local_projects/tension_cost/atp_estimator_spy.py`, which validates it
+against a 200,000-substep Riemann sum. P(at least one) is a *lower bound* on
+E(visits), so the gap is always negative. Measured 2026-09-10 at 4×4, `dt = 1 ms`,
+pCa 4.5 and 6.2, over isometric, lengthening (+0.05 nm/ms) and shortening
+(−0.05 nm/ms):
+
+| preset | gap |
+|---|---|
+| cardiac | −0.06 % to −0.08 % |
+| skeletal | −1.17 % to −1.39 % |
+
+**The split is by cycling rate, not by protocol.** Skeletal turns over ~2.6× faster
+(31 vs 12 ATP/ms at pCa 4.5), so far more heads complete `3 → 4` twice inside one
+step; imposing a ramp moves the gap by only ~0.1 points on top of that. So the
+honest bound is ~0.1 % for cardiac and ~1.4 % for skeletal at `dt = 1 ms` — not
+the "~1 %" an isometric-cardiac-only measurement would have suggested. It shrinks
+with `dt`. Not fixed; not to be described as exact. A skeletal tension-cost study
+should use `dt = 0.1 ms` or carry the correction.
+
+**Work: two different quantities.** `xb_work_on_filaments` is what the
+crossbridges did to the lattice (path-dependent and per-head, so it cannot be
+reconstructed from the returned traces — it must be computed in the scan);
+`sarcomere_work` is what the half-sarcomere did externally at the driven z-line,
+and *is* exactly reconstructible afterwards. `xb_work_per_atp` divides by the
+crossbridge work, because ATP is spent by crossbridges and because that stays
+meaningful under an isometric hold where external work is zero. For
+whole-sarcomere efficiency divide the two exported keys: `sarcomere_work /
+atp_expected_p`. These replace `work_thick`/`work_thick_mean`/`work_per_atp`,
+which were M-line force times the mean displacement of *every* thick crown —
+neither quantity, and dominated by internal backbone strain redistribution.
 
 ---
 
@@ -861,14 +930,14 @@ global scale, bit-for-bit, in every mode.
 |------|---------|
 | `multifil_jax/simulation.py` | `run()`, `SimulationResult`, `_run_sim_kernel`, `BATCH_BUCKETS` |
 | `multifil_jax/timestep.py` | `kinetics_step()`, `timestep()` — single step orchestrator |
-| `multifil_jax/metrics_fn.py` | `compute_all_metrics()` — 52-metric MetricsDict |
-| `multifil_jax/core/state.py` | State hierarchy, `realize_state()`, `Drivers`, `resolve_value()`, `MetricsDict`, `PreconditionerParams` |
+| `multifil_jax/metrics_fn.py` | `compute_all_metrics()` — 56-metric MetricsDict |
+| `multifil_jax/core/state.py` | State hierarchy, `realize_state()`, `Drivers`, `KineticsTrace`, `resolve_value()`, `MetricsDict`, `PreconditionerParams` |
 | `multifil_jax/core/params.py` | `StaticParams`, `DynamicParams`/`Constants`, `_DYNAMIC_DEFAULTS`, the four species presets |
 | `multifil_jax/core/sarc_geometry.py` | `SarcTopology` — PyTree topology, `create()`, `valid_xb_targets()` |
 | `multifil_jax/core/subpopulation.py` | `Subpopulation` dataclass + mask generation |
 | `multifil_jax/kernels/geometry.py` | `update_nearest_neighbors()` |
 | `multifil_jax/kernels/transitions.py` | `thin_transitions()`, `thick_transitions()`, `count_neighbor_states_split()`, `xb_step_probabilities()`, `xb_exit_probabilities()`, `expm_pade6_batch()` |
-| `multifil_jax/kernels/forces.py` | `axial_force_at_mline()`, `compute_forces_vectorized()`, `_xb_radial_force_total()`, `_titin_radial_force_total()` |
+| `multifil_jax/kernels/forces.py` | `xb_geometry()`, `xb_springs_for_state()`, `xb_elastic_energy()`, `xb_polar_forces()`, `polar_to_filament()` (the two-spring primitives — the rate path in `transitions.py` imports them too), `xb_axial_work()`, `axial_force_at_mline()`, `compute_forces_vectorized()`, `_xb_radial_force_total()`, `_titin_radial_force_total()` |
 | `multifil_jax/kernels/solver.py` | `solve_equilibrium()` (unified fixed/dynamic LS), Thomas algorithm |
 | `multifil_jax/kernels/rate_functions.py` | Rate functions (absolute values, no multipliers) |
 | `multifil_jax/utils/hardware.py` | GPU detection, XLA persistent-cache configuration |

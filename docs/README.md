@@ -250,7 +250,7 @@ regardless of ordering. `result.coords` maps each axis name to its values.
 primary output of a mechanical simulation. It is a property that returns
 `result.metrics['axial_force']`.
 
-`result.metrics` — a `MetricsDict` containing 52 quantities computed
+`result.metrics` — a `MetricsDict` containing 56 quantities computed
 at every timestep (described fully in the next section). `MetricsDict` supports
 both dict-style access (`result.metrics['n_bound']`) and attribute access
 (`result.metrics.n_bound`).
@@ -299,7 +299,7 @@ into a single result with a new outer sweep dimension.
 ## 6. What Is in results.metrics?
 
 Every timestep, after the mechanical state has been updated, `compute_all_metrics()`
-(`multifil_jax/metrics_fn.py`) computes 52 scalar quantities and accumulates
+(`multifil_jax/metrics_fn.py`) computes 56 scalar quantities and accumulates
 them into arrays. These are returned in `result.metrics` as a `MetricsDict`.
 Every key in this dictionary maps to an array with the same shape as
 `result.axial_force`.
@@ -356,15 +356,25 @@ changed: one filament-length correction moved `frac_tm_state_3` from 13.5 % to
 
 **Transition events** (events that occurred in this timestep):
 - `'atp_consumed'` — stochastic count of crossbridges that detached and consumed
-  an ATP molecule this step (state 3 → state 4, including 3 → 4 → 0 within one step)
+  an ATP molecule this step (state 3 → state 4, including 3 → 4 → 0 within one
+  step), plus the strong closure tears below. Do not use this during imposed
+  lengthening: 14–19 % of detachments there take the no-ATP give-up route, versus
+  ~0.1 % isometrically.
 - `'newly_bound'` — count of crossbridges that newly attached to actin
   (state 0 → state 1)
 - `'atp_expected_p'` — expected ATP consumption using the P-matrix method
-  (a smoother, expected-value estimate rather than stochastic count)
+  (a smoother, expected-value estimate rather than stochastic count), plus the
+  strong closure tears. **Prefer this one.**
 - `'xb_tear_expected'` — expected NON-ATP detachments: strongly bound heads that
   back down the cycle (3→2→1→0) without reaching Free_2. Disjoint from
-  `atp_expected_p`, so the two sum to total detachment of bound heads. ~0.1% of
-  detachments isometrically, 14–19% during imposed lengthening.
+  `atp_expected_p`. ~0.1 % of detachments isometrically, 14–19 % during imposed
+  lengthening. It does **not** count closure tears.
+- `'closure_tear_weak'` — heads tropomyosin tore off a *weak* (Loose) binding.
+  They return to DRX still primed and cost nothing.
+- `'closure_tear_strong'` — heads tropomyosin tore off a Tight_1 or Tight_2
+  binding. They have already released phosphate and swung the lever, so they go
+  to Free_2 and each costs one ATP, already included in the two totals above.
+  Both keys are identically zero when `xb_tm_K2` is infinite.
 
 **Displacement statistics** — how far filament nodes are from their rest positions:
 - `'thick_displace_mean'`, `'thick_displace_max'`, `'thick_displace_min'`,
@@ -380,12 +390,42 @@ changed: one filament-length correction moved `frac_tm_state_3` from 13.5 % to
 - `'titin_energy_avg'` — mean titin energy across all connections
 - `'titin_energy_delta_avg'` — change in titin energy
 
-**Work metrics** — mechanical work done:
-- `'work_thick'` — work done by M-line force over thick filament displacement
-  this timestep (pN·nm)
-- `'work_thick_mean'` — same, normalized by number of thick filament nodes
-- `'work_per_atp'` — ratio of work done to ATP consumed (thermodynamic
-  efficiency indicator)
+**Work metrics** — mechanical work done this timestep (pN·nm). These are two
+genuinely different quantities and conflating them is the mistake the old
+`work_thick` invited:
+
+- `'xb_work_on_filaments'` — work done **on the lattice by the crossbridges**.
+  This is what the motors delivered, and it is the right numerator for an
+  efficiency, because ATP is spent by crossbridges. Under a strictly isometric
+  hold it is small and sign-mixed rather than zero: heads are still cycling.
+  It is path-dependent and per-head, so it **cannot** be reconstructed from the
+  returned traces — that is why it is computed inside the simulation loop.
+  Axial component only: in dynamic-LS mode the spacing also changes and the
+  radial force does work this does not capture.
+- `'sarcomere_work'` — work done **externally by the half-sarcomere** at the
+  driven z-line: positive when shortening against tension, negative when
+  lengthened, exactly zero under an isometric hold. Unlike the key above, this
+  one *is* exactly reconstructible after the fact, and shipping it is a
+  convenience rather than new information. The reconstruction, with `F` the
+  `axial_force` trace and `z` the `z_line` trace, is the trapezoid
+
+  ```python
+  dz = np.diff(z, axis=-1)                       # step i-1 -> i
+  sarcomere_work = -0.5 * (F[..., :-1] + F[..., 1:]) * dz
+  ```
+
+  which reproduces `result.metrics['sarcomere_work'][..., 1:]`. Measured
+  bit-exact on CPU float32 over isometric, shortening and lengthening ramps
+  (max abs difference = 0); treat it as exact to floating-point round-off rather than
+  guaranteed bitwise, since the shipped value is computed inside the loop. It works
+  because the z-line shift is applied to the thin filament only, while
+  `axial_force` is read from the thick filament's first backbone spring — so
+  `F[i-1]` really *is* the force at the start of step `i`, with no need to carry
+  a force through the scan. Step 0 has `dz = 0` and no predecessor, so its
+  `sarcomere_work` is exactly zero.
+- `'xb_work_per_atp'` — `xb_work_on_filaments / atp_expected_p`, guarded to 0
+  when almost no ATP was spent. For whole-sarcomere efficiency divide the two
+  exported keys yourself: `sarcomere_work / atp_expected_p`.
 
 **Solver diagnostics:**
 - `'newton_iters'` — number of Newton iterations used by the equilibrium solver
@@ -423,10 +463,10 @@ force = result.axial_force                    # shape: (..., time)
 # Cumulative ATP over entire simulation
 total_atp = atp.sum(axis=-1)                 # shape: (...,) collapses time
 
-# Cumulative work (rough integral: force × z_line_velocity × dt)
-# Or use the pre-computed work_thick
-total_work = result.metrics['work_thick'].sum(axis=-1)
-efficiency = total_work / (total_atp + 1e-9) # avoid divide-by-zero
+# Cumulative work. Two different quantities — see section 6.
+xb_work = result.metrics['xb_work_on_filaments'].sum(axis=-1)   # by the motors
+ext_work = result.metrics['sarcomere_work'].sum(axis=-1)        # by the sarcomere
+efficiency = xb_work / (total_atp + 1e-9)    # avoid divide-by-zero
 ```
 
 **Adding custom metrics to the result dictionary** — since `result.metrics`
@@ -434,7 +474,7 @@ is a dict subclass, you can add new keys:
 
 ```python
 result.metrics['efficiency'] = (
-    result.metrics['work_thick'] / (result.metrics['atp_expected_p'] + 1e-9)
+    result.metrics['sarcomere_work'] / (result.metrics['atp_expected_p'] + 1e-9)
 )
 ```
 
@@ -656,7 +696,7 @@ calls the same compiled kernel, so there is no recompilation. The default
 `"auto"` setting chunks batches of 16384+ into groups of 4096, which
 benchmarks show is ~2% faster due to better L2 cache utilization. The primary
 reason to use minibatching is to bound peak GPU VRAM on memory-constrained GPUs
-(e.g. 8 GB): peak VRAM ≈ minibatch_size × n_steps × 52 metrics × 4 bytes × 2.
+(e.g. 8 GB): peak VRAM ≈ minibatch_size × n_steps × 56 metrics × 4 bytes × 2.
 
 ---
 
@@ -723,8 +763,9 @@ If they produce the same shapes with different values, they share a kernel.
 
 Each millisecond of simulated time, `timestep()` (`multifil_jax/timestep.py`)
 is called once. It takes the current mechanical state, the physical parameters,
-the time-varying driver values, and a random number key, and returns a 5-tuple:
-`(new_state, new_rng_key, solver_residual, new_lattice_spacing, newton_iterations)`.
+the time-varying driver values, and a random number key, and returns a 6-tuple:
+`(new_state, new_rng_key, solver_residual, new_lattice_spacing, newton_iterations,
+kinetics_trace)`.
 Here is what happens, in order:
 
 **Step 0: Resolve drivers.** The simulation has two ways to specify values like
@@ -761,9 +802,21 @@ stochastic transitions for each site. The matrix exponential is computed with a
 Padé approximation plus scaling-and-squaring via `expm_pade6_batch()`.
 
 Because a site's coupling depends only on the states of its two neighbors (each
-count capped at 2), there are just 27 distinct rate matrices in the whole
-system — so one batched matrix exponential and a gather serve every site.
-Section 13 covers the cooperativity model itself.
+count capped at 2), and on whether a crossbridge is bound to it, there are just
+54 distinct rate matrices in the whole system — so one batched matrix exponential
+and a gather serve every site. The bound half carries the crossbridge lock: a
+head holding a site open divides that site's two exits from the open state by
+`(1 + xb_tm_K2)`, which is how McKillop & Geeves' measured `K_T(1 + K2)` enters
+the model. Section 13 covers the cooperativity model itself.
+
+A head can still be torn off when tropomyosin closes over it despite that bias,
+and `thin_transitions` returns the mask of heads that happened to — it is the only
+place that knows, since a torn head lands where an ordinary one does. Where it
+lands depends on what it had already spent: a weakly bound (Loose) head returns
+to DRX still primed and owes nothing, while a Tight_1 or Tight_2 head has already
+released phosphate and swung its lever, so it goes to Free_2 and is charged one
+ATP. Sending the latter back to DRX (= M.ADP.Pi) would hand back that phosphate
+for free — 8.0 % of everything the model spent, before this was booked.
 
 **Step 3: Thick filament (crossbridge) transitions.** `thick_transitions()` (`multifil_jax/kernels/transitions.py`)
 applies a six-state Markov model to every individual crossbridge — states 0–5 as
@@ -794,7 +847,10 @@ accelerates the inner conjugate-gradient solve, which runs
 computationally intensive.
 
 Steps 0–3 are encapsulated in `kinetics_step()`, which returns the post-kinetics
-state and `resolved_constants`. This separation exists to support future
+state and a `KineticsTrace` — the mid state, the driver-resolved constants, the
+resolved subpopulation tuple and the closure-tear mask, i.e. everything the
+metrics layer needs to describe the step that actually happened rather than
+re-derive it. This separation exists to support future
 finite-element coupling: run kinetics across all coupled sarcomeres independently,
 then perform a coupled mechanical equilibration.
 
@@ -807,7 +863,7 @@ After all steps complete, the new state, solver residual, emergent lattice
 spacing, and iteration count are returned. The scan loop in `run_single_sim`
 carries the state forward to the next timestep. Immediately after `timestep()`
 returns, `compute_all_metrics()` is called inside the scan body, comparing the
-state before and after the step to produce all 52 scalar metrics. These are
+state before and after the step to produce all 56 scalar metrics. These are
 accumulated as arrays across time and returned as `result.metrics`.
 
 ---
@@ -1052,16 +1108,16 @@ and "active" only during specific steps.
 | `multifil_jax/simulation.py` | `run()` — the main entry point for all simulations |
 | `multifil_jax/simulation.py` | `SimulationResult` — the result container |
 | `multifil_jax/simulation.py` | `BATCH_BUCKETS`, `get_bucket_size()`, `_run_sim_kernel()` |
-| `multifil_jax/timestep.py` | `kinetics_step()` — stochastic phase (driver resolution through transitions) |
+| `multifil_jax/timestep.py` | `kinetics_step()` — stochastic phase (driver resolution through transitions), returns a `KineticsTrace` |
 | `multifil_jax/timestep.py` | `timestep()` — full step orchestrator (kinetics + solve) |
-| `multifil_jax/metrics_fn.py` | `compute_all_metrics()` — 52-metric MetricsDict |
+| `multifil_jax/metrics_fn.py` | `compute_all_metrics()` — 56-metric MetricsDict |
 | `multifil_jax/core/state.py` | `State`, `realize_state()`, `Drivers`, `resolve_value()`, `MetricsDict` |
 | `multifil_jax/core/params.py` | `StaticParams`, `DynamicParams`, and the four species presets |
 | `multifil_jax/core/sarc_geometry.py` | `SarcTopology.create()` — topology builder; `valid_xb_targets()` |
 | `multifil_jax/core/subpopulation.py` | `Subpopulation` — mixed motor populations |
 | `multifil_jax/kernels/geometry.py` | `update_nearest_neighbors()` — XB-to-BS distances |
 | `multifil_jax/kernels/transitions.py` | `thin_transitions()`, `thick_transitions()`, `count_neighbor_states_split()`, `xb_step_probabilities()`, `xb_exit_probabilities()` |
-| `multifil_jax/kernels/forces.py` | `axial_force_at_mline()`, `compute_forces_vectorized()`, `_xb_radial_force_total()`, `_titin_radial_force_total()` |
+| `multifil_jax/kernels/forces.py` | The two-spring primitives (`xb_geometry()`, `xb_springs_for_state()`, `xb_elastic_energy()`, `xb_polar_forces()`, `polar_to_filament()`) — shared with the rate path — plus `axial_force_at_mline()`, `compute_forces_vectorized()`, `_xb_radial_force_total()`, `_titin_radial_force_total()` |
 | `multifil_jax/kernels/solver.py` | `solve_equilibrium()` (unified fixed/dynamic LS), Thomas algorithm |
 | `multifil_jax/kernels/rate_functions.py` | Crossbridge rate functions (geometry-dependent) |
 | `multifil_jax/helper.py` | `count_transitions()`, force/equilibrium validation helpers |
