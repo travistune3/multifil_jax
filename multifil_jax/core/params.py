@@ -1592,10 +1592,12 @@ def get_lethocerus_params() -> Tuple[StaticParams, DynamicParams]:
     StaticParams overrides:
         actin_geometry       = 'invertebrate'  — 1:3 thick:thin, 2 faces/thin.
             [M] Reedy 1968 J Mol Biol 31:155 (Lethocerus unit cell).
-        thick_crown_spacing  = 14.5 nm         — [M] IFM 14.5 nm meridional repeat;
-            Reedy 1968; 145 Å crown spacing confirmed by Hu et al. 2016 Sci Adv.
+        thick_crown_spacing  = 14.5 nm         — [M] IFM crown spacing. Hu et al.
+            2016 Sci Adv 2:e1600058: "The axial spacing is ~145 A in all species".
+            NOT Reedy 1968 — "145" appears zero times in that paper.
         actin_half_pitch     = 38.7 nm         — [M] IFM long-pitch half-repeat;
-            Reedy 1968; Squire et al. 2006 J Mol Biol 361:823.
+            Squire et al. 2006 J Mol Biol 361:823. NOT Reedy 1968 — his repeat is
+            380 A = 38.0 nm throughout.
         mono_per_poly        = 28              — [M] IFM 28/13 actin helix (subunit
         polymer_base_turns   = 13                   axial repeat 2.76nm); Squire 2006
             p.823 (77.4/28 = 2.764nm confirms the pairing).
