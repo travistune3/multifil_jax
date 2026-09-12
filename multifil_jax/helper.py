@@ -209,20 +209,20 @@ def validate_forces_numerical(state: 'State', constants: 'DynamicParams',
     import jax
     from multifil_jax.kernels.forces import compute_forces_vectorized
 
-    n_thick, n_crowns = state.thick.axial.shape
-    n_thin, n_sites = state.thin.axial.shape
+    n_thick, n_crowns = state.thick.displacement.shape
+    n_thin, n_sites = state.thin.displacement.shape
     n_thick_nodes = n_thick * n_crowns
 
-    pos_thick = state.thick.axial
-    pos_thin = state.thin.axial
-    rests_thick = topology.crown_rests
-    rests_thin = topology.binding_rests
+    u_thick = state.thick.displacement
+    u_thin = state.thin.displacement
+    offsets_thick = topology.crown_offsets
+    offsets_thin = topology.binding_offsets
     xb_states = state.thick.xb_states
     xb_bound_to = state.thick.xb_bound_to
 
     # Compute analytical forces
     forces_analytical = compute_forces_vectorized(
-        pos_thick, pos_thin,
+        u_thick, u_thin,
         constants.thick_k, constants.thin_k,
         constants.z_line, constants.lattice_spacing,
         constants.titin_a, constants.titin_b, constants.titin_rest,
@@ -275,33 +275,43 @@ def validate_forces_numerical(state: 'State', constants: 'DynamicParams',
     n_titin_per_thick = 6
     titin_a_over_b = constants.titin_a / constants.titin_b
 
-    def compute_total_energy(pos_flat):
+    def compute_total_energy(u_flat):
         """Total potential energy: backbone springs, crossbridges, and titin.
 
         Written independently of kernels/forces.py — same physics, different
         code — so that agreement between this gradient and the force kernel is
         evidence rather than tautology.
-        """
-        pt = pos_flat[:n_thick_nodes].reshape(n_thick, n_crowns)
-        pn = pos_flat[n_thick_nodes:].reshape(n_thin, n_sites)
 
-        # Thick filament spring energy. The M-line is a fixed anchor at 0.
+        IT MUST TRACK THE COORDINATE CHANGE, and does. The argument is the
+        DISPLACEMENT vector, as the solver's is. Written in absolute positions
+        instead, the gradient would be mathematically identical (the rest frame
+        is a constant offset, so dU/du == dU/dx) but would reintroduce exactly
+        the float32 cancellation the kernel no longer has — and the validator
+        would report the difference as a force-law failure.
+        """
+        ut = u_flat[:n_thick_nodes].reshape(n_thick, n_crowns)
+        un = u_flat[n_thick_nodes:].reshape(n_thin, n_sites)
+
+        # Absolute positions, for the two terms that genuinely need them.
+        pt = offsets_thick + ut
+        pn = z_line - offsets_thin + un
+
+        # Thick filament spring energy. The M-line is a fixed anchor at u = 0,
+        # and the rest lengths cancel out of the extension entirely.
         thick_energy = 0.0
         for i in range(n_thick):
-            dx = pt[i, 0] - rests_thick[i, 0]
-            thick_energy += 0.5 * thick_k * dx ** 2
+            thick_energy += 0.5 * thick_k * ut[i, 0] ** 2
             for j in range(1, n_crowns):
-                dx = pt[i, j] - pt[i, j-1] - rests_thick[i, j]
+                dx = ut[i, j] - ut[i, j-1]
                 thick_energy += 0.5 * thick_k * dx ** 2
 
-        # Thin filament spring energy. The Z-line is the fixed anchor here.
+        # Thin filament spring energy. The Z-disc is the fixed anchor at u = 0.
         thin_energy = 0.0
         for i in range(n_thin):
             for j in range(n_sites - 1):
-                dx = pn[i, j+1] - pn[i, j] - rests_thin[i, j]
+                dx = un[i, j+1] - un[i, j]
                 thin_energy += 0.5 * thin_k * dx ** 2
-            dx = z_line - pn[i, -1] - rests_thin[i, -1]
-            thin_energy += 0.5 * thin_k * dx ** 2
+            thin_energy += 0.5 * thin_k * un[i, -1] ** 2
 
         # Crossbridge two-spring energy, for attached heads only:
         #     U = 0.5*g_k*(r - g_rest)^2 + 0.5*c_k*(theta - c_rest)^2
@@ -331,8 +341,8 @@ def validate_forces_numerical(state: 'State', constants: 'DynamicParams',
 
         return thick_energy + thin_energy + xb_energy + titin_energy
 
-    pos_flat = jnp.concatenate([pos_thick.flatten(), pos_thin.flatten()])
-    forces_numerical = -jax.grad(compute_total_energy)(pos_flat)
+    u_flat = jnp.concatenate([u_thick.flatten(), u_thin.flatten()])
+    forces_numerical = -jax.grad(compute_total_energy)(u_flat)
 
     diff = jnp.abs(forces_analytical - forces_numerical)
 
@@ -377,11 +387,13 @@ def validate_equilibrium(state: 'State', constants: 'DynamicParams',
     simulation, so it verifies that the solve CONVERGED, not that the forces are
     correct. A model with a sign error would pass this check happily.
 
-    Note the achievable residual has a floor: node positions are ~1000 nm, where
-    float32 resolves to ~1e-4 nm, so the residual cannot go below roughly
-    thick_k * 1e-4 pN regardless of how hard the solver works. At default
-    stiffness that is ~0.75 pN, so a tolerance below about 1 pN is not
-    meaningful. See MIN_FLOAT32_TOLERANCE in kernels/solver.py.
+    There is no longer a stiffness-scaled floor under the achievable residual.
+    Positions are stored as displacements from rest (core/state.py), so the
+    backbone error is relative rather than k * ulp(1000 nm), and a rest state
+    with nothing attached returns exactly zero. What the solver actually aims
+    at is `solver_atol + solver_rtol * RMS backbone spring force`; the run
+    reports it as the `solver_tolerance` metric, alongside the dimensionless
+    `solver_residual_norm` (<= 1 means converged).
 
     Args:
         state: State to check, normally one returned by solve_equilibrium

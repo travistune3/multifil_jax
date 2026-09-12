@@ -215,7 +215,7 @@ from dataclasses import dataclass, asdict
 from typing import Dict, Any, List, Tuple
 
 # Static fields that affect array shapes (changing these triggers recompilation)
-STATIC_FIELDS = frozenset({'n_crowns', 'n_polymers_per_thin', 'solver_max_iter', 'actin_geometry', 'n_newton_steps', 'n_cg_steps', 'solver_residual_tol', 'n_xb_bins', 'xb_bin_lo', 'xb_bin_hi', 'thick_bare_zone', 'thick_crown_spacing', 'actin_half_pitch', 'mono_per_poly', 'polymer_base_turns', 'target_zone_wiggle', 'n_xb_per_crown'})
+STATIC_FIELDS = frozenset({'n_crowns', 'n_polymers_per_thin', 'solver_max_iter', 'actin_geometry', 'n_newton_steps', 'n_cg_steps', 'n_xb_bins', 'xb_bin_lo', 'xb_bin_hi', 'thick_bare_zone', 'thick_crown_spacing', 'actin_half_pitch', 'mono_per_poly', 'polymer_base_turns', 'target_zone_wiggle', 'n_xb_per_crown'})
 
 # Single source of truth: every DynamicParams field with its skeletal default.
 # Citations and confidence tiers ([M]/[I]/[G]/[F], see module docstring) live
@@ -1034,11 +1034,13 @@ _DYNAMIC_DEFAULTS = {
                              #     above are NOT temperature-corrected, so changing
                              #     it does not give a physically complete temperature
                              #     change (no Q10 on the pre-exponentials)
-    'solver_tol':   0.3,     # [G] pN — mechanical equilibrium convergence target.
-                             #     Numerical, not physical. Floored internally at
-                             #     thick_k × 1e-4 (the float32 precision limit at
-                             #     sarcomere-scale positions), so at stiff parameters
-                             #     the floor, not this value, is what applies
+    'solver_atol':  0.01,    # [G] pN — absolute term of the equilibrium convergence
+                             #     target: tol = solver_atol + solver_rtol * scale.
+                             #     Numerical, not physical. It is what binds at pCa 9,
+                             #     where the only axial forces are titin's and the
+                             #     backbone scale goes to nothing. Renamed in place
+                             #     from `solver_tol` (whose absolute pN target was
+                             #     inert — a float32 floor always exceeded it)
 
     # ==========================================================================
     # DEFAULT DRIVER VALUES
@@ -1054,6 +1056,16 @@ _DYNAMIC_DEFAULTS = {
                                # appropriate for cardiac. Set it explicitly
     'lattice_spacing': 14.0,   # [M] nm, thick-to-thin surface separation at
                                # typical vertebrate sarcomere lengths
+
+    # APPENDED, and appended deliberately: DYNAMIC_FIELDS, __slots__, __init__
+    # and the pytree flatten order all derive from this dict in order, so an
+    # entry may be renamed in place but never moved. New ones go at the end.
+    'solver_rtol':  1e-3,      # [G] relative term of the convergence target,
+                               # against the RMS backbone spring force (measured
+                               # 130-210 pN at default stiffness and pCa 4.5, so
+                               # 0.14-0.22 pN). Scale-free, so it means the same
+                               # thing across a 1000x stiffness sweep — which an
+                               # absolute pN target does not
 }
 
 # Field order for tree_flatten/unflatten (Python 3.7+ preserves dict order)
@@ -1136,10 +1148,6 @@ class StaticParams:
         n_cg_steps: Conjugate-gradient iterations per Newton step. 0 degenerates
             to Richardson iteration, which converges only when no crossbridges
             are attached — do not use it as a default.
-        solver_residual_tol: Post-run warning threshold (pN). Diagnostic only;
-            it does not affect the solve. Calibrated just above the float32
-            precision floor, which scales as ~thick_k × 2e-4, so raising
-            filament stiffnesses may require raising this too.
         solver_max_iter: Legacy iteration bound retained for compatibility with
             configurations that set it; the Newton/CG caps above are what the
             current solver actually reads.
@@ -1158,10 +1166,6 @@ class StaticParams:
     actin_geometry: str = "vertebrate"
     n_newton_steps: int = 4    # Hard cap on Newton while_loop iterations (exits early at convergence)
     n_cg_steps: int = 6        # CG steps per Newton iter; 0=Richardson (no JVP)
-    solver_residual_tol: float = 1.5  # pN — post-run residual warning threshold
-    # Calibrated to the float32 precision floor at the lit-consistent thick_k=7500.
-    # Empirical floor scales as ~thick_k × 2e-4 pN; raising thick_k or thin_k from defaults
-    # may push the floor above this tol and trigger warnings — adjust accordingly.
     n_xb_bins: int = 200       # bins per AP level; total expm = 2 × n_xb_bins per step
     xb_bin_lo: float = -8.0    # nm — lower edge of axial distance range (baked into SarcTopology)
     xb_bin_hi: float = 35.0    # nm — upper edge; measured range at z=1100 is [-5, 31]nm

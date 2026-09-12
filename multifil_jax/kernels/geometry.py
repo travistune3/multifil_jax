@@ -49,6 +49,8 @@ import jax
 import jax.numpy as jnp
 from typing import Dict, Tuple, TYPE_CHECKING
 
+from multifil_jax.core.state import thick_axial, thin_axial
+
 if TYPE_CHECKING:
     from multifil_jax.core.sarc_geometry import SarcTopology
 
@@ -199,21 +201,24 @@ def update_nearest_neighbors(
     detached one they describe the opportunity it is being offered.
 
     Args:
-        state: Current State (reads thick.axial and thin.axial)
+        state: Current State. Reads the stored displacements and reconstructs
+            TRUE axial positions — the binding search compares against the
+            M-line at 0 and against absolute site coordinates, so it cannot be
+            done in the displacement frame.
         constants: DynamicParams, for the current lattice_spacing
         topology: SarcTopology with the precomputed candidate lists
 
     Returns:
         new_state: State with xb_nearest_bs and xb_distances updated
     """
-    thick_axial = state.thick.axial
-    thin_axial = state.thin.axial
+    thick_pos = thick_axial(state, topology)
+    thin_pos = thin_axial(state, topology, constants.z_line)
 
-    n_thick, n_crowns = thick_axial.shape
+    n_thick, n_crowns = thick_pos.shape
     n_xb_per_crown = topology.n_xb_per_crown
 
     # Flatten thick base positions (each crown has n_xb_per_crown XBs)
-    xb_base_positions = jnp.repeat(thick_axial, n_xb_per_crown, axis=1).reshape(-1)
+    xb_base_positions = jnp.repeat(thick_pos, n_xb_per_crown, axis=1).reshape(-1)
 
     # The myosin head reaches ~13 nm axially from its crown, so the SEARCH is
     # done from the reaching head position. The distance recorded below is
@@ -231,7 +236,7 @@ def update_nearest_neighbors(
     # Find nearest binding sites using fixed-width gather
     nearest_thin, nearest_site = find_nearest_binding_sites_fixed_width(
         xb_head_positions,
-        thin_axial,
+        thin_pos,
         topology.xb_to_thin_id,
         topology.xb_to_site_indices,
         n_sites_per_face_flat,
@@ -240,7 +245,7 @@ def update_nearest_neighbors(
     # Calculate distances using BASE position (WITHOUT +13 offset)
     distances = calculate_xb_to_bs_distances(
         xb_base_positions,
-        thin_axial,
+        thin_pos,
         nearest_thin,
         nearest_site,
         constants.lattice_spacing

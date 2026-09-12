@@ -594,11 +594,11 @@ def _run_sim_kernel(
     rng_keys: jnp.ndarray,
     dt: float,
     unroll: int,
+    n_cg_steps: int,
+    n_newton_steps: int,
     is_dynamic_ls: bool = False,
     K_lat_batched: jnp.ndarray = None,
     nu_batched: jnp.ndarray = None,
-    n_cg_steps: int = 6,
-    n_newton_steps: int = 16,
     subpop_arrays=None,
     is_subpop_active: bool = False,
     is_mean_field: bool = False,
@@ -631,10 +631,17 @@ def _run_sim_kernel(
     """
 
     def create_and_equilibrate(constants, z0, pCa0, ls0):
-        """Create state from topology + constants and solve equilibrium."""
+        """Create state from topology + constants and solve equilibrium.
+
+        The drivers are baked in first. The thin frame is anchored on the
+        Z-disc, so every reconstruction of an absolute position needs the
+        Z-line this state is actually being built at — which is z0, not
+        whatever default sits in `constants`.
+        """
+        constants = constants.with_drivers(pCa0, z0, ls0)
         state = realize_state(topology, constants, z0, pCa0, ls0)
         state = update_nearest_neighbors(state, constants, topology)
-        state, _residual, _, _ = solve_equilibrium(
+        state, _residual, _, _, _, _ = solve_equilibrium(
             state, constants, topology,
             n_cg_steps=n_cg_steps,
             n_newton_steps=n_newton_steps,
@@ -644,8 +651,8 @@ def _run_sim_kernel(
     def run_single_sim(state, constants, key, z_trace, pCa_trace, ls_trace,
                        K_lat_val, nu_val, subpop=None):
         """Run simulation with scan inside vmap."""
-        n_thick, n_crowns = state.thick.axial.shape
-        n_thin, n_sites = state.thin.axial.shape
+        n_thick, n_crowns = state.thick.displacement.shape
+        n_thin, n_sites = state.thin.displacement.shape
         precond_params = build_preconditioner_params(
             n_thick, n_crowns, n_thin, n_sites,
             constants.thick_k, constants.thin_k,
@@ -680,11 +687,10 @@ def _run_sim_kernel(
             old_state, k, current_ls = carry
             z_val, pCa_val, ls_val, dz = inputs
 
-            old_state = old_state._replace(
-                thin=old_state.thin._replace(
-                    axial=old_state.thin.axial + dz
-                )
-            )
+            # NO THIN POSITION SHIFT. Thin displacements are measured from a
+            # Z-disc-anchored rest frame, so the filament moves rigidly with
+            # the Z-line by construction and there is nothing to update. `dz`
+            # is still needed, but only by sarcomere_work.
 
             if is_dynamic_ls:
                 drivers = Drivers(pCa=pCa_val, z_line=z_val, lattice_spacing=current_ls)
@@ -693,7 +699,8 @@ def _run_sim_kernel(
                 drivers = Drivers(pCa=pCa_val, z_line=z_val, lattice_spacing=ls_val)
                 d_ref = None
 
-            new_state, new_k, solver_residual, new_ls, n_iters, trace = timestep(
+            (new_state, new_k, solver_residual, new_ls, n_iters, trace,
+             residual_norm, solver_tolerance) = timestep(
                 old_state, constants, drivers, topology, k, dt=dt,
                 K_lat=K_lat_val if is_dynamic_ls else None,
                 d_ref=d_ref,
@@ -718,6 +725,7 @@ def _run_sim_kernel(
             all_metrics = compute_all_metrics(
                 old_state, new_state, constants_for_metrics, drivers_for_metrics,
                 topology, force, solver_residual, n_iters, dt, trace, dz,
+                residual_norm, solver_tolerance,
             )
 
             return (new_state, new_k, new_ls), all_metrics
@@ -1118,19 +1126,26 @@ def run(
     reshaped_pCa = pCa_batched.reshape(final_shape)
     reshaped_ls = ls_batched.reshape(final_shape)
 
-    # Post-run solver residual validation
+    # Post-run solver convergence check. The test is the NORMALIZED residual,
+    # which is <= 1 exactly when the solve converged — in both LS modes, and at
+    # any stiffness. The old absolute-pN threshold was a third copy of the
+    # float32 coordinate floor and moved with thick_k rather than with the
+    # physics; see kernels/solver._convergence_tolerance.
     max_residual = float(jnp.max(reshaped_metrics['solver_residual']))
-    tol = static_params.solver_residual_tol
-    if max_residual > tol:
+    max_norm = float(jnp.max(reshaped_metrics['solver_residual_norm']))
+    if max_norm > 1.0:
         import warnings
         warnings.warn(
-            f"Solver max residual {max_residual:.2f} pN exceeds "
-            f"threshold {tol} pN (set via StaticParams.solver_residual_tol)"
+            f"Solver did not converge everywhere: max normalized residual "
+            f"{max_norm:.3g} > 1 (max raw residual {max_residual:.4g} pN). "
+            f"Tune DynamicParams.solver_rtol/solver_atol, or raise "
+            f"StaticParams.n_newton_steps."
         )
 
     if verbose:
         print(f"Result shape: {reshaped_metrics['axial_force'].shape}")
-        print(f"Max solver residual: {max_residual:.4f} pN")
+        print(f"Max solver residual: {max_residual:.4f} pN "
+              f"(normalized {max_norm:.4f})")
 
     topology_config = {
         'n_thick': topology.n_thick,

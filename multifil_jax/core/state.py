@@ -24,10 +24,32 @@ NamedTuple is a JAX pytree out of the box, is immutable, and has no __dict__ for
 JAX to trip over. Updates use ._replace(), which builds a new object sharing the
 unchanged arrays:
 
-    new_state = state._replace(thick=state.thick._replace(axial=new_positions))
+    new_state = state._replace(thick=state.thick._replace(displacement=new_u))
 
 Nesting means a change to thick filament positions leaves the thin filament
 arrays untouched by reference, with no copying.
+
+POSITIONS ARE STORED AS DISPLACEMENTS FROM REST
+-----------------------------------------------
+`thick.displacement` and `thin.displacement` are offsets from the rest frame,
+not absolute axial coordinates. Absolute positions are reconstructed on demand
+by thick_axial() / thin_axial() below.
+
+The reason is float32. Absolute node positions run to ~1000 nm, where
+consecutive float32 values are ~1e-4 nm apart, while the strain a backbone
+spring actually carries is F/k — about 0.03 nm at default stiffness, and
+SMALLER the stiffer the filament. Storing absolute positions means every
+backbone force is extracted by cancelling two ~1000 nm floats, so the force
+error is k * ulp(1000 nm): it grows linearly with stiffness while the signal
+does not. Measured, that was 0.69 pN of spurious net force per node at rest
+with nothing attached, and a 14.9% force error at 16x the default stiffness
+against a float64 reference.
+
+In displacement coordinates the rest lengths cancel algebraically — both
+`crown_offsets` and `binding_offsets` ARE the cumulated rest frames — so the
+backbone laws collapse to diff(u) * k with no subtraction of large numbers at
+all. The error becomes relative (~float32 eps) and stiffness-independent. At
+rest with no load the residual is now exactly zero.
 
 STATE INDEX CONVENTIONS
 -----------------------
@@ -74,7 +96,8 @@ class ThickState(NamedTuple):
     is baked into topology.crown_offsets, not stored as a separate value.
     Structural arrays (crown_starts, connectivity, crown_rests) moved to Topology (Tier 1).
     """
-    axial: jnp.ndarray           # (n_thick, n_crowns) crown axial positions
+    displacement: jnp.ndarray    # (n_thick, n_crowns) crown offset from rest;
+                                 # absolute = topology.crown_offsets + this
     xb_states: jnp.ndarray       # (n_thick, n_crowns, n_xb_per_crown) crossbridge states (0-5), int8
     xb_bound_to: jnp.ndarray     # (n_thick, n_crowns, n_xb_per_crown) bound site indices (-1 if unbound)
     xb_nearest_bs: jnp.ndarray   # (n_thick, n_crowns, n_xb_per_crown) nearest binding site indices
@@ -89,7 +112,8 @@ class ThinState(NamedTuple):
     Structural arrays (tm_chains, connectivity, face_to_sites, binding_rests) in Topology.
     permissiveness is derived on-demand: (tm_states == 3).astype(float32)
     """
-    axial: jnp.ndarray           # (n_thin, n_sites) binding site axial positions
+    displacement: jnp.ndarray    # (n_thin, n_sites) site offset from rest;
+                                 # absolute = z_line - topology.binding_offsets + this
     tm_states: jnp.ndarray       # (n_thin, n_sites) tropomyosin states (0-3), int8
     bound_to: jnp.ndarray        # (n_thin, n_sites) XB bound to this site (-1 if unbound)
 
@@ -98,7 +122,7 @@ class State(NamedTuple):
     """Pure simulation state — no embedded params, geometry, or constants.
 
     Use state._replace(field=new_value) for immutable updates.
-    For nested updates: state._replace(thick=state.thick._replace(axial=new_axial))
+    For nested updates: state._replace(thick=state.thick._replace(displacement=new_u))
 
     Removed fields (moved to other tiers):
         - params → Constants (Tier 2), passed as separate arg
@@ -111,6 +135,39 @@ class State(NamedTuple):
     """
     thick: ThickState
     thin: ThinState
+
+
+def thick_axial(state: 'State', topology: 'SarcTopology') -> jnp.ndarray:
+    """Absolute crown positions (nm) from the stored displacements.
+
+    `topology.crown_offsets` is the cumulative sum of `crown_rests`, so this is
+    the rest frame plus the strain the state is actually carrying. Call it
+    wherever a TRUE axial coordinate is needed — crossbridge reach, titin's
+    diagonal to the Z-disc, the M-line visibility gate, the overlap window.
+    Backbone forces must NOT go through here: they read the displacements
+    directly, which is the entire point of the coordinate change.
+
+    Returns:
+        (n_thick, n_crowns) absolute axial positions, nm from the M-line.
+    """
+    return topology.crown_offsets + state.thick.displacement
+
+
+def thin_axial(state: 'State', topology: 'SarcTopology', z_line) -> jnp.ndarray:
+    """Absolute binding-site positions (nm) from the stored displacements.
+
+    The thin frame is anchored on the Z-disc, so the filament follows z_line
+    rigidly with no state update at all — moving the Z-line does not change any
+    displacement. That is why the simulation loop has no per-step thin position
+    shift; see simulation.py.
+
+    Args:
+        z_line: current Z-line position (nm). Resolve drivers before calling.
+
+    Returns:
+        (n_thin, n_sites) absolute axial positions, nm from the M-line.
+    """
+    return z_line - topology.binding_offsets + state.thin.displacement
 
 
 class Drivers(NamedTuple):
@@ -266,7 +323,9 @@ def realize_state(
     # THICK FILAMENT STATE (no k or bare_zone — those are in Constants)
     # Structural arrays (crown_starts, connectivity) are in Topology.
     # =========================================================================
-    thick_axial = topology.crown_offsets.copy()
+    # Rest frame, exactly: crown_offsets IS the cumsum of crown_rests, so the
+    # freshly created state carries zero strain and zero backbone force.
+    thick_displacement = jnp.zeros((n_thick, n_crowns), dtype=jnp.float32)
 
     xb_states = jnp.zeros((n_thick, n_crowns, n_xb_per_crown), dtype=jnp.int8)
     xb_bound_to = jnp.full((n_thick, n_crowns, n_xb_per_crown), -1, dtype=jnp.int32)
@@ -274,7 +333,7 @@ def realize_state(
     xb_distances = jnp.zeros((n_thick, n_crowns, n_xb_per_crown, 2), dtype=jnp.float32)
 
     thick_state = ThickState(
-        axial=thick_axial,
+        displacement=thick_displacement,
         xb_states=xb_states,
         xb_bound_to=xb_bound_to,
         xb_nearest_bs=xb_nearest_bs,
@@ -285,12 +344,14 @@ def realize_state(
     # THIN FILAMENT STATE (no k — that's in Constants)
     # Structural arrays (tm_chains, connectivity, face_to_sites) are in Topology.
     # =========================================================================
-    thin_axial = z_line - topology.binding_offsets
+    # Likewise: binding_rests is the diff of binding_offsets, so zero here is
+    # the exact force-free thin backbone, independent of where the Z-line is.
+    thin_displacement = jnp.zeros((n_thin, n_sites), dtype=jnp.float32)
     tm_states = jnp.zeros((n_thin, n_sites), dtype=jnp.int8)
     bound_to = jnp.full((n_thin, n_sites), -1, dtype=jnp.int32)
 
     thin_state = ThinState(
-        axial=thin_axial,
+        displacement=thin_displacement,
         tm_states=tm_states,
         bound_to=bound_to,
     )

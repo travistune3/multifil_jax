@@ -68,7 +68,13 @@ positions affect the radial balance — automatically and exactly.
 
 Usage:
     from multifil_jax.kernels.solver import solve_equilibrium
-    state, residual, new_ls, n_iters = solve_equilibrium(state, constants, topology)
+    state, residual, new_ls, n_iters, residual_norm, tol = solve_equilibrium(
+        state, constants, topology,
+        n_newton_steps=static_params.n_newton_steps,
+        n_cg_steps=static_params.n_cg_steps)
+
+The two solver caps have no defaults here on purpose: StaticParams is the single
+source of truth for both, and `run()` threads them through from there.
 """
 
 import jax
@@ -88,20 +94,17 @@ if TYPE_CHECKING:
     from multifil_jax.core.state import State
     from multifil_jax.core.params import DynamicParams
 
-# Absolute floor on the convergence tolerance, in pN.
+# Convergence is judged on a SCALE-FREE, PER-BLOCK criterion; there is no
+# absolute floor constant here any more.
 #
-# There is a limit to how small a residual float32 can even represent here. Node
-# positions are ~1000 nm, where consecutive float32 values differ by ~1e-4 nm, so
-# a position cannot be resolved more finely than that. Multiplying by the
-# backbone stiffness turns that position quantum into a force quantum:
-# thick_k * 1e-4 pN. Asking the solver for a residual below it makes the
-# while_loop iterate until its cap, burning time to chase a target that
-# arithmetic cannot express.
-#
-# At the default thick_k = 7500 pN/nm that floor is ~0.75 pN, so this constant
-# is not what binds at default parameters — solve_equilibrium() takes the
-# maximum of this and the stiffness-scaled floor. It matters at soft parameters.
-MIN_FLOAT32_TOLERANCE = 0.25
+# There used to be one, plus a `thick_k * 1e-4` floor, because node positions
+# were absolute (~1000 nm) and float32 could not express a residual below
+# k * ulp(1000 nm). That floor scaled WITH the problem: at 100x stiffness it
+# became 75 pN and Newton exited on its first iteration reporting a clean
+# residual, while at (soft thick, stiff thin) it ignored thin_k entirely and
+# sat below an unreachable target so the loop always ran to its cap. Storing
+# displacements (core/state.py) removed the floor itself; what replaces the
+# constant is `_convergence_tolerance` below.
 
 
 # ============================================================================
@@ -366,7 +369,7 @@ def _preconditioned_cg(neg_jac_mv, precond_mv, b, x0, n_cg_steps):
     return x
 
 
-def _run_newton(residual_fn, precond_mv, pos0, tol, n_newton_steps, n_cg_steps, post_step=None):
+def _run_newton(residual_fn, precond_mv, pos0, tol_vec, n_newton_steps, n_cg_steps, post_step=None):
     """The Newton iteration itself, shared by the fixed- and dynamic-spacing solvers.
 
     Each step solves J dx = F for the update and applies it. The Jacobian-vector
@@ -374,9 +377,16 @@ def _run_newton(residual_fn, precond_mv, pos0, tol, n_newton_steps, n_cg_steps, 
     is never assembled. Note the sign is folded into neg_jac_mv rather than
     negating dx afterwards, saving a pass over the vector each CG iteration.
 
-    Exits as soon as max|F| falls below tol, or after n_newton_steps. Both
-    conditions live in the while_loop predicate, so the body is traced once
-    regardless of how many iterations actually run.
+    Exits as soon as max(|F| / tol_vec) falls to 1 or below, or after
+    n_newton_steps. Both conditions live in the while_loop predicate, so the
+    body is traced once regardless of how many iterations actually run.
+
+    THE TOLERANCE IS A VECTOR, one entry per residual row. Fixed-LS passes a
+    uniform one. Dynamic-LS does not: its last row is a whole-lattice radial
+    aggregate over O(n_xb) terms, in different units of scale from a per-node
+    axial force, and sharing one `max` with the axial rows let it dominate the
+    exit test for reasons unrelated to axial convergence. Per-row tolerances
+    make convergence in that mode provable rather than assumed.
 
     Non-finite updates are zeroed rather than propagated. This is a safety net
     for extreme parameter combinations where the Jacobian is near-singular:
@@ -387,16 +397,22 @@ def _run_newton(residual_fn, precond_mv, pos0, tol, n_newton_steps, n_cg_steps, 
         residual_fn: pos -> force residual vector
         precond_mv: v -> M^{-1} @ v
         pos0: initial position vector
-        tol: convergence tolerance (scalar JAX array)
+        tol_vec: per-row convergence tolerance (JAX array, broadcastable to F)
         n_newton_steps: hard iteration cap
         n_cg_steps: CG iterations per Newton step
         post_step: optional callable applied to x_new after each step
                    (e.g. lattice spacing floor for dynamic LS)
 
     Returns:
-        (x, n_iters, final_residual)
+        (x, n_iters, max|F| in pN, max(|F|/tol_vec) dimensionless)
     """
     f0 = residual_fn(pos0)
+
+    # A tolerance entry of exactly 0 is a legitimate request — "never converge,
+    # run to the cap" — but 0/0 is NaN, and `NaN > 1.0` is False, so the naive
+    # ratio would exit after ONE iteration and report a residual that looks
+    # deceptively small. Floor the divisor at the smallest positive normal.
+    tol_vec = jnp.maximum(tol_vec, jnp.finfo(f0.dtype).tiny)
 
     def body(carry):
         x, f, i = carry
@@ -421,10 +437,10 @@ def _run_newton(residual_fn, precond_mv, pos0, tol, n_newton_steps, n_cg_steps, 
 
     def cond(carry):
         _, f, i = carry
-        return (jnp.max(jnp.abs(f)) > tol) & (i < n_newton_steps)
+        return (jnp.max(jnp.abs(f) / tol_vec) > 1.0) & (i < n_newton_steps)
 
     x, f, n_iters = jax.lax.while_loop(cond, body, (pos0, f0, jnp.int32(0)))
-    return x, n_iters, jnp.max(jnp.abs(f))
+    return x, n_iters, jnp.max(jnp.abs(f)), jnp.max(jnp.abs(f) / tol_vec)
 
 
 # ============================================================================
@@ -432,7 +448,7 @@ def _run_newton(residual_fn, precond_mv, pos0, tol, n_newton_steps, n_cg_steps, 
 # ============================================================================
 
 def _newton_solve(
-    positions_init: jnp.ndarray,
+    u_init: jnp.ndarray,
     thick_k: float,
     thin_k: float,
     z_line: float,
@@ -449,25 +465,26 @@ def _newton_solve(
     n_crowns: int,
     n_thin: int,
     n_sites: int,
-    n_newton_steps: int = 16,
-    n_cg_steps: int = 6,
-    tolerance: Optional[jnp.ndarray] = None,
+    n_newton_steps: int,
+    n_cg_steps: int,
+    tol_vec: jnp.ndarray = None,
     prefactored_precond: Optional[PreFactoredPreconditioner] = None,
-) -> Tuple[jnp.ndarray, int, float]:
+) -> Tuple[jnp.ndarray, int, float, float]:
     """Newton-Raphson solver with while_loop Newton and unrolled CG.
 
     Uses jax.lax.while_loop for the outer Newton loop — body traced once,
-    exits when max|f| < tolerance OR n_newton_steps cap is reached.
+    exits when max(|f| / tol_vec) <= 1 OR the n_newton_steps cap is reached.
     Compile time ∝ n_cg_steps (not n_newton_steps × n_cg_steps).
 
     Inner CG uses Python for loop (unrolled at trace time), enabling
     full XLA fusion across CG iterations.
 
     Args:
-        n_newton_steps: Hard cap on Newton iterations (default 16).
-                        while_loop exits early when converged.
-        n_cg_steps: Fixed number of CG iterations per Newton step (default 6; 0=Richardson).
-        tolerance: Convergence target (pN). If None, uses MIN_FLOAT32_TOLERANCE.
+        n_newton_steps: Hard cap on Newton iterations; while_loop exits early
+                        when converged. No default here — StaticParams is the
+                        single source of truth for both solver caps.
+        n_cg_steps: Fixed number of CG iterations per Newton step (0=Richardson).
+        tol_vec: per-row convergence tolerance (pN), from _convergence_tolerance.
 
     Optimizations:
     1. Unrolled CG with Python for loop (no fori_loop WhileOp)
@@ -477,12 +494,12 @@ def _newton_solve(
     """
     n_thick_nodes = n_thick * n_crowns
 
-    def residual_fn(pos):
-        """Compute force residual F(x) at given positions."""
-        pos_thick = pos[:n_thick_nodes].reshape(n_thick, n_crowns)
-        pos_thin = pos[n_thick_nodes:].reshape(n_thin, n_sites)
+    def residual_fn(u):
+        """Compute force residual F(u) at given displacements."""
+        u_thick = u[:n_thick_nodes].reshape(n_thick, n_crowns)
+        u_thin = u[n_thick_nodes:].reshape(n_thin, n_sites)
         return compute_forces_vectorized(
-            pos_thick, pos_thin,
+            u_thick, u_thin,
             thick_k, thin_k, z_line, lattice_spacing,
             titin_a, titin_b, titin_rest,
             xb_states, xb_bound_to, params, topology
@@ -490,9 +507,10 @@ def _newton_solve(
 
     prefactored = prefactored_precond if prefactored_precond is not None else \
         build_prefactored_preconditioner(precond_params, negate=True, eps=1e-9)
+    # The preconditioner is unchanged by the coordinate switch: the rest frame
+    # is a constant offset, so dF/du == dF/dx exactly.
     precond_mv = lambda v: apply_preconditioner(prefactored, v, n_thick, n_crowns, n_thin, n_sites)
-    tol = tolerance if tolerance is not None else jnp.asarray(MIN_FLOAT32_TOLERANCE)
-    return _run_newton(residual_fn, precond_mv, positions_init, tol, n_newton_steps, n_cg_steps)
+    return _run_newton(residual_fn, precond_mv, u_init, tol_vec, n_newton_steps, n_cg_steps)
 
 
 # ============================================================================
@@ -571,21 +589,25 @@ def _augmented_residual_fn(
     """Augmented (n+1)-dim residual: [f_axial, f_radial].
 
     d = pos_aug[-1] is used as lattice_spacing in compute_forces_vectorized,
-    so JAX JVP automatically captures df_axial/dd and df_radial/dpositions.
+    so JAX JVP automatically captures df_axial/dd and df_radial/du. The first
+    n entries of pos_aug are DISPLACEMENTS (see core/state.py).
     """
     d = pos_aug[-1]
-    pos = pos_aug[:-1]
+    u = pos_aug[:-1]
     n_thick_nodes = n_thick * n_crowns
-    pos_thick = pos[:n_thick_nodes].reshape(n_thick, n_crowns)
-    pos_thin = pos[n_thick_nodes:].reshape(n_thin, n_sites)
+    u_thick = u[:n_thick_nodes].reshape(n_thick, n_crowns)
+    u_thin = u[n_thick_nodes:].reshape(n_thin, n_sites)
 
     f_axial = compute_forces_vectorized(
-        pos_thick, pos_thin,
+        u_thick, u_thin,
         thick_k, thin_k, z_line, d,
         titin_a, titin_b, titin_rest,
         xb_states, xb_bound_to, params, topology
     )
 
+    # The radial path needs true axial coordinates (XB reach, titin diagonal).
+    pos_thick = topology.crown_offsets + u_thick
+    pos_thin = z_line - topology.binding_offsets + u_thin
     f_rad = _radial_residual(
         d, pos_thick, pos_thin, xb_states, xb_bound_to,
         z_line, params, topology,
@@ -597,7 +619,7 @@ def _augmented_residual_fn(
 
 
 def _newton_solve_dynamic_ls(
-    positions_init: jnp.ndarray,
+    u_init: jnp.ndarray,
     d_init: float,
     thick_k: float,
     thin_k: float,
@@ -616,18 +638,20 @@ def _newton_solve_dynamic_ls(
     n_crowns: int,
     n_thin: int,
     n_sites: int,
-    n_newton_steps: int = 16,
-    n_cg_steps: int = 6,
-    tolerance: Optional[jnp.ndarray] = None,
-) -> Tuple[jnp.ndarray, int, float]:
-    """Newton-Raphson solver for augmented system (positions + lattice spacing).
+    n_newton_steps: int,
+    n_cg_steps: int,
+    tol_vec: jnp.ndarray = None,
+) -> Tuple[jnp.ndarray, int, float, float]:
+    """Newton-Raphson solver for augmented system (displacements + lattice spacing).
 
     Uses while_loop for Newton, Python for-loop for CG (unrolled by XLA).
     Includes d > 1.0 nm projection in the while_loop body.
     """
     n_thick_nodes = n_thick * n_crowns
-    pos_thick_init = positions_init[:n_thick_nodes].reshape(n_thick, n_crowns)
-    pos_thin_init = positions_init[n_thick_nodes:].reshape(n_thin, n_sites)
+    u_thick_init = u_init[:n_thick_nodes].reshape(n_thick, n_crowns)
+    u_thin_init = u_init[n_thick_nodes:].reshape(n_thin, n_sites)
+    pos_thick_init = topology.crown_offsets + u_thick_init
+    pos_thin_init = z_line - topology.binding_offsets + u_thin_init
 
     # Exact d-block Jacobian diagonal via scalar autodiff
     J_dd = jax.grad(_radial_residual, argnums=0)(
@@ -637,7 +661,7 @@ def _newton_solve_dynamic_ls(
     )
     d_block_inv = -1.0 / J_dd
 
-    pos_aug0 = jnp.concatenate([positions_init, jnp.array([d_init])])
+    pos_aug0 = jnp.concatenate([u_init, jnp.array([d_init])])
 
     def residual_fn(pos_aug):
         return _augmented_residual_fn(
@@ -650,10 +674,76 @@ def _newton_solve_dynamic_ls(
     precond_mv = lambda v: _apply_augmented_preconditioner(
         prefactored_precond, d_block_inv, v, n_thick, n_crowns, n_thin, n_sites
     )
-    tol = tolerance if tolerance is not None else jnp.asarray(MIN_FLOAT32_TOLERANCE)
     _clamp_d = lambda x: x.at[-1].set(jnp.maximum(x[-1], 1.0))
-    return _run_newton(residual_fn, precond_mv, pos_aug0, tol, n_newton_steps, n_cg_steps,
+    return _run_newton(residual_fn, precond_mv, pos_aug0, tol_vec, n_newton_steps, n_cg_steps,
                        post_step=_clamp_d)
+
+
+# ============================================================================
+# CONVERGENCE TOLERANCE
+# ============================================================================
+
+def _force_scale(state: 'State', constants: 'DynamicParams') -> jnp.ndarray:
+    """RMS backbone spring force in the incoming state (pN).
+
+    The natural scale for "how big is a force here". It is read from the
+    springs rather than from the M-line reading because the M-line force is one
+    spring and can pass through zero, while the RMS over every segment cannot.
+
+    MEASURED at default stiffness, z = 950 nm, pCa 4.5 at steady state:
+    ~130 pN (skeletal 4x4) to ~210 pN (cardiac), giving a tolerance of
+    0.14-0.22 pN. Cross-checked against the same quantity rebuilt from
+    absolute positions in float64: 208.7171 vs 208.7158 pN, 0.0006%. On the
+    cardiac thick backbone the spring force runs ~481 pN at the M-line to
+    ~389 pN at the tip — it does NOT taper to zero, because titin pulls on the
+    tip. It IS zero at pCa 9 with nothing attached and no titin load, which is
+    the case `solver_atol` exists to cover.
+
+    Costs two diffs and a mean, and is evaluated ONCE per solve_equilibrium
+    call from the state going in — so the tolerance is fixed through the whole
+    Newton loop and the exported value is unambiguous.
+    """
+    u_t = state.thick.displacement
+    u_n = state.thin.displacement
+    f_t = jnp.diff(u_t, axis=1, prepend=0.0) * constants.thick_k
+    f_n = jnp.diff(u_n, axis=1, append=0.0) * constants.thin_k
+    return jnp.sqrt(jnp.mean(jnp.concatenate([f_t.ravel() ** 2, f_n.ravel() ** 2])))
+
+
+def _convergence_tolerance(state, constants, n_axial, K_lat, d_ref):
+    """Per-row convergence tolerance, and the axial tolerance as a scalar.
+
+        tol = solver_atol + solver_rtol * scale
+
+    with `scale` the RMS backbone spring force on the axial rows, and
+    |K_lat| * d_ref on the radial row of the augmented dynamic-LS system.
+
+    WHY SCALE-FREE. The previous criterion was an absolute pN target with a
+    `thick_k * 1e-4` floor under it — the float32 coordinate quantum, which
+    scaled with the problem rather than with the physics and ignored thin_k
+    entirely. In displacement coordinates there is no such quantum, so the
+    right question is "small compared to what", and the answer is the forces
+    the backbone is actually carrying. `atol` covers pCa 9, where the only
+    axial forces are titin's.
+
+    WHY NOT A STEP-SIZE CRITERION. max|du| would be the obvious alternative,
+    but `_preconditioned_cg` runs a fixed number of iterations with no
+    convergence check of its own, so a small step is the SYMPTOM of the failure
+    mode this is meant to catch. The residual F is exact no matter how badly CG
+    did.
+
+    Returns:
+        (tol_vec, tol_axial) — the vector to hand _run_newton, and the scalar
+        axial tolerance in pN, which is what gets exported as a metric.
+    """
+    tol_axial = constants.solver_atol + constants.solver_rtol * _force_scale(state, constants)
+    if K_lat is None:
+        return jnp.full((n_axial,), tol_axial), tol_axial
+    scale_rad = jnp.abs(K_lat) * d_ref
+    tol_rad = constants.solver_atol + constants.solver_rtol * scale_rad
+    tol_vec = jnp.concatenate([jnp.full((n_axial,), tol_axial),
+                               jnp.reshape(tol_rad, (1,))])
+    return tol_vec, tol_axial
 
 
 # ============================================================================
@@ -664,15 +754,14 @@ def solve_equilibrium(
     state: 'State',
     constants: 'DynamicParams',
     topology: 'SarcTopology',
+    n_newton_steps: int,
+    n_cg_steps: int,
     K_lat: float = None,
     d_ref: float = None,
-    tolerance: float = None,
-    n_newton_steps: int = 16,
-    n_cg_steps: int = 6,
     precond_params: Optional[PreconditionerParams] = None,
     prefactored_precond: Optional[PreFactoredPreconditioner] = None,
-) -> Tuple['State', jnp.ndarray, float, int]:
-    """Solve for equilibrium filament positions.
+) -> Tuple['State', jnp.ndarray, float, int, jnp.ndarray, jnp.ndarray]:
+    """Solve for equilibrium filament displacements.
 
     When K_lat is None: standard n-DOF axial solve (fixed lattice spacing).
     When K_lat > 0: augmented (n+1)-DOF solve with lattice spacing d as an
@@ -689,33 +778,35 @@ def solve_equilibrium(
         K_lat: Effective lattice stiffness (pN/nm), already scaled by n_thick.
                None = fixed LS mode.
         d_ref: Poisson-scaled reference spacing (nm). Required if K_lat is not None.
-        tolerance: Convergence tolerance (pN). None -> constants.solver_tol,
-                   floored at thick_k × 1e-4 (float32 precision limit).
-        n_newton_steps: Hard cap on Newton iterations (default 16)
-        n_cg_steps: CG iterations per Newton step. Default 6; 0 = Richardson
-                   (no JVP — diverges with attached XBs, see CLAUDE.md DO NOT).
+        n_newton_steps: Hard cap on Newton iterations. No default here —
+                   StaticParams.n_newton_steps is the single source of truth.
+        n_cg_steps: CG iterations per Newton step, from StaticParams.n_cg_steps.
+                   0 = Richardson (no JVP — diverges with attached XBs, see
+                   CLAUDE.md DO NOT).
         precond_params: Pre-built PreconditionerParams (optional, avoids rebuild per step)
         prefactored_precond: Pre-factored Thomas data (optional, avoids re-factoring per step)
 
     Returns:
-        (new_state, residual_scalar, new_lattice_spacing, n_iters)
+        (new_state, residual_scalar, new_lattice_spacing, n_iters,
+         residual_norm, tol_axial)
+
+        residual_scalar  raw max|F| in pN, unchanged meaning
+        residual_norm    max(|F| / tol_vec), dimensionless; <= 1 is converged.
+                         The only single number that is sufficient in BOTH LS
+                         modes, since in dynamic LS the radial row can be over
+                         tolerance while every axial number looks fine.
+        tol_axial        the axial tolerance in pN, so the reported residual
+                         has a physical scale to be read against
         new_lattice_spacing = solved d (dynamic) or constants.lattice_spacing (fixed)
     """
-    thick_axial = state.thick.axial
-    thin_axial = state.thin.axial
-    n_thick, n_crowns = thick_axial.shape
-    n_thin, n_sites = thin_axial.shape
+    u_thick = state.thick.displacement
+    u_thin = state.thin.displacement
+    n_thick, n_crowns = u_thick.shape
+    n_thin, n_sites = u_thin.shape
     n_thick_nodes = n_thick * n_crowns
+    n_axial = n_thick_nodes + n_thin * n_sites
 
-    # Raise the requested tolerance to the float32 precision floor if needed.
-    # See MIN_FLOAT32_TOLERANCE: the floor scales as thick_k * 1e-4, which is
-    # ~0.75 pN at the default thick_k = 7500. Asking for less is unachievable
-    # and merely makes the Newton loop run to its iteration cap.
-    if tolerance is None:
-        tolerance = constants.solver_tol
-    float32_floor = constants.thick_k * jnp.asarray(1e-4)
-    tolerance = jnp.maximum(jnp.asarray(tolerance),
-                            jnp.maximum(float32_floor, jnp.asarray(MIN_FLOAT32_TOLERANCE)))
+    tol_vec, tol_axial = _convergence_tolerance(state, constants, n_axial, K_lat, d_ref)
 
     if precond_params is None:
         from multifil_jax.core.state import build_preconditioner_params
@@ -724,12 +815,12 @@ def solve_equilibrium(
             constants.thick_k, constants.thin_k,
         )
 
-    positions_init = jnp.concatenate([thick_axial.flatten(), thin_axial.flatten()])
+    u_init = jnp.concatenate([u_thick.flatten(), u_thin.flatten()])
 
     if K_lat is None:
         # Fixed LS: standard n-DOF solve
-        positions_final, n_iters, final_residual = _newton_solve(
-            positions_init,
+        u_final, n_iters, final_residual, residual_norm = _newton_solve(
+            u_init,
             constants.thick_k, constants.thin_k,
             constants.z_line, constants.lattice_spacing,
             constants.titin_a, constants.titin_b, constants.titin_rest,
@@ -737,17 +828,17 @@ def solve_equilibrium(
             constants, precond_params, topology,
             n_thick, n_crowns, n_thin, n_sites,
             n_newton_steps, n_cg_steps,
-            tolerance=tolerance,
+            tol_vec=tol_vec,
             prefactored_precond=prefactored_precond,
         )
-        new_positions = positions_final
+        new_u = u_final
         new_lattice_spacing = constants.lattice_spacing
     else:
         # Dynamic LS: augmented (n+1)-DOF solve
         if prefactored_precond is None:
             prefactored_precond = build_prefactored_preconditioner(precond_params)
-        pos_aug_final, n_iters, final_residual = _newton_solve_dynamic_ls(
-            positions_init, constants.lattice_spacing,
+        pos_aug_final, n_iters, final_residual, residual_norm = _newton_solve_dynamic_ls(
+            u_init, constants.lattice_spacing,
             constants.thick_k, constants.thin_k,
             constants.z_line,
             constants.titin_a, constants.titin_b, constants.titin_rest,
@@ -757,15 +848,16 @@ def solve_equilibrium(
             prefactored_precond,
             n_thick, n_crowns, n_thin, n_sites,
             n_newton_steps, n_cg_steps,
-            tolerance=tolerance,
+            tol_vec=tol_vec,
         )
-        new_positions = pos_aug_final[:-1]
+        new_u = pos_aug_final[:-1]
         new_lattice_spacing = pos_aug_final[-1]
 
-    new_thick_axial = new_positions[:n_thick_nodes].reshape(n_thick, n_crowns)
-    new_thin_axial = new_positions[n_thick_nodes:].reshape(n_thin, n_sites)
+    new_u_thick = new_u[:n_thick_nodes].reshape(n_thick, n_crowns)
+    new_u_thin = new_u[n_thick_nodes:].reshape(n_thin, n_sites)
     new_state = state._replace(
-        thick=state.thick._replace(axial=new_thick_axial),
-        thin=state.thin._replace(axial=new_thin_axial),
+        thick=state.thick._replace(displacement=new_u_thick),
+        thin=state.thin._replace(displacement=new_u_thin),
     )
-    return new_state, final_residual, new_lattice_spacing, n_iters
+    return (new_state, final_residual, new_lattice_spacing, n_iters,
+            residual_norm, tol_axial)

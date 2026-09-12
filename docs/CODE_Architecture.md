@@ -75,8 +75,8 @@ result = run(
 - `list[float]` → Cartesian product sweep axis
 - `array(n_steps)` → time-varying trace
 
-**`static_params`**: `run()` reads `n_cg_steps`, `n_newton_steps` (both JIT-static)
-and `solver_residual_tol` (post-run warning threshold) from it. Defaults to
+**`static_params`**: `run()` reads `n_cg_steps` and `n_newton_steps` (both
+JIT-static) from it. Defaults to
 `StaticParams()` if omitted — pass the *same* StaticParams used to build the
 topology whenever it was customized.
 
@@ -164,7 +164,7 @@ skeletal-inherited placeholders, not fitted values.
 
 ```
 result.axial_force      # property → metrics['axial_force'] (pN)
-result.metrics          # MetricsDict of 57 metric arrays, same shape
+result.metrics          # MetricsDict of 63 metric arrays, same shape
 result.z_line           # z_line trace used
 result.pCa              # pCa trace used
 result.metrics['solver_residual']  # Newton solver residual at each step
@@ -239,7 +239,7 @@ When a subpopulation is active, `subpop_arrays` joins the vmap as one extra
 (dict) axis; when inactive the vmap signature is unchanged, so the WT trace is
 byte-identical to a build without the feature.
 
-All 57 metrics are always computed. No `metrics`/`manifest` in JIT
+All 63 metrics are always computed. No `metrics`/`manifest` in JIT
 `static_argnames` — changing metric selection never triggers recompilation.
 
 ---
@@ -283,16 +283,19 @@ across all coupled sarcomeres, then perform a coupled equilibration.
 ### `timestep()` — full step (kinetics + equilibrium)
 
 ```python
-new_state, new_key, residual, new_ls, n_iters, trace = timestep(
+(new_state, new_key, residual, new_ls, n_iters, trace,
+ residual_norm, tolerance) = timestep(
     state, constants, drivers, topology, rng_key, dt=dt,
     K_lat=None, d_ref=None,
-    solver_tol=None, n_cg_steps=6, n_newton_steps=16,
+    n_cg_steps=6, n_newton_steps=16,
     precond_params=None, prefactored_precond=None,
     xb_subpop=None, tm_subpop=None,
 )
 ```
 
-Returns a 6-tuple, the last element being the `KineticsTrace` above — feed it
+Returns an 8-tuple. `residual_norm` is `max(|F| / tol_vec)` — dimensionless,
+`<= 1` means converged — and `tolerance` is the axial tolerance in pN. The
+`KineticsTrace` is the 6th element — feed it
 straight to `compute_all_metrics()`. `K_lat is None` selects fixed LS mode (resolved at trace time,
 no runtime branch). When `K_lat` is not None, passes `K_lat` and `d_ref` to
 `solve_equilibrium()` which handles the augmented (n+1)-DOF dynamic LS solve.
@@ -355,7 +358,7 @@ convention (`xb_r01_coeff`, `xb_r12_coeff`, `xb_r23_coeff`, `xb_r34_coeff`,
 `xb_r40`, `xb_r04`, `xb_r05`).
 
 **MetricsDict** — scan output. A dict subclass with attribute access, registered
-as a JAX PyTree. Contains all 57 metric scalars per timestep (including
+as a JAX PyTree. Contains all 63 metric scalars per timestep (including
 `axial_force`, `solver_residual`, `newton_iters`).
 
 **Immutable updates** via `._replace()`:
@@ -473,7 +476,6 @@ static = StaticParams(
     # --- solver ---
     n_newton_steps=4,                # Newton while_loop cap (exits early at convergence)
     n_cg_steps=6,                    # CG iterations per Newton step (0=Richardson, diverges with bound XBs)
-    solver_residual_tol=1.5,         # post-run warning threshold (pN)
     solver_max_iter=50,
 
     # --- XB transition-matrix binning ---
@@ -497,10 +499,11 @@ static = StaticParams(
 )
 ```
 
-`solver_residual_tol=1.5` pN is calibrated to the float32 precision floor at the
-literature-consistent `thick_k=7500`. The empirical floor scales as
-~`thick_k × 2e-4`, so raising `thick_k`/`thin_k` may trip the warning — raise the
-tolerance with them.
+`StaticParams.solver_residual_tol` is gone. It was a third copy of a float32
+precision floor that no longer exists: node positions are stored as
+displacements from rest, so the achievable residual does not scale with
+stiffness. Convergence is judged on the dimensionless `solver_residual_norm`
+metric, and the post-run warning fires when it exceeds 1.
 
 `target_zone_wiggle` (which actin monomer falls in a target zone) and
 `crown_face_wiggle_deg` (which of six hex neighbors a crown's arm points at) are
@@ -760,13 +763,26 @@ jaxpr equations vs the previous for-loop approach; 20% faster.
 **Note:** `fori_loop` was tried for `thomas_solve` and caused 20× runtime regression (XLA cannot
 fuse across WhileOp boundaries). Do NOT revert to fori_loop.
 
-### Tolerance floor
+### Convergence tolerance — scale-free and per-block
 
 ```python
-tolerance = max(tolerance, thick_k * 1e-4, MIN_FLOAT32_TOLERANCE)
+tol_axial = solver_atol + solver_rtol * RMS(backbone spring force)
+tol_rad   = solver_atol + solver_rtol * |K_lat| * d_ref     # dynamic LS only
+converged when   max(|F| / tol_vec) <= 1
 ```
 
-Prevents the while_loop from chasing an unreachable target at stiff parameter values.
+`_run_newton` takes a tolerance **vector**, one entry per residual row. Fixed LS
+passes a uniform one; dynamic LS appends `tol_rad` for the radial row, which is
+a whole-lattice aggregate and would otherwise share one `max` with per-node
+axial forces. `scale_axial` is evaluated ONCE per `solve_equilibrium` call from
+the incoming state, so the tolerance is fixed through the Newton loop.
+
+There used to be a `max(tolerance, thick_k * 1e-4, MIN_FLOAT32_TOLERANCE)`
+floor here. It existed because absolute node positions (~1000 nm) put a float32
+quantum under every backbone force, and it scaled WITH the problem rather than
+with the physics: at 100x stiffness the tolerance became 75 pN and Newton
+exited on its first iteration. It also ignored `thin_k` entirely. Displacement
+coordinates removed the quantum; see `core/state.py`.
 
 ### Dynamic lattice spacing solve path
 
@@ -810,13 +826,13 @@ reported `lattice_spacing` are post-solve quantities); `trace.constants` carries
 the **pre-solve** one (the rates were evaluated there). Both are correct for
 their own question and must not be unified.
 
-Returns a `MetricsDict` with **61 keys** (same keys every call). Always computed —
+Returns a `MetricsDict` with **63 keys** (same keys every call). Always computed —
 no selection needed.
 
-**Metric groups (57 total):**
+**Metric groups (63 total):**
 | Group | Keys | n |
 |-------|------|---|
-| Protocol | `axial_force`, `solver_residual`, `z_line`, `pCa`, `lattice_spacing` | 5 |
+| Protocol | `axial_force`, `solver_residual`, `solver_residual_norm`, `solver_tolerance`, `z_line`, `pCa`, `lattice_spacing` | 7 |
 | XB counts | `n_bound`, `n_xb_drx`, `n_xb_loose`, `n_xb_tight_1`, `n_xb_tight_2`, `n_xb_free_2`, `n_xb_srx` | 7 |
 | XB fractions | `frac_xb_bound`, `frac_xb_drx`, `frac_xb_loose`, `frac_xb_tight_1`, `frac_xb_tight_2`, `frac_xb_free_2`, `frac_xb_srx` | 7 |
 | XB force by state | `force_xb_loose`, `force_xb_tight_1`, `force_xb_tight_2` | 3 |
@@ -834,7 +850,8 @@ no selection needed.
 The **overlap-zone** group (`compute_overlap_tm_fractions()`) restricts the TM
 fractions to crossbridge-reachable sites: within
 `[crown_offsets.min() - 13, crown_offsets.max() + 13]` (the same 13 nm head reach
-used in `geometry.py`) **and** past the hiding line (`thin_axial > 0`). The plain
+used in `geometry.py`) **and** past the hiding line (absolute position > 0,
+reconstructed with `thin_axial()`). The plain
 `frac_tm_*` keys average over *every* site, including the thick filament's bare
 zone and sites beyond its tip, so they are diluted by permanently unreachable
 sites. Prefer the `_overlap` variants whenever comparing across geometries — a

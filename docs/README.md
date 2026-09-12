@@ -250,18 +250,28 @@ regardless of ordering. `result.coords` maps each axis name to its values.
 primary output of a mechanical simulation. It is a property that returns
 `result.metrics['axial_force']`.
 
-`result.metrics` — a `MetricsDict` containing 57 quantities computed
+`result.metrics` — a `MetricsDict` containing 63 quantities computed
 at every timestep (described fully in the next section). `MetricsDict` supports
 both dict-style access (`result.metrics['n_bound']`) and attribute access
 (`result.metrics.n_bound`).
 
 `result.metrics['solver_residual']` — a diagnostic trace showing how well the
 mechanical equilibrium solver converged at each step. `run()` warns after the
-fact if the residual exceeds `StaticParams.solver_residual_tol` (default 1.5 pN).
-That threshold is not a physics constant: it sits just above the float32
-precision floor, which scales roughly as `thick_k × 2e-4`. If you raise `thick_k`
-or `thin_k` well above their defaults, raise the tolerance with them or you will
-get spurious warnings.
+fact if `solver_residual_norm` exceeds 1, i.e. if the solve did not reach
+its own tolerance anywhere in the run.
+`result.metrics['solver_tolerance']` — what the solver was actually aiming at,
+in pN: `solver_atol + solver_rtol * RMS backbone spring force`. Reading the raw
+residual without it is meaningless, because "small" depends on how much force
+the lattice is carrying.
+
+`result.metrics['solver_residual_norm']` — the raw residual divided by that
+tolerance, so `<= 1` means converged. It is the number to check, and the only
+one that is sufficient in dynamic-lattice-spacing mode too, where the radial
+row can be over tolerance while every axial number looks fine.
+
+There is no longer a stiffness-scaled precision floor to work around. Node
+positions are stored as displacements from rest, so a run at 100x the default
+`thick_k` converges to the same *relative* accuracy as one at the default.
 
 `result.metrics['newton_iters']` — the number of Newton iterations the solver
 used at each step. Typically 1–4 for standard parameters.
@@ -710,7 +720,7 @@ calls the same compiled kernel, so there is no recompilation. The default
 `"auto"` setting chunks batches of 16384+ into groups of 4096, which
 benchmarks show is ~2% faster due to better L2 cache utilization. The primary
 reason to use minibatching is to bound peak GPU VRAM on memory-constrained GPUs
-(e.g. 8 GB): peak VRAM ≈ minibatch_size × n_steps × 57 metrics × 4 bytes × 2.
+(e.g. 8 GB): peak VRAM ≈ minibatch_size × n_steps × 63 metrics × 4 bytes × 2.
 
 ---
 

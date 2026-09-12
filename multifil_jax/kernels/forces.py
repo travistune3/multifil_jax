@@ -69,6 +69,8 @@ import jax.numpy as jnp
 from typing import Tuple, Dict, Union, TYPE_CHECKING
 from functools import partial
 
+from multifil_jax.core.state import thick_axial, thin_axial
+
 if TYPE_CHECKING:
     from multifil_jax.core.sarc_geometry import SarcTopology
     from multifil_jax.core.state import State
@@ -80,8 +82,8 @@ if TYPE_CHECKING:
 # ============================================================================
 
 def compute_thick_passive_forces_single(
-    positions: jnp.ndarray,
-    rests: jnp.ndarray,
+    u: jnp.ndarray,
+    offsets: jnp.ndarray,
     thick_k: float,
     z_line: float,
     lattice_spacing: float,
@@ -108,9 +110,16 @@ def compute_thick_passive_forces_single(
     one-sided — compression produces no force, since a protein tether cannot
     push.
 
+    COORDINATES ARE DISPLACEMENTS. `u` is each crown's offset from its rest
+    position, so the backbone law needs no rest lengths: `crown_offsets` is the
+    cumsum of `crown_rests`, and the two cancel algebraically. What survives is
+    diff(u) * k, in which nothing large is subtracted from anything large. See
+    core/state.py for why that matters. Titin still needs a TRUE position, so
+    the rest frame is passed in as `offsets` and added back for the tip alone.
+
     Args:
-        positions: (n_crowns,) crown axial positions (nm)
-        rests: (n_crowns,) rest spacing between each crown and the previous node
+        u: (n_crowns,) crown displacements from rest (nm)
+        offsets: (n_crowns,) rest-frame crown positions, topology.crown_offsets
         thick_k: Backbone spring constant per segment (pN/nm)
         z_line: Z-line position (nm), the far anchor for titin
         lattice_spacing: Radial thick-to-thin distance (nm), the other leg of
@@ -124,17 +133,12 @@ def compute_thick_passive_forces_single(
     Returns:
         forces: (n_crowns,) net axial force on each crown (pN)
     """
-    # Prepend M-line position (0) to crown positions
-    axial_with_mline = jnp.concatenate([jnp.array([0.0]), positions])
+    # Spring extension IS the displacement difference: the M-line is a fixed
+    # anchor at u = 0 and the rest lengths cancel. Exactly zero at rest.
+    spring_forces = jnp.diff(jnp.concatenate([jnp.array([0.0]), u])) * thick_k
 
-    # Calculate distances between adjacent nodes
-    dists = jnp.diff(axial_with_mline)
-
-    # Spring forces: F = k * (actual - rest)
-    spring_forces = (dists - rests) * thick_k
-
-    # Calculate titin force for last crown
-    myo_loc = positions[-1]
+    # Calculate titin force for last crown — a true axial position is needed
+    myo_loc = offsets[-1] + u[-1]
     axial_dist = z_line - myo_loc
 
     # Total titin length (Pythagorean theorem)
@@ -163,8 +167,8 @@ def compute_thick_passive_forces_single(
 
 
 def compute_thick_passive_forces_vectorized(
-    positions_thick: jnp.ndarray,
-    rests_thick: jnp.ndarray,
+    u_thick: jnp.ndarray,
+    offsets_thick: jnp.ndarray,
     thick_k: float,
     z_line: float,
     lattice_spacing: float,
@@ -176,8 +180,8 @@ def compute_thick_passive_forces_vectorized(
     """Vectorized thick filament passive forces for all thick filaments.
 
     Args:
-        positions_thick: (n_thick, n_crowns) crown positions
-        rests_thick: (n_thick, n_crowns) rest spacings
+        u_thick: (n_thick, n_crowns) crown displacements from rest
+        offsets_thick: (n_thick, n_crowns) rest frame, topology.crown_offsets
         thick_k: Thick filament spring constant
         z_line: Z-line position
         lattice_spacing: Lattice spacing
@@ -198,7 +202,7 @@ def compute_thick_passive_forces_vectorized(
         n_titin=n_titin_per_thick
     )
 
-    forces = jax.vmap(compute_fn)(positions_thick, rests_thick)
+    forces = jax.vmap(compute_fn)(u_thick, offsets_thick)
 
     return forces
 
@@ -208,30 +212,28 @@ def compute_thick_passive_forces_vectorized(
 # ============================================================================
 
 def compute_thin_passive_forces_single(
-    positions: jnp.ndarray,
-    rests: jnp.ndarray,
-    thin_k: float,
-    z_line: float
+    u: jnp.ndarray,
+    thin_k: float
 ) -> jnp.ndarray:
     """Compute net force on each binding site of one thin filament.
 
+    COORDINATES ARE DISPLACEMENTS, and the Z-line leaves this function
+    entirely. The thin frame is anchored on the Z-disc (absolute position is
+    `z_line - binding_offsets + u`), and `binding_rests` is exactly the diff of
+    `binding_offsets`, so both the rest lengths and z_line cancel. The filament
+    therefore follows the Z-disc rigidly with no force and no state update —
+    which is why the simulation loop no longer shifts thin positions when the
+    Z-line moves. See core/state.py.
+
     Args:
-        positions: (n_sites,) binding site axial positions
-        rests: (n_sites,) rest spacings between sites
+        u: (n_sites,) binding site displacements from rest (nm)
         thin_k: Thin filament spring constant (pN/nm)
-        z_line: Z-line position (nm)
 
     Returns:
         forces: (n_sites,) net force on each binding site
     """
-    # Append z-line to positions
-    axial_with_zline = jnp.concatenate([positions, jnp.array([z_line])])
-
-    # Calculate distances between adjacent nodes
-    dists = jnp.diff(axial_with_zline)
-
-    # Spring forces
-    spring_forces = (dists - rests) * thin_k
+    # The Z-disc is the fixed anchor at u = 0, appended at the far end.
+    spring_forces = jnp.diff(jnp.concatenate([u, jnp.array([0.0])])) * thin_k
 
     # Prepend 0 (first site has no spring on M-line side)
     spring_forces_with_zero = jnp.concatenate([jnp.array([0.0]), spring_forces])
@@ -243,18 +245,14 @@ def compute_thin_passive_forces_single(
 
 
 def compute_thin_passive_forces_vectorized(
-    positions_thin: jnp.ndarray,
-    rests_thin: jnp.ndarray,
-    thin_k: float,
-    z_line: float
+    u_thin: jnp.ndarray,
+    thin_k: float
 ) -> jnp.ndarray:
     """Vectorized thin filament passive forces for all thin filaments.
 
     Args:
-        positions_thin: (n_thin, n_sites) binding site positions
-        rests_thin: (n_thin, n_sites) rest spacings
+        u_thin: (n_thin, n_sites) binding site displacements from rest
         thin_k: Thin filament spring constant
-        z_line: Z-line position
 
     Returns:
         forces: (n_thin, n_sites) net force on each site
@@ -262,10 +260,9 @@ def compute_thin_passive_forces_vectorized(
     compute_fn = partial(
         compute_thin_passive_forces_single,
         thin_k=thin_k,
-        z_line=z_line
     )
 
-    forces = jax.vmap(compute_fn)(positions_thin, rests_thin)
+    forces = jax.vmap(compute_fn)(u_thin)
 
     return forces
 
@@ -701,8 +698,8 @@ def xb_axial_work(
 # ============================================================================
 
 def compute_forces_vectorized(
-    positions_thick: jnp.ndarray,
-    positions_thin: jnp.ndarray,
+    u_thick: jnp.ndarray,
+    u_thin: jnp.ndarray,
     thick_k: float,
     thin_k: float,
     z_line: float,
@@ -720,15 +717,19 @@ def compute_forces_vectorized(
     This is the JAX-native replacement for compute_forces_from_positions().
     It is fully JIT-compilable and GPU-ready.
 
-    The residual is: F(x) = 0 at equilibrium
+    The residual is: F(u) = 0 at equilibrium
 
-    Rest spacings are sourced from geometry (topology):
-        thick: geometry.crown_rests (n_thick, n_crowns), per-filament
-        thin:  geometry.binding_rests (n_thin, n_sites)
+    THE DEGREES OF FREEDOM ARE DISPLACEMENTS, not absolute positions (see
+    core/state.py). The backbone laws use them directly and need no rest
+    lengths. The crossbridge and titin paths need true axial coordinates, so
+    this function reconstructs them from the topology rest frames and hands
+    those on. Those two paths subtract quantities that are O(10-25 nm) and set
+    by lattice geometry rather than by force balance, so they neither shrink
+    under a stiffness sweep nor cancel catastrophically.
 
     Args:
-        positions_thick: (n_thick, n_crowns) crown positions
-        positions_thin: (n_thin, n_sites) binding site positions
+        u_thick: (n_thick, n_crowns) crown displacements from rest
+        u_thin: (n_thin, n_sites) binding site displacements from rest
         thick_k: Thick filament spring constant
         thin_k: Thin filament spring constant
         z_line: Z-line position
@@ -737,28 +738,26 @@ def compute_forces_vectorized(
         xb_states: Crossbridge states
         xb_bound_to: Crossbridge binding info (site_idx only, thin from geometry)
         params: Parameter dictionary
-        geometry: SarcTopology with xb_to_thin_id, crown_rests, binding_rests.
+        geometry: SarcTopology with xb_to_thin_id, crown_offsets, binding_offsets.
 
     Returns:
         forces: (n_thick_nodes + n_thin_nodes,) flattened force residual
     """
-    rests_thick = geometry.crown_rests
-    rests_thin = geometry.binding_rests
+    offsets_thick = geometry.crown_offsets
 
     # 1. Thick filament passive forces (with titin)
     forces_thick = compute_thick_passive_forces_vectorized(
-        positions_thick, rests_thick,
+        u_thick, offsets_thick,
         thick_k, z_line, lattice_spacing,
         titin_a, titin_b, titin_rest
     )
 
     # 2. Thin filament passive forces
-    forces_thin = compute_thin_passive_forces_vectorized(
-        positions_thin, rests_thin,
-        thin_k, z_line
-    )
+    forces_thin = compute_thin_passive_forces_vectorized(u_thin, thin_k)
 
-    # 3. Crossbridge forces (pass geometry for optimized indexing)
+    # 3. Crossbridge forces — these need true axial coordinates
+    positions_thick = offsets_thick + u_thick
+    positions_thin = z_line - geometry.binding_offsets + u_thin
     xb_forces_thick, xb_forces_thin = compute_xb_forces_vectorized(
         positions_thick, positions_thin,
         xb_states, xb_bound_to,
@@ -794,8 +793,8 @@ def compute_forces_from_state_vectorized(
         forces: Flattened force residual array
     """
     return compute_forces_vectorized(
-        positions_thick=state.thick.axial,
-        positions_thin=state.thin.axial,
+        u_thick=state.thick.displacement,
+        u_thin=state.thin.displacement,
         thick_k=constants.thick_k,
         thin_k=constants.thin_k,
         z_line=constants.z_line,
@@ -834,8 +833,8 @@ def compute_thick_forces_vectorized(
     """
     # 1. Passive forces from thick filament springs (including titin)
     f_passive = compute_thick_passive_forces_vectorized(
-        state.thick.axial,
-        topology.crown_rests,
+        state.thick.displacement,
+        topology.crown_offsets,
         constants.thick_k,
         constants.z_line,
         constants.lattice_spacing,
@@ -846,8 +845,8 @@ def compute_thick_forces_vectorized(
 
     # 2. Crossbridge forces on thick filament
     xb_forces_thick, _ = compute_xb_forces_vectorized(
-        state.thick.axial,
-        state.thin.axial,
+        thick_axial(state, topology),
+        thin_axial(state, topology, constants.z_line),
         state.thick.xb_states,
         state.thick.xb_bound_to,
         constants.lattice_spacing,
@@ -873,7 +872,7 @@ def axial_force_at_mline(state: 'State', constants: 'DynamicParams', topology: '
     backbone spring of each thick filament — the segment between the M-line and
     the first crown:
 
-        force = sum over thick filaments of (crown[0] - bare_zone) * thick_k
+        force = sum over thick filaments of u[0] * thick_k
 
     Deliberately NOT the sum of individual crossbridge forces. Once the solver
     has equilibrated the lattice, every force generated anywhere on the filament
@@ -895,13 +894,14 @@ def axial_force_at_mline(state: 'State', constants: 'DynamicParams', topology: '
     Args:
         state: State NamedTuple (pure state, no embedded params)
         constants: DynamicParams with thick_k
-        topology: SarcTopology with crown_offsets[:, 0] = per-filament bare_zone distance
+        topology: unused; kept so the signature matches the other metric
+            readers. The bare-zone distance IS crown_offsets[:, 0], which is
+            exactly what the stored displacement is measured from.
 
     Returns:
         force: Total axial force at M-line (pN)
     """
-    bare_zone = topology.crown_offsets[:, 0]
-    force_per_thick = (state.thick.axial[:, 0] - bare_zone) * constants.thick_k
+    force_per_thick = state.thick.displacement[:, 0] * constants.thick_k
     return jnp.sum(force_per_thick)
 
 

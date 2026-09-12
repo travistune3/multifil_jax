@@ -91,15 +91,14 @@ PRESETS = {
 # Solver settings are held IDENTICAL across species, so that any difference in
 # the results is geometry and not solver tuning.
 #
-# Both are raised from their defaults for the IFM case. The default Newton cap
-# of 4 leaves residuals near 17 pN at some IFM lengths; raising it to 16 brings
-# them to ~1.8 pN, and beyond that more iterations change nothing — that is a
-# float32 precision floor, not a failure to converge. The floor is higher here
-# than for vertebrate because IFM nodes sit at ~1500 nm rather than ~1100 nm and
-# there are more of them, and float32 spacing grows with magnitude. Forces at
-# 4, 16 and 32 Newton steps agree to the printed precision.
+# The Newton cap is raised from its default of 4, which leaves residuals near
+# 17 pN at some IFM lengths. There used to be a residual-warning threshold set
+# alongside it, sized to a float32 precision floor that rose with node position
+# — IFM nodes sit at ~1500 nm rather than ~1100 nm. That floor is gone: node
+# positions are stored as displacements from rest, so the achievable residual
+# no longer depends on where the filament is. Convergence is now judged on the
+# dimensionless `solver_residual_norm` metric (<= 1 means converged).
 N_NEWTON_STEPS = 16
-SOLVER_RESIDUAL_TOL = 2.5   # pN — above the achievable floor for both geometries
 
 # ---------------------------------------------------------------------------
 # CAVEAT 1, ENFORCED: confirm the two presets really do share their kinetics.
@@ -146,8 +145,7 @@ print("STRUCTURE")
 print("=" * 72)
 for name, factory in PRESETS.items():
     static, dynamic = factory()
-    static = static.replace(n_newton_steps=N_NEWTON_STEPS,
-                            solver_residual_tol=SOLVER_RESIDUAL_TOL)
+    static = static.replace(n_newton_steps=N_NEWTON_STEPS)
     topo = SarcTopology.create(nrows=NROWS, ncols=NCOLS,
                                static_params=static, dynamic_params=dynamic)
     topologies[name] = (jax.device_put(topo), static)

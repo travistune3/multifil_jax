@@ -168,14 +168,14 @@ def timestep(state: 'State',
              dt: float,
              K_lat=None,
              d_ref=None,
-             solver_tol: Optional[float] = None,
-             n_cg_steps: int = 6,
-             n_newton_steps: int = 16,
+             n_cg_steps: int,
+             n_newton_steps: int,
              precond_params=None,
              prefactored_precond=None,
              xb_subpop=None,
              tm_subpop=None) -> Tuple['State', jnp.ndarray, jnp.ndarray, float,
-                                       int, KineticsTrace]:
+                                       int, KineticsTrace, jnp.ndarray,
+                                       jnp.ndarray]:
     """Execute one timestep of the half-sarcomere simulation.
 
     Tiered Architecture:
@@ -193,16 +193,15 @@ def timestep(state: 'State',
         dt: Timestep size (ms) -- keyword-only, JIT static
         K_lat: Lattice stiffness (pN/nm). None = fixed LS mode.
         d_ref: Poisson-scaled reference lattice spacing (nm). Required if K_lat is not None.
-        solver_tol: Convergence tolerance (pN). If None, uses constants.solver_tol
         precond_params: Pre-built PreconditionerParams (optional)
         prefactored_precond: Pre-factored Thomas data (optional)
 
     Returns:
         new_state: State after both kinetics and equilibration
         new_rng_key: Advanced RNG key
-        solver_residual: Largest remaining net force on any node (pN). Worth
-            checking — a large value means the reported force is not an
-            equilibrium force.
+        solver_residual: Largest remaining net force on any node (pN). Raw, so
+            it carries units and no scale. Read it against solver_tolerance, or
+            read solver_residual_norm instead.
         new_ls: Lattice spacing used. The solved value in dynamic mode, the
             prescribed one otherwise.
         n_iters: Newton iterations taken, useful for spotting configurations
@@ -211,20 +210,24 @@ def timestep(state: 'State',
             constants, the resolved subpopulation tuple and the closure-tear
             mask. Feed it straight to compute_all_metrics. Within-step only;
             never carry it through a scan. See kinetics_step.
+        solver_residual_norm: max(|F| / tol_vec), dimensionless. <= 1 means
+            converged, in BOTH lattice-spacing modes.
+        solver_tolerance: the axial convergence tolerance actually used (pN).
     """
     state, rng_key, trace = kinetics_step(
         state, constants, drivers, topology, rng_key, dt=dt,
         xb_subpop=xb_subpop, tm_subpop=tm_subpop,
     )
 
-    new_state, solver_residual, new_ls, n_iters = solve_equilibrium(
+    (new_state, solver_residual, new_ls, n_iters,
+     residual_norm, tol_axial) = solve_equilibrium(
         state, trace.constants, topology,
         K_lat=K_lat, d_ref=d_ref,
-        tolerance=solver_tol,
         n_cg_steps=n_cg_steps,
         n_newton_steps=n_newton_steps,
         precond_params=precond_params,
         prefactored_precond=prefactored_precond,
     )
 
-    return new_state, rng_key, solver_residual, new_ls, n_iters, trace
+    return (new_state, rng_key, solver_residual, new_ls, n_iters, trace,
+            residual_norm, tol_axial)

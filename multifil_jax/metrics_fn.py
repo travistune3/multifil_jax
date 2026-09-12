@@ -165,7 +165,8 @@ from typing import Dict, TYPE_CHECKING
 from multifil_jax.kernels.forces import (axial_force_at_mline, xb_axial_force_by_state,
                                          xb_axial_work)
 from multifil_jax.kernels.transitions import xb_expected_crossings
-from multifil_jax.core.state import Drivers, resolve_value, MetricsDict
+from multifil_jax.core.state import (Drivers, resolve_value, MetricsDict,
+                                     thick_axial, thin_axial)
 
 if TYPE_CHECKING:
     from multifil_jax.core.sarc_geometry import SarcTopology
@@ -176,6 +177,7 @@ if TYPE_CHECKING:
 def compute_overlap_tm_fractions(
     state: 'State',
     topology: 'SarcTopology',
+    z_line,
 ) -> Dict[str, jnp.ndarray]:
     """Tropomyosin activation restricted to sites a crossbridge could reach.
 
@@ -203,7 +205,7 @@ def compute_overlap_tm_fractions(
       - at or beyond `crown_offsets.min() - 13.0` (the M-line end of the crown
         span, extended by the myosin head's reach)
       - at or before `crown_offsets.max() + 13.0` (the tip end, same reach)
-      - strictly past the M-line, `thin_axial > 0`
+      - strictly past the M-line, absolute position > 0
 
     The 13.0 nm is the same head reach used in kernels/geometry.py when
     searching for binding partners. The two must agree: if this bound were more
@@ -224,13 +226,15 @@ def compute_overlap_tm_fractions(
         should NOT change with calcium.
     """
     tm_states = state.thin.tm_states
-    thin_axial = state.thin.axial
+    # TRUE positions: both the crown-span window and the M-line gate below are
+    # absolute-coordinate tests, so the displacements have to be lifted first.
+    thin_pos = thin_axial(state, topology, z_line)
 
     near_bound = topology.crown_offsets.min() - 13.0
     far_bound = topology.crown_offsets.max() + 13.0
 
-    in_reach = (thin_axial >= near_bound) & (thin_axial <= far_bound)
-    visible = thin_axial > 0.0
+    in_reach = (thin_pos >= near_bound) & (thin_pos <= far_bound)
+    visible = thin_pos > 0.0
     overlap_mask = in_reach & visible
 
     n_overlap_sites = jnp.sum(overlap_mask).astype(jnp.float32)
@@ -260,6 +264,8 @@ def compute_all_metrics(
     dt: float,
     trace: 'KineticsTrace',
     delta_z: jnp.ndarray,
+    solver_residual_norm: jnp.ndarray,
+    solver_tolerance: jnp.ndarray,
 ) -> 'MetricsDict':
     """Compute all metrics for a single timestep.
 
@@ -285,7 +291,13 @@ def compute_all_metrics(
             actually drove this step.
         delta_z: scalar z-line displacement applied at the START of this step
             (nm). Negative is shortening. Needed for `sarcomere_work` and for
-            nothing else.
+            nothing else — it no longer moves anything, because thin
+            displacements are measured from a Z-disc-anchored frame.
+        solver_residual_norm: max(|F| / tol_vec) from the solve. Dimensionless,
+            <= 1 when converged, and the only such number that is sufficient in
+            both lattice-spacing modes.
+        solver_tolerance: the axial convergence tolerance used (pN), so the raw
+            residual can be read against a physical scale.
 
     THE TWO CONSTANTS OBJECTS DIFFER ON PURPOSE. `constants`/`drivers` carry the
     SOLVED lattice spacing, and the mechanics metrics must use them —
@@ -308,8 +320,10 @@ def compute_all_metrics(
 
     n_total_xb = jnp.float32(jnp.size(new_xb))
 
+    z_line_for_pos = resolve_value(drivers.z_line, constants.z_line)
     f_xb_loose, f_xb_tight_1, f_xb_tight_2 = xb_axial_force_by_state(
-        new_state.thick.axial, new_state.thin.axial, new_xb,
+        thick_axial(new_state, topology),
+        thin_axial(new_state, topology, z_line_for_pos), new_xb,
         new_state.thick.xb_bound_to,
         resolve_value(drivers.lattice_spacing, constants.lattice_spacing),
         constants, topology)
@@ -339,7 +353,7 @@ def compute_all_metrics(
     n_tm_2 = jnp.sum(new_tm == 2).astype(jnp.float32)
     n_tm_3 = jnp.sum(new_tm == 3).astype(jnp.float32)
     actin_permissiveness = jnp.mean((new_state.thin.tm_states == 3).astype(jnp.float32))
-    overlap_tm_fractions = compute_overlap_tm_fractions(new_state, topology)
+    overlap_tm_fractions = compute_overlap_tm_fractions(new_state, topology, z_line)
 
     # ========================================================================
     # TRANSITION EVENT COUNTS
@@ -383,42 +397,42 @@ def compute_all_metrics(
     # ========================================================================
     # DISPLACEMENT STATISTICS
     # ========================================================================
-    thick_axial = new_state.thick.axial
-    thin_axial = new_state.thin.axial
-
-    thick_rest_positions = topology.crown_offsets
-    thick_displacement = thick_axial - thick_rest_positions
-    thick_displace_flat = thick_displacement.flatten()
-
-    thin_rest_positions = jnp.cumsum(topology.binding_rests, axis=1)
-    thin_displacement = thin_axial - thin_rest_positions
-    thin_displace_flat = thin_displacement.flatten()
+    # Both are now read straight off the state, which IS a displacement.
+    #
+    # `thin_displace_*` MOVED when this landed, and the old values were wrong.
+    # The previous form subtracted `cumsum(binding_rests)`, an M-line-cumulative
+    # frame, from thin positions that are built in the Z-line frame; the two
+    # differ by a constant offset that the metric silently carried. The stored
+    # displacement is measured from the frame the filament is actually built in.
+    thick_displace_flat = new_state.thick.displacement.flatten()
+    thin_displace_flat = new_state.thin.displacement.flatten()
 
     # ========================================================================
     # ENERGY METRICS
     # ========================================================================
     k_thick = constants.thick_k
-    L0_thick = topology.crown_offsets[:, 0]
-    x1 = new_state.thick.axial[:, 0]
-    thick_energy_first = 0.5 * k_thick * (x1 - L0_thick)**2
+    # The first backbone spring's extension IS the first crown's displacement:
+    # crown_offsets[:, 0] is the bare-zone rest length it is measured from.
+    u1 = new_state.thick.displacement[:, 0]
+    thick_energy_first = 0.5 * k_thick * u1**2
     thick_energy_first_avg = jnp.mean(thick_energy_first)
 
-    x1_old = old_state.thick.axial[:, 0]
-    thick_energy_first_old = 0.5 * k_thick * (x1_old - L0_thick)**2
+    u1_old = old_state.thick.displacement[:, 0]
+    thick_energy_first_old = 0.5 * k_thick * u1_old**2
     thick_energy_first_delta_avg = jnp.mean(thick_energy_first - thick_energy_first_old)
 
     # Titin energy
     a_tit = constants.titin_a
     b_tit = constants.titin_b
     L0_tit = constants.titin_rest
-    thick_tip_new = new_state.thick.axial[:, -1]
+    thick_tip_new = thick_axial(new_state, topology)[:, -1]
     axial_dist_new = z_line - thick_tip_new
     titin_length_new = jnp.sqrt(axial_dist_new**2 + lattice_spacing**2)
     extension_new = titin_length_new - L0_tit
     titin_energy_new = (a_tit / b_tit) * (jnp.exp(b_tit * extension_new) - 1.0)
     titin_energy_avg = jnp.mean(titin_energy_new)
 
-    thick_tip_old = old_state.thick.axial[:, -1]
+    thick_tip_old = thick_axial(old_state, topology)[:, -1]
     axial_dist_old = z_line - thick_tip_old
     titin_length_old = jnp.sqrt(axial_dist_old**2 + lattice_spacing**2)
     extension_old = titin_length_old - L0_tit
@@ -445,19 +459,24 @@ def compute_all_metrics(
     #    shipping it is a convenience and an anchor for the documentation, not
     #    independent information.
     #
-    # old_state.thick.axial IS the pre-solve thick position: between the
-    # previous step's solve and this one the only change is the z-line shift,
-    # which touches thin.axial alone, and no kinetics call moves a filament.
+    # `old_state` IS the pre-solve configuration: no kinetics call moves a
+    # filament, and the z-line shift no longer moves one either — the thin
+    # frame is Z-disc-anchored, so reconstructing the OLD displacements at the
+    # NEW z_line gives exactly the pre-solve absolute positions. (That is the
+    # same number the explicit `thin.axial + dz` used to produce; the invariant
+    # this comment used to assert is now true by construction.)
     ls_old = trace.constants.lattice_spacing
     work_xb = xb_axial_work(
-        old_state.thick.axial, old_state.thin.axial, ls_old,
-        new_state.thick.axial, new_state.thin.axial, lattice_spacing,
+        thick_axial(old_state, topology),
+        thin_axial(old_state, topology, z_line_for_pos), ls_old,
+        thick_axial(new_state, topology),
+        thin_axial(new_state, topology, z_line_for_pos), lattice_spacing,
         new_xb, new_state.thick.xb_bound_to, constants, topology)
 
     # An honest trapezoid without carrying a force through the scan.
     # `force_old` is one backbone spring strain and is EXACTLY the previous
-    # step's reported axial_force: dz is applied to thin.axial only, while
-    # axial_force_at_mline reads thick.axial[:, 0].
+    # step's reported axial_force: nothing between the two solves touches the
+    # thick displacements, and axial_force_at_mline reads only those.
     force_old = axial_force_at_mline(old_state, constants, topology)
     sarcomere_work = -0.5 * (force_old + force) * delta_z
 
@@ -551,6 +570,14 @@ def compute_all_metrics(
         # Driver / protocol values
         'axial_force': force,
         'solver_residual': solver_residual,
+        # Raw max|F| above, in pN, kept unchanged. The two below are what make
+        # it readable: `solver_tolerance` gives it a physical scale, and
+        # `solver_residual_norm` is the pass/fail number — <= 1 is converged,
+        # in fixed AND dynamic LS. With `newton_iters` they separate
+        # "converged comfortably", "converged at the wire", "hit the Newton
+        # cap" and "hit the cap against an unreachable target".
+        'solver_residual_norm': solver_residual_norm,
+        'solver_tolerance': solver_tolerance,
         'z_line': z_line,
         'pCa': pCa_val,
         'lattice_spacing': lattice_spacing,
