@@ -493,11 +493,15 @@ def compute_xb_forces_vectorized(
     forces_on_thick_flat = forces_per_crown.sum(axis=-1)
     forces_on_thick = forces_on_thick_flat.reshape(n_thick, n_crowns)
 
-    # REFACTORED: Use segment_sum instead of one_hot matmul
-    # segment_sum uses GPU atomic operations - no huge buffer allocation
+    # UNBOUND HEADS ARE SENT PAST THE END AND DROPPED. They carry zero force, but
+    # left in place they all clip to site 0 of their thin, and invalid heads
+    # share the (0, 0) placeholder, so over half the updates write ONE segment.
+    # A GPU scatter-add that hammers one slot is several times slower than the
+    # same scatter with spread indices, and this runs at every force evaluation
+    # of the Newton/CG loop.
     forces_on_thin_flat = jax.ops.segment_sum(
         -forces,
-        thin_flat_idx,
+        jnp.where(xb_bound_to.reshape(-1) >= 0, thin_flat_idx, n_sites_total),
         num_segments=n_sites_total
     )
     forces_on_thin = forces_on_thin_flat.reshape(n_thin, n_sites)

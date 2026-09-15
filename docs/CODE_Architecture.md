@@ -643,7 +643,8 @@ exponential per caller, never two.
 - `_build_xb_Q_bins(state, constants, topology)` → `(Q_bins, key)`.
   Builds `(2 * n_xb_bins, 6, 6)` rate matrices — one block at permissiveness 0,
   one at permissiveness 1, each evaluated at the `n_xb_bins` axial bin centers.
-  Each XB's `key` comes from `jnp.digitize(axial_dist, xb_bin_edges)` plus its
+  Each XB's `key` is its axial bin — arithmetic on the uniform `xb_bin_edges`,
+  clipped at both ends — plus its
   permissiveness bit. The key depends only on geometry and permissiveness, never
   on rates, so it is shared across subpopulations.
 - `_xb_Q_resolved(...)` → `(Q_bins, key, labels)`. All subpopulation handling

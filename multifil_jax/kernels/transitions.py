@@ -924,14 +924,16 @@ def thin_transitions(state: 'State',
 
     xb_shape = state.thick.xb_states.shape
     xb_flat = state.thick.xb_states.reshape(-1)
-    n_xb = xb_flat.shape[0]
 
-    # thin.bound_to holds a FLAT crossbridge index (assigned from
-    # jnp.arange(n_xb_total)), so scatter the per-site flag onto heads by that
-    # index. Scatter-MAX, not add: unbound and unaffected sites clip to head 0
-    # and contribute 0, which cannot raise the flag of a head that did not move.
-    idx = jnp.clip(bound_to.reshape(-1), 0, n_xb - 1)
-    hit = jnp.zeros(n_xb, jnp.int32).at[idx].max(left.astype(jnp.int32)) == 1
+    # A bound head is torn when the site it holds left the open state. One
+    # GATHER per head, not a scatter of the per-site flag onto heads: in that
+    # form every unbound site clipped to head 0, so nearly all updates wrote one
+    # slot, which is the slow path for a GPU scatter. The two binding records
+    # agree (thick_transitions keeps them so), so reading the site from the head
+    # side is the same set of heads.
+    xb_site = state.thick.xb_bound_to.reshape(-1)
+    hit = (xb_site >= 0) & left[topology.xb_to_thin_id * n_sites
+                                + jnp.clip(xb_site, 0, n_sites - 1)]
 
     # WHERE A TORN HEAD LANDS. A Loose (state 1) head is still primed —
     # A.M.ADP.Pi, nothing spent — so it goes to state 0 DRX and owes nothing. A
@@ -945,9 +947,9 @@ def thin_transitions(state: 'State',
     # a genuine refund.
     #
     # >>> WRITTEN AS `(s == 2) | (s == 3) -> 4, else 0`, NEVER AS
-    #     `weak -> 0, else -> 4`. `hit` is raised from thin.bound_to, and if
-    #     that record were ever stale — a site naming a head whose own
-    #     xb_bound_to is already -1 — the "else" form would push an already
+    #     `weak -> 0, else -> 4`. `hit` is raised from the two binding records
+    #     together, and if they were ever stale — a head's xb_bound_to naming a
+    #     site that no longer names it — the "else" form would push an already
     #     detached head into Free_2 and charge it an ATP it never spent. Testing
     #     the states that actually owe one cannot do that. The two-sided binding
     #     invariant that makes such a record impossible is asserted by
@@ -1215,7 +1217,7 @@ def _build_xb_Q_bins(
     permissiveness 1. Each head is then assigned the index of the cell it falls
     in, and gathers from there.
 
-    Bin assignment uses jnp.digitize against topology.xb_bin_edges, clipped at
+    Bin assignment is arithmetic on the uniform topology.xb_bin_edges, clipped at
     both ends — heads outside the grid range are treated as if at the nearest
     edge. Since the bin range is chosen to bracket reachable distances, and
     binding probability decays sharply outside it, that clipping affects only
@@ -1306,9 +1308,11 @@ def _build_xb_Q_bins(
     # Layout: [0..n_bins-1] = AP=0, [n_bins..2*n_bins-1] = AP=1
     Q_bins = jnp.concatenate([Q_ap0, Q_ap1], axis=0)         # (2*n_bins, 6, 6)
 
-    # Assign each XB to a bin via digitize + clip
+    # Assign each XB to a bin. The edges are uniform (a linspace), so the bin is
+    # arithmetic, not a binary search: ~30x cheaper on GPU at 25,600 heads.
     x_axial = xb_distances_flat[:, 0]                              # (n_xb_total,)
-    bin_idx = jnp.digitize(x_axial, topology.xb_bin_edges) - 1    # in [-1, n_bins]
+    edges = topology.xb_bin_edges
+    bin_idx = jnp.floor((x_axial - edges[0]) * (n_bins / (edges[-1] - edges[0]))).astype(jnp.int32)
     bin_idx = jnp.clip(bin_idx, 0, n_bins - 1)
 
     ap  = permissiveness.astype(jnp.int32)                         # 0 or 1
@@ -1650,11 +1654,12 @@ def thick_transitions(state: 'State',
         # occupied at the start of the step, so the loser of a same-step
         # collision kept a bound state and an `xb_bound_to` pointing at a site
         # another head owned: two heads on one site, both exerting force.
-        # Non-binders contribute the `n_xb_total` sentinel, which no real head
-        # index can reach, so they can never win and never touch the array —
-        # which is why the write-back of the existing value is gone.
-        winner = jnp.full(n_sites_total, n_xb_total, jnp.int32).at[site_flat].min(
-            jnp.where(can_bind, xb_indices_arr, n_xb_total))
+        # Non-binders are sent past the end and dropped, so they can never win
+        # and never touch the array. Dropping rather than writing a sentinel
+        # also keeps them off the few sites they would otherwise pile onto
+        # (invalid heads all name thin 0), which is the slow path for a GPU scatter.
+        winner = jnp.full(n_sites_total, n_xb_total, jnp.int32).at[
+            jnp.where(can_bind, site_flat, n_sites_total)].min(xb_indices_arr)
         won = can_bind & (winner[site_flat] == xb_indices_arr)
 
         new_xb_bound_to_flat = jnp.where(
@@ -1679,10 +1684,12 @@ def thick_transitions(state: 'State',
         # scatter.
         really_unbinding = is_unbinding & (xb_bound_to_flat >= 0)
         old_thin_indices = topology.xb_to_thin_id
+        # Only heads really unbinding scatter; the rest are sent past the end and
+        # dropped (left in place, every unbound head lands on site 0 of its thin).
         old_site_flat = (old_thin_indices * n_sites
                          + jnp.clip(xb_bound_to_flat, 0, n_sites - 1))
-        clear_site = jnp.zeros(n_sites_total, jnp.int32).at[old_site_flat].max(
-            really_unbinding.astype(jnp.int32)) == 1
+        clear_site = jnp.zeros(n_sites_total, jnp.int32).at[
+            jnp.where(really_unbinding, old_site_flat, n_sites_total)].max(1) == 1
         new_thin_bound_to_flat = jnp.where(clear_site, -1, thin_bound_to_flat)
 
         # STEP 2: record the winners. `winner` is already a per-SITE array, so
