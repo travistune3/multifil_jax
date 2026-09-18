@@ -452,9 +452,27 @@ def get_bucket_size(actual_size: int) -> int:
 # When to split a padded batch into sequential chunks: (min_batch, chunk_size).
 #
 # Chunking is primarily a MEMORY control, not a speed one. Every simulation
-# accumulates all 52 metrics at every timestep, so peak GPU memory scales as
+# accumulates all 63 metrics at every timestep, so peak GPU memory scales as
 #
-#     peak VRAM (GB) ~ minibatch_size * n_steps * 52 * 4 bytes * 2 / 1e9
+#     peak VRAM (GB) ~ minibatch_size * n_steps * 63 * 4 bytes * 2 / 1e9
+#
+# A CHUNKED RUN ACCUMULATES ON THE HOST, NOT THE DEVICE — see the chunk loop in
+# run(). Chunking alone never bounded the total: every chunk stayed resident and
+# the concatenate then built a second full copy, so a big sweep finished its
+# compute and died assembling the result. Measured 63 metrics x 4 bytes = 252
+# bytes per sim per timestep (2026-09-17), so 67k sims over 1200 steps wanted
+# 20 GB, twice, on a 24 GB card.
+#
+# >>> THE HOST FIX TRADES A GPU LIMIT FOR A HOST-RAM LIMIT, AND THAT IS NOT A
+#     REAL SOLUTION. A 236k-sim x 1200-step grid still needs ~71 GB of system
+#     RAM to hold traces the caller usually reduces to one scalar per sim and
+#     throws away. It works here (125 GB under WSL2) and it will not work on a
+#     normal machine. The durable fix is to stop materialising what nobody
+#     wants — reduce each chunk's time axis before accumulating it — which is
+#     deliberately NOT done here because doing it inside the kernel changes its
+#     output signature and reintroduces the per-metric-list recompile that got
+#     explicit metric selection removed in the first place. Revisit with that
+#     constraint in mind. <<<
 #
 # — roughly 1.5 GB of metrics for 4096 simulations over 1000 steps, and about
 # twice that in total. On an 8 GB card a long simulation at large batch will run
@@ -1087,12 +1105,13 @@ def run(
     chunk_size = resolved_minibatch if use_minibatch else padded_batch
     if use_minibatch and verbose:
         print(f"Minibatching: {padded_batch // chunk_size} chunks of {chunk_size}")
-    chunks = []
-    for start in range(0, padded_batch, chunk_size):
+    starts = list(range(0, padded_batch, chunk_size))
+
+    def _run_chunk(start):
         end = start + chunk_size
         chunk_subpop = (None if not is_subpop_active
                         else jax.tree_util.tree_map(lambda x, s=start, e=end: x[s:e], subpop_arrays))
-        chunks.append(_run_sim_kernel(
+        return _run_sim_kernel(
             topology=topology,
             batched_params=jax.tree_util.tree_map(lambda x, s=start, e=end: x[s:e], batched_params),
             z_batched=z_batched[start:end],
@@ -1103,14 +1122,37 @@ def run(
             nu_batched=nu_batched[start:end],
             subpop_arrays=chunk_subpop,
             **kernel_kwargs,
-        ))
-    if len(chunks) == 1:
-        batched_metrics = chunks[0]
+        )
+
+    # ONE CHUNK: unchanged, and stays on the device. The overwhelming majority
+    # of runs land here, and a host round-trip would tax all of them to fix a
+    # problem only the chunked path has.
+    chunk_maxima = None
+    if len(starts) == 1:
+        batched_metrics = _run_chunk(starts[0])
     else:
-        batched_metrics = MetricsDict({
-            k: jnp.concatenate([c[k] for c in chunks], axis=0)
-            for k in chunks[0]
-        })
+        # MANY CHUNKS: accumulate on the HOST, into a buffer allocated ONCE.
+        # Preallocation is the whole trick. Appending to a list and calling
+        # np.concatenate at the end would peak at twice the final size, which
+        # is the exact bug this replaces, moved one level down.
+        batched_metrics = None
+        chunk_maxima = {k: -float('inf') for k in ('solver_residual',
+                                                   'solver_residual_norm')}
+        for start in starts:
+            chunk = _run_chunk(start)
+            if batched_metrics is None:
+                batched_metrics = MetricsDict({
+                    k: np.empty((padded_batch,) + v.shape[1:], dtype=v.dtype)
+                    for k, v in chunk.items()})
+            # The convergence maxima are taken PER CHUNK, on the device, while
+            # the chunk is still there. Reducing the assembled host array later
+            # would drag every byte back across the bus.
+            for k in chunk_maxima:
+                chunk_maxima[k] = max(chunk_maxima[k], float(jnp.max(chunk[k])))
+            for k, v in chunk.items():
+                host = np.asarray(v)
+                batched_metrics[k][start:start + host.shape[0]] = host
+            del chunk, host      # release the device buffer before the next one
 
     # Slice back to actual batch size
     if padded_batch > total_batch:
@@ -1131,8 +1173,13 @@ def run(
     # any stiffness. The old absolute-pN threshold was a third copy of the
     # float32 coordinate floor and moved with thick_k rather than with the
     # physics; see kernels/solver._convergence_tolerance.
-    max_residual = float(jnp.max(reshaped_metrics['solver_residual']))
-    max_norm = float(jnp.max(reshaped_metrics['solver_residual_norm']))
+    if chunk_maxima is not None:
+        # Already reduced per chunk, on the device, during accumulation.
+        max_residual = chunk_maxima['solver_residual']
+        max_norm = chunk_maxima['solver_residual_norm']
+    else:
+        max_residual = float(jnp.max(reshaped_metrics['solver_residual']))
+        max_norm = float(jnp.max(reshaped_metrics['solver_residual_norm']))
     if max_norm > 1.0:
         import warnings
         warnings.warn(
