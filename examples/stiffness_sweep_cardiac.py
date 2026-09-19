@@ -1,4 +1,5 @@
-"""Stiffness sweep with cardiac params, plotting thick_energy_first_delta_avg."""
+"""Stiffness sweep with cardiac params, plotting the per-step change in
+the first backbone spring's elastic energy."""
 
 import time
 import numpy as np
@@ -40,7 +41,9 @@ print(f"Done in {time.time()-t0:.1f}s")
 
 # ── Extract metric ─────────────────────────────────────────────────────────────
 # Shape: (thick_k, thin_k, replicates, time)
-data = np.array(results.metrics['thick_energy_first_delta_avg'])
+# The per-step CHANGE in that energy is not a metric: it is the first
+# difference of the level trace, which is what np.diff gives here.
+data = np.diff(np.array(results.metrics['thick_energy_first_avg']), axis=-1)
 
 # Steady-state mean: last 100 timesteps, averaged over replicates and time
 steady = data[..., -200:].mean(axis=(-1, -2))   # (thick_k, thin_k)
@@ -55,7 +58,7 @@ im = ax.imshow(
     extent=[thick_sweep[0], thick_sweep[-1], thin_sweep[0], thin_sweep[-1]],
     cmap='RdBu_r',
 )
-fig.colorbar(im, ax=ax, label='thick_energy_first_delta_avg (pN·nm)')
+fig.colorbar(im, ax=ax, label='Δ thick_energy_first_avg per step (pN·nm)')
 
 ax.set_xlabel('thick_k (pN/nm)')
 ax.set_ylabel('thin_k (pN/nm)')

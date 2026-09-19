@@ -21,10 +21,13 @@ summed over crossbridges — see kernels/forces.axial_force_at_mline. It include
 titin, which at long sarcomere lengths can exceed the active contribution
 entirely. Subtract a relaxed (pCa 9) baseline before interpreting active force.
 
-Occupancy metrics come in two flavours. The plain `frac_tm_*` fractions average
-over every site on the filament; the `*_overlap` variants average only over
-sites a crossbridge could reach. Prefer the latter when comparing across
-geometries — see compute_overlap_tm_fractions() for why the difference bites.
+Occupancy is exported as COUNTS (`n_xb_*`, `n_tm_state_*`) plus the two
+`*_overlap` FRACTIONS. The all-site fractions are not exported because they are
+the counts over a constant — divide by `topology_config['total_xbs']` or by
+`n_thin * n_sites`. The `*_overlap` variants cannot be recovered that way: they
+average only over sites a crossbridge could reach, and their denominator moves
+with the geometry. Prefer them when comparing across geometries — see
+compute_overlap_tm_fractions() for why the difference bites.
 
 ATP consumption is reported two ways, which will not agree exactly, and should
 not:
@@ -91,7 +94,6 @@ THE CYCLE FLUXES ARE EXPORTED TOO, so the ATP books self-verify on any run
 instead of needing a spy script. All are exact expected crossing counts per step
 (see kernels/transitions.xb_expected_crossings):
 
-    xb_detach_atp        N34, the Q-route ATP-consuming detachment alone
     xb_detach_free       N10, a Loose head falling off having never bound ATP
     xb_give_up           N21, and this is NOT A DETACHMENT — see below
     atp_net_pi_release   N12 - N21, which must equal atp_expected at steady
@@ -162,8 +164,7 @@ import jax
 import jax.numpy as jnp
 from typing import Dict, TYPE_CHECKING
 
-from multifil_jax.kernels.forces import (axial_force_at_mline, xb_axial_force_by_state,
-                                         xb_axial_work)
+from multifil_jax.kernels.forces import xb_axial_force_by_state, xb_axial_work
 from multifil_jax.kernels.transitions import xb_expected_crossings
 from multifil_jax.core.state import (Drivers, resolve_value, MetricsDict,
                                      thick_axial, thin_axial)
@@ -181,9 +182,9 @@ def compute_overlap_tm_fractions(
 ) -> Dict[str, jnp.ndarray]:
     """Tropomyosin activation restricted to sites a crossbridge could reach.
 
-    THE PROBLEM THIS SOLVES. The plain `frac_tm_state_3` metric averages over
-    every tropomyosin site on every thin filament. Many of those sites can never
-    host a crossbridge no matter how activated they are:
+    THE PROBLEM THIS SOLVES. An all-site activated fraction — `n_tm_state_3`
+    over every tropomyosin site on every thin filament — averages over sites
+    that can never host a crossbridge no matter how activated they are:
 
       - sites opposite the thick filament's bare zone, where there are no crowns
       - sites beyond the tip of the thick filament, past the end of the overlap
@@ -220,7 +221,6 @@ def compute_overlap_tm_fractions(
       - frac_tm_state_2_overlap: Ca-open fraction. Responds earlier than
         state 3 and is the more direct readout of cooperative propagation.
       - frac_tm_state_3_overlap: fully open, crossbridge-bindable fraction.
-      - frac_tm_available_overlap: states 2 and 3 combined.
       - n_overlap_sites: the denominator, worth checking when a result surprises
         you — it should change with sarcomere length and filament geometry, and
         should NOT change with calcium.
@@ -247,7 +247,6 @@ def compute_overlap_tm_fractions(
     return {
         'frac_tm_state_2_overlap': n_state_2 / n_overlap_sites,
         'frac_tm_state_3_overlap': n_state_3 / n_overlap_sites,
-        'frac_tm_available_overlap': (n_state_2 + n_state_3) / n_overlap_sites,
         'n_overlap_sites': n_overlap_sites,
     }
 
@@ -263,7 +262,6 @@ def compute_all_metrics(
     newton_iters,
     dt: float,
     trace: 'KineticsTrace',
-    delta_z: jnp.ndarray,
     solver_residual_norm: jnp.ndarray,
     solver_tolerance: jnp.ndarray,
 ) -> 'MetricsDict':
@@ -289,10 +287,6 @@ def compute_all_metrics(
             optional: every realised transition count and every Q-matrix metric
             below reads it, because those are the state and the generator that
             actually drove this step.
-        delta_z: scalar z-line displacement applied at the START of this step
-            (nm). Negative is shortening. Needed for `sarcomere_work` and for
-            nothing else — it no longer moves anything, because thin
-            displacements are measured from a Z-disc-anchored frame.
         solver_residual_norm: max(|F| / tol_vec) from the solve. Dimensionless,
             <= 1 when converged, and the only such number that is sufficient in
             both lattice-spacing modes.
@@ -318,8 +312,6 @@ def compute_all_metrics(
     mid_xb = trace.state.thick.xb_states
     new_tm = new_state.thin.tm_states
 
-    n_total_xb = jnp.float32(jnp.size(new_xb))
-
     z_line_for_pos = resolve_value(drivers.z_line, constants.z_line)
     f_xb_loose, f_xb_tight_1, f_xb_tight_2 = xb_axial_force_by_state(
         thick_axial(new_state, topology),
@@ -327,11 +319,9 @@ def compute_all_metrics(
         new_state.thick.xb_bound_to,
         resolve_value(drivers.lattice_spacing, constants.lattice_spacing),
         constants, topology)
-    n_total_tm = jnp.float32(jnp.size(new_tm))
 
     # Resolve driver values
     z_line = resolve_value(drivers.z_line, constants.z_line)
-    pCa_val = resolve_value(drivers.pCa, constants.pCa)
     lattice_spacing = resolve_value(drivers.lattice_spacing, constants.lattice_spacing)
 
     # ========================================================================
@@ -343,7 +333,6 @@ def compute_all_metrics(
     n_tight_2 = jnp.sum(new_xb == 3).astype(jnp.float32)
     n_free_2 = jnp.sum(new_xb == 4).astype(jnp.float32)
     n_srx = jnp.sum(new_xb == 5).astype(jnp.float32)
-    n_bound = jnp.sum((new_xb >= 1) & (new_xb <= 3)).astype(jnp.float32)
 
     # ========================================================================
     # TROPOMYOSIN STATE COUNTS
@@ -352,7 +341,6 @@ def compute_all_metrics(
     n_tm_1 = jnp.sum(new_tm == 1).astype(jnp.float32)
     n_tm_2 = jnp.sum(new_tm == 2).astype(jnp.float32)
     n_tm_3 = jnp.sum(new_tm == 3).astype(jnp.float32)
-    actin_permissiveness = jnp.mean((new_state.thin.tm_states == 3).astype(jnp.float32))
     overlap_tm_fractions = compute_overlap_tm_fractions(new_state, topology, z_line)
 
     # ========================================================================
@@ -417,10 +405,6 @@ def compute_all_metrics(
     thick_energy_first = 0.5 * k_thick * u1**2
     thick_energy_first_avg = jnp.mean(thick_energy_first)
 
-    u1_old = old_state.thick.displacement[:, 0]
-    thick_energy_first_old = 0.5 * k_thick * u1_old**2
-    thick_energy_first_delta_avg = jnp.mean(thick_energy_first - thick_energy_first_old)
-
     # Titin energy
     a_tit = constants.titin_a
     b_tit = constants.titin_b
@@ -452,12 +436,11 @@ def compute_all_metrics(
     #    from the returned traces — it has to be computed here. This is the
     #    numerator for an efficiency, because ATP is spent by crossbridges.
     #
-    # 2. sarcomere_work: work done externally by the half-sarcomere at the
-    #    driven z-line, -F*dz, positive when shortening against tension. This
-    #    one IS exactly reconstructible afterwards from the axial_force and
-    #    z_line traces (docs/README.md section 6 gives the expression);
-    #    shipping it is a convenience and an anchor for the documentation, not
-    #    independent information.
+    # 2. The EXTERNAL work done by the half-sarcomere at the driven z-line,
+    #    -F*dz, positive when shortening against tension, is NOT exported. It
+    #    is exactly reconstructible afterwards from the axial_force and z_line
+    #    traces (docs/README.md section 6 gives the expression) and is
+    #    identically zero under an isometric hold.
     #
     # `old_state` IS the pre-solve configuration: no kinetics call moves a
     # filament, and the z-line shift no longer moves one either — the thin
@@ -472,13 +455,6 @@ def compute_all_metrics(
         thick_axial(new_state, topology),
         thin_axial(new_state, topology, z_line_for_pos), lattice_spacing,
         new_xb, new_state.thick.xb_bound_to, constants, topology)
-
-    # An honest trapezoid without carrying a force through the scan.
-    # `force_old` is one backbone spring strain and is EXACTLY the previous
-    # step's reported axial_force: nothing between the two solves touches the
-    # thick displacements, and axial_force_at_mline reads only those.
-    force_old = axial_force_at_mline(old_state, constants, topology)
-    sarcomere_work = -0.5 * (force_old + force) * delta_z
 
     # ========================================================================
     # ATP AND THE CYCLE FLUXES — exact expected crossing counts
@@ -555,14 +531,6 @@ def compute_all_metrics(
     # shrink because this sum became exact — only halving dt tests it.
     atp_expected = n_tear_strong + N34
 
-    # Work per ATP. The numerator is the CROSSBRIDGE work, because ATP is spent
-    # by crossbridges — and because it stays meaningful under an isometric hold,
-    # where external work is exactly zero while heads are still cycling and
-    # spending. For whole-sarcomere efficiency divide the two exported keys
-    # yourself: sarcomere_work / atp_expected. There is no third key for it.
-    xb_work_per_atp = jnp.where(atp_expected > 0.01,
-                                work_xb / atp_expected, 0.0)
-
     # ========================================================================
     # ASSEMBLE RESULT DICT (fixed keys — same pytree every call)
     # ========================================================================
@@ -578,12 +546,15 @@ def compute_all_metrics(
         # cap" and "hit the cap against an unreachable target".
         'solver_residual_norm': solver_residual_norm,
         'solver_tolerance': solver_tolerance,
-        'z_line': z_line,
-        'pCa': pCa_val,
+        # The PRESCRIBED z_line and pCa are already first-class fields on
+        # SimulationResult (result.z_line / result.pCa) and were bit-identical
+        # here, so they are not duplicated as metrics. `lattice_spacing` IS
+        # kept: result.lattice_spacing is the prescribed d0, this is the SOLVED
+        # d, and under dynamic LS they differ.
         'lattice_spacing': lattice_spacing,
 
-        # Crossbridge state counts
-        'n_bound': n_bound,
+        # Crossbridge state counts. n_bound is not exported — it is exactly
+        # loose + tight_1 + tight_2.
         'n_xb_drx': n_drx,
         'n_xb_loose': n_loose,
         'n_xb_tight_1': n_tight_1,
@@ -600,30 +571,18 @@ def compute_all_metrics(
         'force_xb_tight_1': f_xb_tight_1,
         'force_xb_tight_2': f_xb_tight_2,
 
-        # Crossbridge state fractions
-        'frac_xb_bound': n_bound / n_total_xb,
-        'frac_xb_drx': n_drx / n_total_xb,
-        'frac_xb_loose': n_loose / n_total_xb,
-        'frac_xb_tight_1': n_tight_1 / n_total_xb,
-        'frac_xb_tight_2': n_tight_2 / n_total_xb,
-        'frac_xb_free_2': n_free_2 / n_total_xb,
-        'frac_xb_srx': n_srx / n_total_xb,
-
         # TM state counts
         'n_tm_state_0': n_tm_0,
         'n_tm_state_1': n_tm_1,
         'n_tm_state_2': n_tm_2,
         'n_tm_state_3': n_tm_3,
 
-        # TM state fractions
-        'frac_tm_state_0': n_tm_0 / n_total_tm,
-        'frac_tm_state_1': n_tm_1 / n_total_tm,
-        'frac_tm_state_2': n_tm_2 / n_total_tm,
-        'frac_tm_state_3': n_tm_3 / n_total_tm,
-        'actin_permissiveness': actin_permissiveness,
+        # TM occupancy over sites a crossbridge could actually reach. The
+        # all-site fractions are not exported: divide the counts above by
+        # n_thin * n_sites. `frac_tm_available_overlap` is likewise just the
+        # sum of the two below.
         'frac_tm_state_2_overlap': overlap_tm_fractions['frac_tm_state_2_overlap'],
         'frac_tm_state_3_overlap': overlap_tm_fractions['frac_tm_state_3_overlap'],
-        'frac_tm_available_overlap': overlap_tm_fractions['frac_tm_available_overlap'],
         'n_overlap_sites': overlap_tm_fractions['n_overlap_sites'],
 
         # Transition events
@@ -650,18 +609,21 @@ def compute_all_metrics(
 
         # Energy metrics
         'thick_energy_first_avg': thick_energy_first_avg,
-        'thick_energy_first_delta_avg': thick_energy_first_delta_avg,
         'titin_energy_avg': titin_energy_avg,
         'titin_energy_delta_avg': titin_energy_delta_avg,
 
-        # Work metrics (pN*nm). Different quantities — see the WORK METRICS
-        # block above and docs/README.md section 6.
+        # Work done ON the lattice BY the crossbridges (pN*nm) — see the WORK
+        # METRICS block above and docs/README.md section 6. `sarcomere_work`,
+        # the EXTERNAL work, is not exported: it is exactly
+        # -0.5*(F[t-1]+F[t])*dz from the axial_force and z_line traces, and is
+        # identically zero under an isometric hold.
         'xb_work_on_filaments': work_xb,
-        'sarcomere_work': sarcomere_work,
 
-        # ATP expected metrics
+        # ATP expected metrics. There is no xb_work_per_atp key: a per-step
+        # ratio cannot be time-averaged (mean(w/a) != mean(w)/mean(a), measured
+        # +15.7% at pCa 6.2). Reduce the numerator and denominator over the
+        # window and divide afterwards.
         'atp_expected': atp_expected,
-        'xb_work_per_atp': xb_work_per_atp,
 
         # THE CYCLE FLUXES, as exact expected crossing counts per step. Each is
         # summed over every head from its own mid state and its own generator;
@@ -669,11 +631,6 @@ def compute_all_metrics(
         # the model reads them — and they exist so the ATP books can be checked
         # on any run instead of needing a spy script.
         #
-        # `xb_detach_atp` is the Q-route ATP-consuming detachment ALONE, i.e.
-        # atp_expected minus the closure charge. Exported so the composition
-        # of the ATP number is visible without doing arithmetic against
-        # closure_detach_atp.
-        'xb_detach_atp': N34,
         # A Loose head falling off having never bound ATP: an ordinary failed
         # weak attachment, NOT a load-driven event, and it costs nothing.
         'xb_detach_free': N10,

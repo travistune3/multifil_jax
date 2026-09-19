@@ -140,7 +140,7 @@ print(results.summary())
 # Generate corner plot
 
 # Derived metric
-# results.metrics['energy_per_atp'] = results.metrics['thick_energy_first_delta_avg'] / results.metrics['atp_expected']
+# energy per ATP = np.diff(results.metrics['thick_energy_first_avg'], axis=-1) / results.metrics['atp_expected'][..., 1:]
 # results.metrics['solver_residual'] = results.solver_residual
 
 plot_metric_corner(results, metric_name='axial_force', last_n=900)

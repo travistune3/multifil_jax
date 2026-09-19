@@ -452,19 +452,20 @@ def get_bucket_size(actual_size: int) -> int:
 # When to split a padded batch into sequential chunks: (min_batch, chunk_size).
 #
 # Chunking is primarily a MEMORY control, not a speed one. Every simulation
-# accumulates all 63 metrics at every timestep, so peak GPU memory scales as
+# accumulates all 43 metrics at every timestep, so peak GPU memory scales as
 #
-#     peak VRAM (GB) ~ minibatch_size * n_steps * 63 * 4 bytes * 2 / 1e9
+#     peak VRAM (GB) ~ minibatch_size * n_steps * 43 * 4 bytes * 2 / 1e9
 #
 # A CHUNKED RUN ACCUMULATES ON THE HOST, NOT THE DEVICE — see the chunk loop in
 # run(). Chunking alone never bounded the total: every chunk stayed resident and
 # the concatenate then built a second full copy, so a big sweep finished its
-# compute and died assembling the result. Measured 63 metrics x 4 bytes = 252
-# bytes per sim per timestep (2026-09-17), so 67k sims over 1200 steps wanted
-# 20 GB, twice, on a 24 GB card.
+# compute and died assembling the result. 43 metrics x 4 bytes = 172 bytes per
+# sim per timestep, so 67k sims over 1200 steps wants 13.9 GB, twice, on a
+# 24 GB card. (It was 252 bytes over 63 metrics until 2026-09-19, when the 20
+# reconstructible ones were deleted — a 1.5x reduction, not a fix.)
 #
 # >>> THE HOST FIX TRADES A GPU LIMIT FOR A HOST-RAM LIMIT, AND THAT IS NOT A
-#     REAL SOLUTION. A 236k-sim x 1200-step grid still needs ~71 GB of system
+#     REAL SOLUTION. A 236k-sim x 1200-step grid still needs ~49 GB of system
 #     RAM to hold traces the caller usually reduces to one scalar per sim and
 #     throws away. It works here (125 GB under WSL2) and it will not work on a
 #     normal machine. The durable fix is to stop materialising what nobody
@@ -474,7 +475,7 @@ def get_bucket_size(actual_size: int) -> int:
 #     explicit metric selection removed in the first place. Revisit with that
 #     constraint in mind. <<<
 #
-# — roughly 1.5 GB of metrics for 4096 simulations over 1000 steps, and about
+# — roughly 0.7 GB of metrics for 4096 simulations over 1000 steps, and about
 # twice that in total. On an 8 GB card a long simulation at large batch will run
 # out of memory without chunking. Since each chunk calls the same compiled
 # kernel, splitting costs no recompilation.
@@ -677,7 +678,6 @@ def _run_sim_kernel(
         )
         prefactored_precond = build_prefactored_preconditioner(precond_params)
 
-        delta_z = jnp.concatenate([jnp.zeros(1), jnp.diff(z_trace)])
         l0 = z_trace[0]  # reference z for Poisson scaling
 
         # Subpopulation: build the K unscaled population constants once per sim
@@ -703,12 +703,14 @@ def _run_sim_kernel(
 
         def scan_fn(carry, inputs):
             old_state, k, current_ls = carry
-            z_val, pCa_val, ls_val, dz = inputs
+            z_val, pCa_val, ls_val = inputs
 
-            # NO THIN POSITION SHIFT. Thin displacements are measured from a
-            # Z-disc-anchored rest frame, so the filament moves rigidly with
-            # the Z-line by construction and there is nothing to update. `dz`
-            # is still needed, but only by sarcomere_work.
+            # NO THIN POSITION SHIFT, AND NO dz. Thin displacements are
+            # measured from a Z-disc-anchored rest frame, so the filament moves
+            # rigidly with the Z-line by construction and there is nothing to
+            # update. The per-step z-line displacement is not carried either:
+            # its only reader was `sarcomere_work`, and that is reconstructed
+            # after the fact from the axial_force and z_line traces.
 
             if is_dynamic_ls:
                 drivers = Drivers(pCa=pCa_val, z_line=z_val, lattice_spacing=current_ls)
@@ -742,7 +744,7 @@ def _run_sim_kernel(
 
             all_metrics = compute_all_metrics(
                 old_state, new_state, constants_for_metrics, drivers_for_metrics,
-                topology, force, solver_residual, n_iters, dt, trace, dz,
+                topology, force, solver_residual, n_iters, dt, trace,
                 residual_norm, solver_tolerance,
             )
 
@@ -751,7 +753,7 @@ def _run_sim_kernel(
         _, metrics_out = jax.lax.scan(
             scan_fn,
             (state, key, ls_trace[0]),
-            (z_trace, pCa_trace, ls_trace, delta_z),
+            (z_trace, pCa_trace, ls_trace),
             unroll=unroll,
         )
         return metrics_out

@@ -228,11 +228,11 @@ arrays. Every array inside it shares the same shape convention:
 
 For a single simulation with no sweep and `replicates=1`:
 - `result.axial_force` has shape `(1, 1000)` — 1 replicate, 1000 timesteps.
-- `result.metrics['n_bound']` has the same shape.
+- `result.metrics['n_xb_tight_2']` has the same shape.
 
 For a pCa sweep over 5 values with 3 replicates and 1000 steps:
 - `result.axial_force` has shape `(5, 3, 1000)`.
-- `result.metrics['n_bound']` has shape `(5, 3, 1000)`.
+- `result.metrics['n_xb_tight_2']` has shape `(5, 3, 1000)`.
 
 Sweep axes come back in a FIXED internal order, **not** the order you passed
 the arguments in: `z_line`, `pCa`, `lattice_spacing`, then `K_lat`, `nu`, then
@@ -250,10 +250,16 @@ regardless of ordering. `result.coords` maps each axis name to its values.
 primary output of a mechanical simulation. It is a property that returns
 `result.metrics['axial_force']`.
 
-`result.metrics` — a `MetricsDict` containing 63 quantities computed
+`result.metrics` — a `MetricsDict` containing 43 quantities computed
 at every timestep (described fully in the next section). `MetricsDict` supports
-both dict-style access (`result.metrics['n_bound']`) and attribute access
-(`result.metrics.n_bound`).
+both dict-style access (`result.metrics['n_xb_tight_2']`) and attribute access
+(`result.metrics.n_xb_tight_2`).
+
+Every key is INDEPENDENT: nothing in `metrics` can be computed from the other
+keys plus `result.topology_config`. Quantities that could be — the all-site
+occupancy fractions, `n_bound`, `sarcomere_work`, `xb_work_per_atp` and the
+rest — were removed on 2026-09-19 rather than shipped and stored. Where one is
+useful, this document gives the one-line reconstruction.
 
 `result.metrics['solver_residual']` — a diagnostic trace showing how well the
 mechanical equilibrium solver converged at each step. `run()` warns after the
@@ -334,30 +340,36 @@ The six crossbridge states are indexed 0–5:
 | 4 | `'n_xb_free_2'` | just detached, post-ATP |
 | 5 | `'n_xb_srx'` | super-relaxed — parked, not recruitable |
 
-- `'n_bound'` — total crossbridges attached to actin (states 1, 2, and 3)
+Bound heads are states 1–3, so the attached total is
+`n_xb_loose + n_xb_tight_1 + n_xb_tight_2`; there is no `n_bound` key.
 
 The super-relaxed (SRX) state is the model's activation reserve: heads parked
 there cannot bind until calcium recruits them out. It is the mechanism behind
 most of the model's calcium sensitivity, alongside tropomyosin cooperativity.
 
-**Crossbridge state fractions** (same as above but divided by total XB count):
-- `'frac_xb_bound'`, `'frac_xb_drx'`, `'frac_xb_loose'`, `'frac_xb_tight_1'`,
-  `'frac_xb_tight_2'`, `'frac_xb_free_2'`, `'frac_xb_srx'`
+**Crossbridge state fractions are not exported.** Divide any count above by
+`result.topology_config['total_xbs']`, which is the exact denominator the
+removed `frac_xb_*` keys used.
 
 **Tropomyosin (TM) state counts** — TM is a four-state regulatory chain:
 - `'n_tm_state_0'` through `'n_tm_state_3'` — counts in each TM state
-- `'frac_tm_state_0'` through `'frac_tm_state_3'` — fractions
-- `'actin_permissiveness'` — mean float 0–1 indicating how accessible actin
-  binding sites are across all thin filaments
 
-**Tropomyosin fractions restricted to the overlap zone** — the four keys above
-average over *every* binding site on every thin filament, including sites in the
-thick filament's bare zone and sites beyond its tip, which no crossbridge can
-ever reach. These four keys use only the reachable sites instead:
+All-site TM fractions are not exported: divide by
+`topology_config['n_thin'] * topology_config['n_sites']`. The former
+`actin_permissiveness` was exactly `n_tm_state_3` over that same denominator.
+
+**Tropomyosin fractions restricted to the overlap zone** — an all-site
+fraction averages over *every* binding site on every thin filament, including
+sites in the thick filament's bare zone and sites beyond its tip, which no
+crossbridge can ever reach. These keys use only the reachable sites instead,
+and unlike the all-site fractions they CANNOT be reconstructed from the counts,
+because their denominator moves with the geometry:
 - `'frac_tm_state_2_overlap'` — calcium-open fraction within reach
 - `'frac_tm_state_3_overlap'` — fully-open (crossbridge-bindable) fraction within reach
-- `'frac_tm_available_overlap'` — states 2 and 3 combined
 - `'n_overlap_sites'` — the denominator, useful as a sanity check
+
+States 2 and 3 combined is the sum of the two fractions above; the former
+`frac_tm_available_overlap` key was exactly that.
 
 **Prefer the `_overlap` variants whenever you compare across geometries or
 filament lengths.** The all-site versions change simply because the denominator
@@ -380,8 +392,8 @@ changed: one filament-length correction moved `frac_tm_state_3` from 13.5 % to
   **Prefer this one.** (Before 2026-09-11 it was `atp_expected_p` and estimated
   `P(visit Free_2 at least once)`, a lower bound that ran −0.07 % low on cardiac
   and −1.2 % on skeletal.)
-- `'xb_detach_atp'` — the ATP-consuming detachment flux alone, i.e.
-  `atp_expected` minus the closure charge.
+  The ATP-consuming detachment flux alone is `atp_expected -
+  closure_detach_atp`; the former `xb_detach_atp` key was exactly that.
 - `'xb_detach_free'` — a Loose head falling off having never bound ATP. An
   ordinary failed weak attachment, not a load-driven event.
 - `'xb_give_up'` — the strain-gated `2→1` reversal, by which a badly-positioned
@@ -409,10 +421,15 @@ changed: one filament-length correction moved `frac_tm_state_3` from 13.5 % to
 **Energy metrics** — elastic stored energy in the system:
 - `'thick_energy_first_avg'` — mean elastic energy stored in the first crown
   spring of all thick filaments (pN·nm)
-- `'thick_energy_first_delta_avg'` — change in that energy from the previous
-  timestep
 - `'titin_energy_avg'` — mean titin energy across all connections
-- `'titin_energy_delta_avg'` — change in titin energy
+- `'titin_energy_delta_avg'` — change in titin energy **from filament motion
+  alone**, holding this step's `z_line` and lattice spacing fixed. This is NOT
+  `np.diff(titin_energy_avg)`, which also picks up the driver's contribution:
+  under a shortening ramp the two differ by more than the delta itself. It is
+  kept for that reason.
+
+The per-step change in `thick_energy_first_avg` is not exported — that one IS
+just `np.diff(..., axis=-1)`, because it reads no drivers.
 
 **Work metrics** — mechanical work done this timestep (pN·nm). These are two
 genuinely different quantities and conflating them is the mistake the old
@@ -426,30 +443,40 @@ genuinely different quantities and conflating them is the mistake the old
   returned traces — that is why it is computed inside the simulation loop.
   Axial component only: in dynamic-LS mode the spacing also changes and the
   radial force does work this does not capture.
-- `'sarcomere_work'` — work done **externally by the half-sarcomere** at the
-  driven z-line: positive when shortening against tension, negative when
-  lengthened, exactly zero under an isometric hold. Unlike the key above, this
-  one *is* exactly reconstructible after the fact, and shipping it is a
-  convenience rather than new information. The reconstruction, with `F` the
-  `axial_force` trace and `z` the `z_line` trace, is the trapezoid
+**External work is not exported.** The work done by the half-sarcomere at the
+  driven z-line — positive when shortening against tension, negative when
+  lengthened, exactly zero under an isometric hold — is exactly reconstructible
+  after the fact. With `F` the `axial_force` trace and `z` the `z_line` trace it
+  is the trapezoid
 
   ```python
   dz = np.diff(z, axis=-1)                       # step i-1 -> i
   sarcomere_work = -0.5 * (F[..., :-1] + F[..., 1:]) * dz
   ```
 
-  which reproduces `result.metrics['sarcomere_work'][..., 1:]`. Measured
-  bit-exact on CPU float32 over isometric, shortening and lengthening ramps
-  (max abs difference = 0); treat it as exact to floating-point round-off rather than
-  guaranteed bitwise, since the shipped value is computed inside the loop. It works
-  because the z-line shift is applied to the thin filament only, while
+  This was measured bit-exact against the formerly-shipped key on CPU float32
+  over isometric, shortening and lengthening ramps (max abs difference = 0). It
+  works because the z-line shift is applied to the thin filament only, while
   `axial_force` is read from the thick filament's first backbone spring — so
   `F[i-1]` really *is* the force at the start of step `i`, with no need to carry
   a force through the scan. Step 0 has `dz = 0` and no predecessor, so its
   `sarcomere_work` is exactly zero.
-- `'xb_work_per_atp'` — `xb_work_on_filaments / atp_expected`, guarded to 0
-  when almost no ATP was spent. For whole-sarcomere efficiency divide the two
-  exported keys yourself: `sarcomere_work / atp_expected`.
+**There is no `xb_work_per_atp` key, and forming one per timestep is a
+mistake.** A per-step ratio cannot be time-averaged: `mean(w/a)` is the
+*unweighted* mean of the per-step efficiencies while the efficiency over a
+window is `sum(w)/sum(a)`, the ATP-weighted one. The bias is the squared
+coefficient of variation of the denominator — measured at +1.3 % at pCa 4.5 and
+**+15.7 %** at pCa 6.2, and at pCa 9 the old key reported a confident `0.0000`
+for a quantity that is `0/0`. Reduce numerator and denominator over your window
+first, then divide:
+
+  ```python
+  w = result.metrics['xb_work_on_filaments'][..., w0:].sum(axis=-1)
+  a = result.metrics['atp_expected'][..., w0:].sum(axis=-1)
+  work_per_atp = w / a
+  ```
+
+  The same applies to the replicate axis, and to tension cost.
 
 **Solver diagnostics:**
 - `'newton_iters'` — number of Newton iterations used by the equilibrium solver
@@ -489,17 +516,16 @@ total_atp = atp.sum(axis=-1)                 # shape: (...,) collapses time
 
 # Cumulative work. Two different quantities — see section 6.
 xb_work = result.metrics['xb_work_on_filaments'].sum(axis=-1)   # by the motors
-ext_work = result.metrics['sarcomere_work'].sum(axis=-1)        # by the sarcomere
-efficiency = xb_work / (total_atp + 1e-9)    # avoid divide-by-zero
+efficiency = xb_work / total_atp             # ratio of SUMS, never of per-step ratios
 ```
 
 **Adding custom metrics to the result dictionary** — since `result.metrics`
 is a dict subclass, you can add new keys:
 
 ```python
-result.metrics['efficiency'] = (
-    result.metrics['sarcomere_work'] / (result.metrics['atp_expected'] + 1e-9)
-)
+dz = np.diff(result.z_line, axis=-1)
+F = result.axial_force
+result.metrics['sarcomere_work'] = -0.5 * (F[..., :-1] + F[..., 1:]) * dz
 ```
 
 **Comparing bound fraction over time across pCa conditions** — for a sweep
@@ -507,7 +533,9 @@ over pCa values:
 
 ```python
 # result.axial_force shape: (n_pCa, replicates, time)
-mean_bound = result.metrics['frac_xb_bound'].mean(axis=1)  # average replicates
+bound = (result.metrics['n_xb_loose'] + result.metrics['n_xb_tight_1']
+         + result.metrics['n_xb_tight_2']) / result.topology_config['total_xbs']
+mean_bound = bound.mean(axis=1)             # average replicates
 # mean_bound shape: (n_pCa, time)
 
 # Steady-state value for each pCa condition
@@ -720,7 +748,7 @@ calls the same compiled kernel, so there is no recompilation. The default
 `"auto"` setting chunks batches of 16384+ into groups of 4096, which
 benchmarks show is ~2% faster due to better L2 cache utilization. The primary
 reason to use minibatching is to bound peak GPU VRAM on memory-constrained GPUs
-(e.g. 8 GB): peak VRAM ≈ minibatch_size × n_steps × 63 metrics × 4 bytes × 2.
+(e.g. 8 GB): peak VRAM ≈ minibatch_size × n_steps × 43 metrics × 4 bytes × 2.
 
 ---
 

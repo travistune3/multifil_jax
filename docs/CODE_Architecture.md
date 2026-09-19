@@ -164,7 +164,7 @@ skeletal-inherited placeholders, not fitted values.
 
 ```
 result.axial_force      # property → metrics['axial_force'] (pN)
-result.metrics          # MetricsDict of 63 metric arrays, same shape
+result.metrics          # MetricsDict of 43 metric arrays, same shape
 result.z_line           # z_line trace used
 result.pCa              # pCa trace used
 result.metrics['solver_residual']  # Newton solver residual at each step
@@ -239,7 +239,7 @@ When a subpopulation is active, `subpop_arrays` joins the vmap as one extra
 (dict) axis; when inactive the vmap signature is unchanged, so the WT trace is
 byte-identical to a build without the feature.
 
-All 63 metrics are always computed. No `metrics`/`manifest` in JIT
+All 43 metrics are always computed. No `metrics`/`manifest` in JIT
 `static_argnames` — changing metric selection never triggers recompilation.
 
 ---
@@ -353,12 +353,12 @@ State(
 | 4 | Free_2 | just detached, post-ATP |
 | 5 | SRX | super-relaxed / parked |
 
-`n_bound` counts states 1–3. The rate-coefficient names follow the same
+Bound heads are states 1–3. The rate-coefficient names follow the same
 convention (`xb_r01_coeff`, `xb_r12_coeff`, `xb_r23_coeff`, `xb_r34_coeff`,
 `xb_r40`, `xb_r04`, `xb_r05`).
 
 **MetricsDict** — scan output. A dict subclass with attribute access, registered
-as a JAX PyTree. Contains all 63 metric scalars per timestep (including
+as a JAX PyTree. Contains all 43 metric scalars per timestep (including
 `axial_force`, `solver_residual`, `newton_iters`).
 
 **Immutable updates** via `._replace()`:
@@ -818,7 +818,8 @@ Single function:
 ```python
 metrics = compute_all_metrics(
     old_state, new_state, constants, drivers, topology,
-    force, solver_residual, newton_iters, dt, trace, delta_z,
+    force, solver_residual, newton_iters, dt, trace,
+    solver_residual_norm, solver_tolerance,
 )
 ```
 
@@ -827,35 +828,60 @@ reported `lattice_spacing` are post-solve quantities); `trace.constants` carries
 the **pre-solve** one (the rates were evaluated there). Both are correct for
 their own question and must not be unified.
 
-Returns a `MetricsDict` with **63 keys** (same keys every call). Always computed —
+Returns a `MetricsDict` with **43 keys** (same keys every call). Always computed —
 no selection needed.
 
-**Metric groups (63 total):**
+**Every key is independent.** Nothing here is computable from the other keys
+plus `result.topology_config`. Twenty keys that were — the all-site occupancy
+fractions, `n_bound`, `actin_permissiveness`, `frac_tm_available_overlap`,
+`xb_detach_atp`, `sarcomere_work`, `thick_energy_first_delta_avg`,
+`xb_work_per_atp`, and the `z_line`/`pCa` duplicates of the `SimulationResult`
+fields — were deleted on 2026-09-19. See "Reconstructions" below.
+
+**Metric groups (43 total):**
 | Group | Keys | n |
 |-------|------|---|
-| Protocol | `axial_force`, `solver_residual`, `solver_residual_norm`, `solver_tolerance`, `z_line`, `pCa`, `lattice_spacing` | 7 |
-| XB counts | `n_bound`, `n_xb_drx`, `n_xb_loose`, `n_xb_tight_1`, `n_xb_tight_2`, `n_xb_free_2`, `n_xb_srx` | 7 |
-| XB fractions | `frac_xb_bound`, `frac_xb_drx`, `frac_xb_loose`, `frac_xb_tight_1`, `frac_xb_tight_2`, `frac_xb_free_2`, `frac_xb_srx` | 7 |
+| Protocol | `axial_force`, `solver_residual`, `solver_residual_norm`, `solver_tolerance`, `lattice_spacing` | 5 |
+| XB counts | `n_xb_drx`, `n_xb_loose`, `n_xb_tight_1`, `n_xb_tight_2`, `n_xb_free_2`, `n_xb_srx` | 6 |
 | XB force by state | `force_xb_loose`, `force_xb_tight_1`, `force_xb_tight_2` | 3 |
 | TM counts | `n_tm_state_0` … `n_tm_state_3` | 4 |
-| TM fractions | `frac_tm_state_0` … `frac_tm_state_3`, `actin_permissiveness` | 5 |
-| TM overlap-zone | `frac_tm_state_2_overlap`, `frac_tm_state_3_overlap`, `frac_tm_available_overlap`, `n_overlap_sites` | 4 |
+| TM overlap-zone | `frac_tm_state_2_overlap`, `frac_tm_state_3_overlap`, `n_overlap_sites` | 3 |
 | Transitions | `atp_consumed`, `newly_bound`, `closure_detach_free`, `closure_detach_atp` | 4 |
 | Displacement | `thick_displace_mean/max/min/std`, `thin_displace_mean/max/min/std` | 8 |
-| Energy | `thick_energy_first_avg`, `thick_energy_first_delta_avg`, `titin_energy_avg`, `titin_energy_delta_avg` | 4 |
-| Work | `xb_work_on_filaments`, `sarcomere_work` | 2 |
-| Detachment / ATP | `atp_expected`, `xb_work_per_atp` | 2 |
-| Cycle fluxes | `xb_detach_atp`, `xb_detach_free`, `xb_give_up`, `atp_net_pi_release`, `atp_net_hydrolysis` | 5 |
+| Energy | `thick_energy_first_avg`, `titin_energy_avg`, `titin_energy_delta_avg` | 3 |
+| Work | `xb_work_on_filaments` | 1 |
+| ATP | `atp_expected` | 1 |
+| Cycle fluxes | `xb_detach_free`, `xb_give_up`, `atp_net_pi_release`, `atp_net_hydrolysis` | 4 |
 | Solver | `newton_iters` | 1 |
+
+**Reconstructions**, for the keys that used to exist:
+| Was | Is now |
+|-----|--------|
+| `z_line`, `pCa` | `result.z_line`, `result.pCa` — bit-identical, already stored |
+| `frac_xb_*` | count / `result.topology_config['total_xbs']` |
+| `frac_tm_state_*`, `actin_permissiveness` | count / (`n_thin` × `n_sites`) |
+| `n_bound` | `n_xb_loose + n_xb_tight_1 + n_xb_tight_2` |
+| `frac_tm_available_overlap` | `frac_tm_state_2_overlap + frac_tm_state_3_overlap` |
+| `xb_detach_atp` | `atp_expected - closure_detach_atp` |
+| `thick_energy_first_delta_avg` | `np.diff(thick_energy_first_avg, axis=-1)` |
+| `sarcomere_work` | `-0.5*(F[..., :-1] + F[..., 1:]) * np.diff(z, axis=-1)` |
+| `xb_work_per_atp` | **do not form it per step** — see below |
+
+`titin_energy_delta_avg` is deliberately NOT on that list: both its endpoints
+are evaluated at the current step's `z_line` and lattice spacing, so it is the
+change from filament motion alone. `np.diff` of the level also picks up the
+driver's contribution, and under a shortening ramp the two differ by more than
+the delta itself.
 
 The **overlap-zone** group (`compute_overlap_tm_fractions()`) restricts the TM
 fractions to crossbridge-reachable sites: within
 `[crown_offsets.min() - 13, crown_offsets.max() + 13]` (the same 13 nm head reach
 used in `geometry.py`) **and** past the hiding line (absolute position > 0,
 reconstructed with `thin_axial()`). The plain
-`frac_tm_*` keys average over *every* site, including the thick filament's bare
-zone and sites beyond its tip, so they are diluted by permanently unreachable
-sites. Prefer the `_overlap` variants whenever comparing across geometries — a
+all-site fractions (counts over a constant denominator) average over *every*
+site, including the thick filament's bare zone and sites beyond its tip, so
+they are diluted by permanently unreachable sites. That is why the `_overlap`
+variants are exported and the all-site fractions are not — a
 filament-length change once moved the all-site metric 13.5 %→17.3 % almost
 entirely through that denominator while the true overlap value barely moved.
 
@@ -901,15 +927,21 @@ the "~1 %" an isometric-cardiac-only measurement would have suggested. It shrink
 with `dt`. Not fixed; not to be described as exact. A skeletal tension-cost study
 should use `dt = 0.1 ms` or carry the correction.
 
-**Work: two different quantities.** `xb_work_on_filaments` is what the
-crossbridges did to the lattice (path-dependent and per-head, so it cannot be
-reconstructed from the returned traces — it must be computed in the scan);
-`sarcomere_work` is what the half-sarcomere did externally at the driven z-line,
-and *is* exactly reconstructible afterwards. `xb_work_per_atp` divides by the
-crossbridge work, because ATP is spent by crossbridges and because that stays
-meaningful under an isometric hold where external work is zero. For
-whole-sarcomere efficiency divide the two exported keys: `sarcomere_work /
-atp_expected`. These replace `work_thick`/`work_thick_mean`/`work_per_atp`,
+**Work: two different quantities, one exported.** `xb_work_on_filaments` is
+what the crossbridges did to the lattice — path-dependent and per-head, so it
+cannot be reconstructed from the returned traces and must be computed in the
+scan. The external work at the driven z-line is exactly reconstructible
+afterwards (see the table above) and is therefore not exported; it is also
+identically zero under an isometric hold, where crossbridge work is not.
+
+**Never form work-per-ATP per timestep.** `mean(w/a)` is the unweighted mean of
+per-step efficiencies; the efficiency over a window is `sum(w)/sum(a)`, the
+ATP-weighted one. The bias is the squared CV of the denominator: +1.3 % at
+pCa 4.5, **+15.7 %** at pCa 6.2, and `0/0` reported as `0.0000` at pCa 9. The
+deleted `xb_work_per_atp` key did exactly this. Reduce numerator and
+denominator over the window, then divide — and likewise across replicates.
+
+These replace `work_thick`/`work_thick_mean`/`work_per_atp`,
 which were M-line force times the mean displacement of *every* thick crown —
 neither quantity, and dominated by internal backbone strain redistribution.
 
@@ -965,7 +997,7 @@ global scale, bit-for-bit, in every mode.
 |------|---------|
 | `multifil_jax/simulation.py` | `run()`, `SimulationResult`, `_run_sim_kernel`, `BATCH_BUCKETS` |
 | `multifil_jax/timestep.py` | `kinetics_step()`, `timestep()` — single step orchestrator |
-| `multifil_jax/metrics_fn.py` | `compute_all_metrics()` — 57-metric MetricsDict |
+| `multifil_jax/metrics_fn.py` | `compute_all_metrics()` — 43-metric MetricsDict |
 | `multifil_jax/core/state.py` | State hierarchy, `realize_state()`, `Drivers`, `KineticsTrace`, `resolve_value()`, `MetricsDict`, `PreconditionerParams` |
 | `multifil_jax/core/params.py` | `StaticParams`, `DynamicParams`/`Constants`, `_DYNAMIC_DEFAULTS`, the four species presets |
 | `multifil_jax/core/sarc_geometry.py` | `SarcTopology` — PyTree topology, `create()`, `valid_xb_targets()` |
