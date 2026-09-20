@@ -495,9 +495,21 @@ _DYNAMIC_DEFAULTS = {
     # filament. It is what makes resting muscle springy: stretch a relaxed fibre
     # and titin, not the crossbridges, resists. Its force-extension curve is
     # steeply non-linear (entropic unfolding of Ig domains, then backbone
-    # stretching), modelled here as a one-sided exponential:
+    # stretching), modelled here as an exponential:
     #
     #     F = titin_a * exp(titin_b * (L - titin_rest)),  clamped to >= 0
+    #
+    # THE CLAMP NEVER FIRES, AND THE LAW IS NOT ONE-SIDED. titin_a > 0 and the
+    # exponential is strictly positive, so F > 0 at every length: THERE IS NO
+    # SLACK REGIME. F = titin_a exactly at L = titin_rest (55 pN per molecule
+    # cardiac, 43 skeletal), not 0. The potential (titin_a/titin_b)*exp(...) is
+    # MONOTONIC in L and is minimised at the shortest reachable L — which is
+    # L = lattice_spacing, i.e. the thick filament tip level with the Z-disc.
+    # So titin is a tether that always pulls the tip toward the Z-disc and never
+    # releases; its axial component reverses sign if the tip passes the Z-line,
+    # which is correct central-force behaviour and is restoring on both sides.
+    # VERIFIED 2026-09-19 [CODE]: the implemented axial force is the exact
+    # -dU/d(crown position) to 6e-10 relative on both sides of the anchor.
     #
     # L is the true 3D length of the connection, sqrt(axial^2 + lattice_spacing^2),
     # so titin also pulls the filaments together radially — a term that matters
@@ -519,7 +531,10 @@ _DYNAMIC_DEFAULTS = {
     #          Powers 2018 SWEPT this parameter: "b was set to 4, 7.5, or 10 µm⁻¹"
     #          to study the effect of titin stiffness. 4 µm⁻¹ = 0.004 nm⁻¹ is simply
     #          their most compliant case, paired with the arbitrary a above.
-    # titin_rest [I]: slack length at SL 2.0 µm (z_line=1000 nm → L≈213 nm);
+    # titin_rest [I]: the exponent OFFSET. It is NOT a slack length in this
+    #          model — see the force-law note above: F(titin_rest) = titin_a,
+    #          not 0, and nothing ever goes slack. The VALUE is taken from a
+    #          measured slack length at SL 2.0 µm (z_line=1000 nm → L≈213 nm);
     #          Linke 1998 PNAS 95:8052
     # --------------------------------------------------------------------------
     'titin_a':    43.0,    # [I] pN per molecule (from an arbitrary 260 pN — see above)
@@ -1498,8 +1513,12 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams]:
                                    Granzier & Labeit 2004 Circ Res 94:284
         titin_b  = 0.008 nm⁻¹    — [G] 8 µm⁻¹ is NOT one of Powers 2018's values
                                    (they swept 4, 7.5, 10 µm⁻¹). Interpolated, unsourced.
-        titin_rest = 140.0 nm     — [I] slack at SL 1.85 µm (z_line=925 → L≈138 nm);
-                                   Linke 1998 PNAS 95:8052
+        titin_rest = 140.0 nm     — [I] the exponent OFFSET, not a slack length
+                                   in this model (F(titin_rest) = titin_a, not
+                                   0; nothing goes slack — see the titin block
+                                   in _DYNAMIC_DEFAULTS). Value is a measured
+                                   slack length at SL 1.85 µm (z_line=925 →
+                                   L≈138 nm); Linke 1998 PNAS 95:8052
 
     Returns:
         (StaticParams, DynamicParams)
@@ -1546,7 +1565,8 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams]:
         'titin_b': 0.008,         # [G] 8 µm⁻¹. NOT a Powers 2018 value: that paper
                                   #     swept b = 4, 7.5 and 10 µm⁻¹ only (audit
                                   #     2026-08-19). 8 is interpolated, not sourced.
-        'titin_rest': 140.0,      # slack at SL 1.85 µm (z_line=925 nm → L≈138 nm)
+        'titin_rest': 140.0,      # exponent offset; value from a slack length
+                                  # measured at SL 1.85 µm (z=925 → L≈138 nm)
     }
     return StaticParams(), DynamicParams(**cardiac_overrides)
 
