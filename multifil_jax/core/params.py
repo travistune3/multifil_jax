@@ -214,6 +214,24 @@ import warnings
 from dataclasses import dataclass, asdict
 from typing import Dict, Any, List, Tuple
 
+# Sum of the thick and thin filament radii (nm): 8 + 5, Brenner 1996.
+#
+# `lattice_spacing` is the SURFACE-to-surface gap, but the isovolumic (Poisson)
+# argument constrains filament PACKING, i.e. the centre-to-centre spacing d10:
+# squeezing the lattice moves the filament axes together, it does not shrink
+# the filaments. So a Poisson scaling must be applied to d + FILAMENT_RADII_SUM
+# and the radii added back afterwards, never to the gap directly.
+#
+# Brenner 1996 (rabbit psoas, 4-6 C) gives the conversion in this convention:
+#     d = (2/3) * d10 - FILAMENT_RADII_SUM
+# Sanity check on the default: d0 = 14.0 at z_line = 950 nm (SL 1.9 um) is
+# d10 = 40.5 nm, which scaled isovolumically to SL 2.3 um gives d10 = 36.8 nm —
+# the literature value at that length.
+#
+# Vertebrate radii. An invertebrate/IFM geometry has its own, and would need
+# this to become a parameter rather than a constant.
+FILAMENT_RADII_SUM = 13.0
+
 # Static fields that affect array shapes (changing these triggers recompilation)
 STATIC_FIELDS = frozenset({'n_crowns', 'n_polymers_per_thin', 'solver_max_iter', 'actin_geometry', 'n_newton_steps', 'n_cg_steps', 'n_xb_bins', 'xb_bin_lo', 'xb_bin_hi', 'thick_bare_zone', 'thick_crown_spacing', 'actin_half_pitch', 'mono_per_poly', 'polymer_base_turns', 'target_zone_wiggle', 'n_xb_per_crown'})
 
@@ -417,7 +435,7 @@ _DYNAMIC_DEFAULTS = {
     #   K = 1.3 pN/nm verified 2026-08-19).
     #   BUT 1.3 pN/nm is another MODEL's chosen value, while the two direct
     #   MEASUREMENTS sit at 2.3-2.7 pN/nm: Woody 2019 >=2.3 (human beta-cardiac,
-    #   single molecule) and Brunello et al. 2014 J Physiol 592:3881 Table 1,
+    #   single molecule) and Brunello et al. 2014 J Physiol 592:3881 Table 2,
     #   in-situ crossbridge stiffness eps = 2.7 +/- 0.9 pN/nm (frog). So this
     #   projection agrees with the models and is ~2x below the experiments. Open.
     # --------------------------------------------------------------------------

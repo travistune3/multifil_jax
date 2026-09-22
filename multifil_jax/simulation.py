@@ -76,7 +76,8 @@ from functools import partial
 from typing import Dict, Tuple, List, Optional, Union
 
 from multifil_jax.core.params import (
-    StaticParams, DynamicParams, get_skeletal_params, DYNAMIC_FIELDS
+    StaticParams, DynamicParams, get_skeletal_params, DYNAMIC_FIELDS,
+    FILAMENT_RADII_SUM
 )
 from multifil_jax.core.state import realize_state, State, Drivers, MetricsDict, build_preconditioner_params
 from multifil_jax.kernels.solver import build_prefactored_preconditioner
@@ -714,7 +715,10 @@ def _run_sim_kernel(
 
             if is_dynamic_ls:
                 drivers = Drivers(pCa=pCa_val, z_line=z_val, lattice_spacing=current_ls)
-                d_ref = ls_val * (l0 / z_val) ** nu_val
+                # Scale the centre-to-centre spacing, not the surface gap: the
+                # filament radii do not change with sarcomere length.
+                d_ref = ((ls_val + FILAMENT_RADII_SUM) * (l0 / z_val) ** nu_val
+                         - FILAMENT_RADII_SUM)
             else:
                 drivers = Drivers(pCa=pCa_val, z_line=z_val, lattice_spacing=ls_val)
                 d_ref = None
@@ -818,7 +822,10 @@ def run(
         lattice_spacing: Lattice spacing (nm) -- float, list, or array
         K_lat: Lattice stiffness per thick filament (pN/nm). None = fixed LS.
                Float or list (sweep). Internally scaled by n_thick.
-        nu: Poisson exponent for d_ref(z) = d0*(z0/z)^nu. Float or list (sweep).
+        nu: Poisson exponent. Applied to the CENTRE-TO-CENTRE spacing, since
+            the filament radii are fixed while the lattice closes:
+                d(z) = (d0 + FILAMENT_RADII_SUM)*(z0/z)^nu - FILAMENT_RADII_SUM
+            with d the thick-to-thin SURFACE gap. Float or list (sweep).
             If K_lat is None and nu>0, pre-computes Poisson LS trace.
         dynamic_params: DynamicParams, dict of overrides/sweeps, or list of DynamicParams.
                         A list creates a 'candidates' sweep axis (one element per candidate),
@@ -1038,8 +1045,12 @@ def run(
     has_nonzero_nu = (any(v != 0.0 for v in nu) if isinstance(nu, list)
                       else float(nu) != 0.0)
     if not is_dynamic_ls and not ls_is_trace and has_nonzero_nu:
-        d0 = ls_batched[:, 0:1]                            # (total_batch, 1)
-        ls_batched = d0 * (z_batched[:, 0:1] / z_batched) ** nu_batched[:, None]
+        # Scale the centre-to-centre spacing (d + radii), then take the radii
+        # back off: the isovolumic argument is about filament PACKING, and the
+        # filaments themselves do not get thinner as the lattice closes.
+        d0 = ls_batched[:, 0:1] + FILAMENT_RADII_SUM       # (total_batch, 1)
+        ls_batched = (d0 * (z_batched[:, 0:1] / z_batched) ** nu_batched[:, None]
+                      - FILAMENT_RADII_SUM)
 
     # Batched DynamicParams — one lookup per field.
     def _param(name):
