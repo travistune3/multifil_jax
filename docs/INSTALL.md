@@ -105,7 +105,8 @@ For an **8 GB GPU (e.g. RTX 4060):** the default `minibatch_size="auto"` is safe
 
 ```python
 # ~3 GB peak for 2000-step sim with large batch:
-result = run(topo, pCa=4.5, replicates=16384, duration_ms=2000, minibatch_size=2048)
+result = run(topo, pCa=4.5, z_line=z0, lattice_spacing=d0,
+             replicates=16384, duration_ms=2000, minibatch_size=2048)
 ```
 
 `minibatch_size` splits the batch into sequential chunks — it does not affect results, only peak memory and marginally performance. Non-power-of-2 values are snapped down to the nearest power of 2 automatically.

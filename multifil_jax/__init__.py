@@ -23,18 +23,19 @@ QUICK START
     from multifil_jax import SarcTopology, run
     from multifil_jax.core.params import get_skeletal_params
 
-    static, dynamic = get_skeletal_params()
+    static, dynamic, z0, d0 = get_skeletal_params()
     topo = SarcTopology.create(nrows=2, ncols=2,
                                static_params=static, dynamic_params=dynamic)
 
-    result = run(topo, pCa=4.5, z_line=1100.0, duration_ms=1000,
+    result = run(topo, pCa=4.5, z_line=1100.0, lattice_spacing=d0, duration_ms=1000,
                  dynamic_params=dynamic, static_params=static)
     print(result.summary())
 
 Pass a list instead of a scalar to sweep it — the axes are Cartesian-producted
 and run in parallel:
 
-    result = run(topo, pCa=[9.0, 6.0, 5.5, 4.5], replicates=5)
+    result = run(topo, pCa=[9.0, 6.0, 5.5, 4.5], z_line=z0, lattice_spacing=d0,
+                 replicates=5)
 
 WHERE THINGS LIVE
 -----------------

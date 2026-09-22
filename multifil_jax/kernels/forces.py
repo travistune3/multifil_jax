@@ -785,6 +785,8 @@ def compute_forces_from_state_vectorized(
     state: 'State',
     constants: 'DynamicParams',
     topology: 'SarcTopology',
+    z_line,
+    lattice_spacing,
 ) -> jnp.ndarray:
     """Convenience function to compute forces directly from state + constants + topology.
 
@@ -792,6 +794,8 @@ def compute_forces_from_state_vectorized(
         state: State NamedTuple (pure state, no embedded params)
         constants: DynamicParams with physics values
         topology: SarcTopology with structural index maps
+        z_line: Z-line position (nm)
+        lattice_spacing: lattice spacing (nm)
 
     Returns:
         forces: Flattened force residual array
@@ -801,8 +805,8 @@ def compute_forces_from_state_vectorized(
         u_thin=state.thin.displacement,
         thick_k=constants.thick_k,
         thin_k=constants.thin_k,
-        z_line=constants.z_line,
-        lattice_spacing=constants.lattice_spacing,
+        z_line=z_line,
+        lattice_spacing=lattice_spacing,
         titin_a=constants.titin_a,
         titin_b=constants.titin_b,
         titin_rest=constants.titin_rest,
@@ -821,6 +825,8 @@ def compute_thick_forces_vectorized(
     state: 'State',
     constants: 'DynamicParams',
     topology: 'SarcTopology',
+    z_line,
+    lattice_spacing,
 ) -> jnp.ndarray:
     """Compute net force on each thick filament node.
 
@@ -831,6 +837,8 @@ def compute_thick_forces_vectorized(
         state: State NamedTuple (pure state, no embedded params)
         constants: DynamicParams with physics values
         topology: SarcTopology with structural index maps
+        z_line: Z-line position (nm)
+        lattice_spacing: lattice spacing (nm)
 
     Returns:
         Forces on thick nodes: (n_thick, n_crowns)
@@ -840,8 +848,8 @@ def compute_thick_forces_vectorized(
         state.thick.displacement,
         topology.crown_offsets,
         constants.thick_k,
-        constants.z_line,
-        constants.lattice_spacing,
+        z_line,
+        lattice_spacing,
         constants.titin_a,
         constants.titin_b,
         constants.titin_rest,
@@ -850,10 +858,10 @@ def compute_thick_forces_vectorized(
     # 2. Crossbridge forces on thick filament
     xb_forces_thick, _ = compute_xb_forces_vectorized(
         thick_axial(state, topology),
-        thin_axial(state, topology, constants.z_line),
+        thin_axial(state, topology, z_line),
         state.thick.xb_states,
         state.thick.xb_bound_to,
-        constants.lattice_spacing,
+        lattice_spacing,
         constants,
         topology,
     )

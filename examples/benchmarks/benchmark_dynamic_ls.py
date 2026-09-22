@@ -55,7 +55,7 @@ def run_section_a(dur, reps, seed):
     print("      To clear: rm -rf ~/.cache/multifil_jax/xla/")
     print()
 
-    static, dynamic = get_skeletal_params()
+    static, dynamic, z0, d0 = get_skeletal_params()
     topo = SarcTopology.create(nrows=2, ncols=2, static_params=static, dynamic_params=dynamic)
     n_steps = int(dur)
 
@@ -124,7 +124,7 @@ def run_section_b(dur, seed):
     print("K_lat per-filament fix: delta_d should be roughly constant across sizes.")
     print()
 
-    static, dynamic = get_skeletal_params()
+    static, dynamic, z0, d0 = get_skeletal_params()
     K_LAT = 5.0
     NU = 0.5
     n_steps = int(dur)

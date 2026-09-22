@@ -53,11 +53,11 @@ def main():
     print()
 
     # Create topology
-    static, dynamic = get_skeletal_params()
+    static, dynamic, z0, d0 = get_skeletal_params()
     topo = SarcTopology.create(nrows=args.n, ncols=args.n, static_params=static, dynamic_params=dynamic)
     topo = jax.device_put(topo)
 
-    run_kwargs = dict(pCa=4.5, z_line=1100.0, duration_ms=DURATION_MS, dt=DT,
+    run_kwargs = dict(pCa=4.5, z_line=1100.0, lattice_spacing=d0, duration_ms=DURATION_MS, dt=DT,
                       replicates=args.batch)
 
     # Warmup run (triggers JIT compilation)

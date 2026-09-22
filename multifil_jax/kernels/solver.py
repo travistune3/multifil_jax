@@ -69,7 +69,7 @@ positions affect the radial balance — automatically and exactly.
 Usage:
     from multifil_jax.kernels.solver import solve_equilibrium
     state, residual, new_ls, n_iters, residual_norm, tol = solve_equilibrium(
-        state, constants, topology,
+        state, constants, topology, z_line, lattice_spacing,
         n_newton_steps=static_params.n_newton_steps,
         n_cg_steps=static_params.n_cg_steps)
 
@@ -804,6 +804,8 @@ def solve_equilibrium(
     state: 'State',
     constants: 'DynamicParams',
     topology: 'SarcTopology',
+    z_line,
+    lattice_spacing,
     n_newton_steps: int,
     n_cg_steps: int,
     K_lat: float = None,
@@ -822,9 +824,11 @@ def solve_equilibrium(
 
     Args:
         state: Current State NamedTuple
-        constants: DynamicParams with physics values. constants.lattice_spacing
-                   is used as the initial d guess in dynamic LS mode.
+        constants: DynamicParams with physics values
         topology: SarcTopology with structural index maps
+        z_line: this step's Z-line position (nm), anchors the thin frame
+        lattice_spacing: this step's lattice spacing (nm). Fixed LS: the
+                   spacing itself. Dynamic LS: the initial d guess.
         K_lat: Effective lattice stiffness (pN/nm), already scaled by n_thick.
                None = fixed LS mode.
         d_ref: Poisson-scaled reference spacing (nm). Required if K_lat is not None.
@@ -847,7 +851,7 @@ def solve_equilibrium(
                          tolerance while every axial number looks fine.
         tol_axial        the axial tolerance in pN, so the reported residual
                          has a physical scale to be read against
-        new_lattice_spacing = solved d (dynamic) or constants.lattice_spacing (fixed)
+        new_lattice_spacing = solved d (dynamic) or lattice_spacing (fixed)
     """
     u_thick = state.thick.displacement
     u_thin = state.thin.displacement
@@ -872,7 +876,7 @@ def solve_equilibrium(
         u_final, n_iters, final_residual, residual_norm = _newton_solve(
             u_init,
             constants.thick_k, constants.thin_k,
-            constants.z_line, constants.lattice_spacing,
+            z_line, lattice_spacing,
             constants.titin_a, constants.titin_b, constants.titin_rest,
             state.thick.xb_states, state.thick.xb_bound_to,
             constants, precond_params, topology,
@@ -882,15 +886,15 @@ def solve_equilibrium(
             prefactored_precond=prefactored_precond,
         )
         new_u = u_final
-        new_lattice_spacing = constants.lattice_spacing
+        new_lattice_spacing = lattice_spacing
     else:
         # Dynamic LS: augmented (n+1)-DOF solve
         if prefactored_precond is None:
             prefactored_precond = build_prefactored_preconditioner(precond_params)
         pos_aug_final, n_iters, final_residual, residual_norm = _newton_solve_dynamic_ls(
-            u_init, constants.lattice_spacing,
+            u_init, lattice_spacing,
             constants.thick_k, constants.thin_k,
-            constants.z_line,
+            z_line,
             constants.titin_a, constants.titin_b, constants.titin_rest,
             state.thick.xb_states, state.thick.xb_bound_to,
             constants, topology,

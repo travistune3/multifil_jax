@@ -692,6 +692,7 @@ def _compute_unique_tm_Q_matrices(ca_concentration: float,
 def thin_transitions(state: 'State',
                      constants: 'DynamicParams',
                      topology: 'SarcTopology',
+                     pCa,
                      rng_key: jax.random.PRNGKey,
                      dt: float,
                      random_values: Optional[jnp.ndarray] = None,
@@ -822,8 +823,9 @@ def thin_transitions(state: 'State',
 
     Args:
         state: Current State (reads tm_states and bound_to)
-        constants: DynamicParams with pCa, tm_J_C, tm_J_M and the tm_* rates
+        constants: DynamicParams with tm_J_C, tm_J_M and the tm_* rates
         topology: SarcTopology, for chain neighbours and the eye_4 identity
+        pCa: this step's calcium level, -log10([Ca2+] in M)
         rng_key: JAX random key for sampling
         dt: Timestep length (ms)
         random_values: Optional pre-drawn uniforms, for deterministic testing
@@ -857,7 +859,7 @@ def thin_transitions(state: 'State',
     n_thin, n_sites = tm_states.shape
     n_sites_total = n_thin * n_sites
 
-    ca_conc = 10.0 ** (-constants.pCa)
+    ca_conc = 10.0 ** (-pCa)
     J_C = constants.tm_J_C
     J_M = constants.tm_J_M
 
@@ -1203,6 +1205,8 @@ def _build_xb_Q_bins(
     state: 'State',
     constants: 'DynamicParams',
     topology: 'SarcTopology',
+    pCa,
+    lattice_spacing,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Evaluate crossbridge rate matrices on a distance grid, and index each head.
 
@@ -1238,8 +1242,10 @@ def _build_xb_Q_bins(
 
     Args:
         state: Current State (reads xb_distances, xb_nearest_bs, tm_states)
-        constants: DynamicParams with rates and lattice_spacing
+        constants: DynamicParams with the xb_* rates and spring constants
         topology: SarcTopology with bin edges/centres, xb_to_thin_id, xb_valid
+        pCa: this step's calcium level
+        lattice_spacing: this step's (pre-solve) lattice spacing, nm
 
     Returns:
         Q_bins: (2 * n_bins, 6, 6) rate matrices, permissiveness-0 block first
@@ -1251,7 +1257,6 @@ def _build_xb_Q_bins(
 
     # Get axial distances for bin assignment
     xb_distances = state.thick.xb_distances
-    lattice_spacing = constants.lattice_spacing
 
     if xb_distances is not None:
         xb_distances_flat = xb_distances.reshape(-1, 2)
@@ -1281,7 +1286,7 @@ def _build_xb_Q_bins(
     else:
         permissiveness = jnp.ones(n_xb_total) * 0.5
 
-    ca_conc = 10.0 ** (-constants.pCa)
+    ca_conc = 10.0 ** (-pCa)
     n_bins = topology.xb_bin_centers.shape[0]   # static integer known to XLA
     d = lattice_spacing
 
@@ -1325,6 +1330,8 @@ def _xb_Q_resolved(
     state: 'State',
     constants: 'DynamicParams',
     topology: 'SarcTopology',
+    pCa,
+    lattice_spacing,
     xb_subpop=None,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, Optional[jnp.ndarray]]:
     """Effective binned rate matrices, and how to gather them per head.
@@ -1346,6 +1353,7 @@ def _xb_Q_resolved(
         state: Current State NamedTuple
         constants: DynamicParams with physics values
         topology: SarcTopology with xb_bin_edges, xb_bin_centers, eye_6
+        pCa, lattice_spacing: this step's drivers, shared by every population
         xb_subpop: None for the standard single-population path, or a tuple
             (mode, constants_k, extra) for subpopulations. constants_k is a
             length-K list of DynamicParams (population 0 = WT). For
@@ -1364,11 +1372,12 @@ def _xb_Q_resolved(
         labels: None, or (n_xb_total,) population index for mode=='explicit'
     """
     if xb_subpop is None:
-        Q_bins, key = _build_xb_Q_bins(state, constants, topology)
+        Q_bins, key = _build_xb_Q_bins(state, constants, topology, pCa, lattice_spacing)
         return Q_bins, key, None
 
     mode, constants_k, extra = xb_subpop
-    built = [_build_xb_Q_bins(state, ck, topology) for ck in constants_k]
+    built = [_build_xb_Q_bins(state, ck, topology, pCa, lattice_spacing)
+             for ck in constants_k]
     key = built[0][1]  # shared across populations (geometry/permissiveness only)
 
     if mode == 'mean_field':
@@ -1437,6 +1446,8 @@ def xb_binned_generator(
     state: 'State',
     constants: 'DynamicParams',
     topology: 'SarcTopology',
+    pCa,
+    lattice_spacing,
     dt: float,
     xb_subpop=None,
 ) -> XBBins:
@@ -1455,13 +1466,16 @@ def xb_binned_generator(
         state: Current State NamedTuple
         constants: DynamicParams with physics values
         topology: SarcTopology with xb_bin_edges, xb_bin_centers, eye_6
+        pCa: this step's calcium level
+        lattice_spacing: this step's (pre-solve) lattice spacing, nm
         dt: Timestep length (ms)
         xb_subpop: see _xb_Q_resolved
 
     Returns:
         XBBins
     """
-    Q_bins, key, labels = _xb_Q_resolved(state, constants, topology, xb_subpop)
+    Q_bins, key, labels = _xb_Q_resolved(state, constants, topology, pCa,
+                                         lattice_spacing, xb_subpop)
     P_bins, G_bins = _expm_bins(Q_bins, dt, topology.eye_6, with_integral=True)
     return XBBins(Q=Q_bins, P=P_bins, G=G_bins, key=key, labels=labels)
 

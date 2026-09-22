@@ -139,17 +139,18 @@ def describe(name, topo, dynamic):
     return n_valid
 
 
-topologies, n_valid_xbs, dynamics = {}, {}, {}
+topologies, n_valid_xbs, dynamics, spacings = {}, {}, {}, {}
 print("\n" + "=" * 72)
 print("STRUCTURE")
 print("=" * 72)
 for name, factory in PRESETS.items():
-    static, dynamic = factory()
+    static, dynamic, z0, d0 = factory()
     static = static.replace(n_newton_steps=N_NEWTON_STEPS)
     topo = SarcTopology.create(nrows=NROWS, ncols=NCOLS,
                                static_params=static, dynamic_params=dynamic)
     topologies[name] = (jax.device_put(topo), static)
     dynamics[name] = dynamic
+    spacings[name] = d0
     n_valid_xbs[name] = describe(name, topo, dynamic)
 
 print("\nNote the crossbridge-slot line. Slots without a real geometric target")
@@ -175,7 +176,7 @@ for name, (topo, static) in topologies.items():
     res = run(
         topo,
         pCa=[PCA_RELAXED, PCA_ACTIVE],
-        z_line=z_list,
+        z_line=z_list, lattice_spacing=spacings[name],
         duration_ms=DURATION_MS,
         dt=1.0,
         replicates=REPLICATES,

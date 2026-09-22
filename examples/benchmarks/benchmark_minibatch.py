@@ -54,7 +54,7 @@ def main():
     print(f"Total runs: {total_runs}")
     print()
 
-    static, dynamic = get_skeletal_params()
+    static, dynamic, z0, d0 = get_skeletal_params()
     topo = SarcTopology.create(nrows=n, ncols=n, static_params=static, dynamic_params=dynamic)
 
     # Candidate chunk sizes: powers of 2 up to total_runs (inclusive)
@@ -77,7 +77,7 @@ def main():
 
         # Warmup: pays JIT compile for this chunk size once
         print(f"  Warming up {label}...", end='', flush=True)
-        r = run(topo, pCa=4.5, z_line=1100.0, duration_ms=duration_ms,
+        r = run(topo, pCa=4.5, z_line=1100.0, lattice_spacing=d0, duration_ms=duration_ms,
                 replicates=total_runs, minibatch_size=minibatch_arg)
         r.axial_force.block_until_ready()
         print(" done")
@@ -86,7 +86,7 @@ def main():
         times = []
         for seed in range(1, 4):
             t0 = time.perf_counter()
-            r = run(topo, pCa=4.5, z_line=1100.0, duration_ms=duration_ms,
+            r = run(topo, pCa=4.5, z_line=1100.0, lattice_spacing=d0, duration_ms=duration_ms,
                     replicates=total_runs, minibatch_size=minibatch_arg, rng_seed=seed)
             r.axial_force.block_until_ready()
             times.append(time.perf_counter() - t0)

@@ -59,13 +59,6 @@ Both are stored as int8 — with hundreds of thousands of units these arrays are
 large, and 8 bits is ample for six states. Beware that jnp.argmax returns int32,
 so every sampling site must cast back explicitly on assignment or the arrays
 silently widen.
-
-DRIVERS AND THE NaN SENTINEL
-----------------------------
-pCa, z_line and lattice_spacing can be constant for a run or vary per timestep.
-Rather than branching, the per-step value is NaN when there is no override, and
-resolve_value() selects between it and the constant with jnp.where. Branchless,
-so it costs nothing on the GPU and never causes divergence.
 """
 
 import jax
@@ -162,7 +155,7 @@ def thin_axial(state: 'State', topology: 'SarcTopology', z_line) -> jnp.ndarray:
     shift; see simulation.py.
 
     Args:
-        z_line: current Z-line position (nm). Resolve drivers before calling.
+        z_line: current Z-line position (nm).
 
     Returns:
         (n_thin, n_sites) absolute axial positions, nm from the M-line.
@@ -173,12 +166,14 @@ def thin_axial(state: 'State', topology: 'SarcTopology', z_line) -> jnp.ndarray:
 class Drivers(NamedTuple):
     """Time-varying inputs for the simulation (Tier 3).
 
-    When a driver is constant/swept, its value is in Constants and
-    the Drivers field is NaN (sentinel).
+    Per-step values, always finite; there is no fallback. The drivers are not
+    in DynamicParams. The bundle exists only at the orchestration layer
+    (kinetics_step, timestep, compute_all_metrics, KineticsTrace); leaf kernels
+    take the individual scalars they use as explicit arguments.
     """
-    pCa: jnp.ndarray             # scalar per timestep, NaN if in Constants
-    z_line: jnp.ndarray          # scalar per timestep, NaN if in Constants
-    lattice_spacing: jnp.ndarray # scalar per timestep, NaN if in Constants
+    pCa: jnp.ndarray             # scalar per timestep
+    z_line: jnp.ndarray          # scalar per timestep, nm from the M-line
+    lattice_spacing: jnp.ndarray # scalar per timestep, nm surface-to-surface
 
 class KineticsTrace(NamedTuple):
     """What the kinetics phase saw, handed forward so metrics need not guess.
@@ -198,16 +193,16 @@ class KineticsTrace(NamedTuple):
     off `old_state` instead, the error is small (0.06%-0.46% measured, cardiac
     and skeletal, dt 1.0 and 0.1) but it is systematic and free to avoid.
 
-    `constants` are the driver-resolved ones the kinetics phase used, at the
-    PRE-solve lattice spacing. The mechanics path deliberately does NOT use
-    these: `axial_force_at_mline` and the reported `lattice_spacing` are
-    post-solve quantities and must be read at the SOLVED spacing. Both are
-    correct; they are answering different questions.
+    `drivers` are the ones the kinetics phase ran at, carrying the PRE-solve
+    lattice spacing. The mechanics path deliberately does NOT use them:
+    `axial_force_at_mline` and the reported `lattice_spacing` are post-solve
+    quantities and must be read at the SOLVED spacing. Both are correct; they
+    are answering different questions.
 
     Fields:
         state: post-thin_transitions, pre-thick_transitions State
-        constants: driver-resolved DynamicParams at the pre-solve lattice spacing
-        xb_subpop: the already-resolved (mode, constants_k, extra) tuple, or None
+        drivers: the Drivers the kinetics ran at (pre-solve lattice spacing)
+        xb_subpop: the (mode, constants_k, extra) tuple, or None
         torn: (n_thick, n_crowns, n_xb_per_crown) bool, heads tropomyosin tore
             off this step. Not recoverable from the before/after states — a torn
             head lands where an ordinary one does — so it is carried, not
@@ -220,7 +215,7 @@ class KineticsTrace(NamedTuple):
             — small, and a within-step value, which is what this trace is for.
     """
     state: 'State'
-    constants: 'DynamicParams'
+    drivers: Drivers
     xb_subpop: object
     torn: jnp.ndarray
     xb_bins: object
@@ -433,20 +428,3 @@ def get_ca_concentration(pCa: float) -> float:
         ca_concentration: Calcium concentration in Molar (10**(-pCa))
     """
     return 10.0 ** (-pCa)
-
-
-def resolve_value(driver_val: jnp.ndarray, constant_val: jnp.ndarray) -> jnp.ndarray:
-    """Resolve a driver value: use driver if valid, else fall back to constant.
-
-    This keeps physics kernels clean — no conditional branching, just jnp.where.
-
-    Args:
-        driver_val: Value from Drivers (NaN sentinel if not a trace)
-        constant_val: Fallback value from Constants
-
-    Returns:
-        Resolved value (driver if not NaN, else constant)
-    """
-    return jnp.where(jnp.isnan(driver_val), constant_val, driver_val)
-
-

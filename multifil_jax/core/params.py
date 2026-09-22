@@ -21,9 +21,10 @@ Rates and stiffnesses here are ABSOLUTE values in model units (ms, nm, pN, kT),
 not multipliers on some hidden base. A rate constant in this file is the rate
 the kernel uses. Nothing is scaled again downstream.
 
-pCa, z_line, and lattice_spacing appear here too, holding their default (or
-swept) values. When they need to vary within a single simulation they are
-overridden per timestep through Drivers; see core/state.py.
+pCa, z_line and lattice_spacing are NOT here. They are Tier-3 drivers
+(core/state.py Drivers), passed to run() explicitly and threaded to the kernels
+as arguments. Each preset returns its natural z_line and lattice_spacing (z0, d0)
+alongside the params.
 
 UNITS
 -----
@@ -1075,24 +1076,10 @@ _DYNAMIC_DEFAULTS = {
                              #     from `solver_tol` (whose absolute pN target was
                              #     inert — a float32 floor always exceeded it)
 
-    # ==========================================================================
-    # DEFAULT DRIVER VALUES
-    #
-    # pCa, z_line and lattice_spacing live here so they can be swept like any
-    # other parameter. When they need to vary WITHIN a simulation they are
-    # overridden per timestep through Drivers (core/state.py); these values are
-    # the fallback for any step that supplies no override.
-    # ==========================================================================
-    'pCa':             4.5,    # near-saturating activation (10^-4.5 M Ca²⁺)
-    'z_line':          900.0,  # nm from M-line, i.e. sarcomere length 1.8 µm.
-                               # Short for skeletal (typical working 1000–1300 nm);
-                               # appropriate for cardiac. Set it explicitly
-    'lattice_spacing': 14.0,   # [M] nm, thick-to-thin surface separation at
-                               # typical vertebrate sarcomere lengths
-
-    # APPENDED, and appended deliberately: DYNAMIC_FIELDS, __slots__, __init__
-    # and the pytree flatten order all derive from this dict in order, so an
-    # entry may be renamed in place but never moved. New ones go at the end.
+    # DYNAMIC_FIELDS, __slots__, __init__ and the pytree flatten order all
+    # derive from this dict, so field order is DERIVED, never positional:
+    # nothing may index DYNAMIC_FIELDS or the pytree leaves by position. Look
+    # fields up by name.
     'solver_rtol':  1e-3,      # [G] relative term of the convergence target,
                                # against the RMS backbone spring force (measured
                                # 130-210 pN at default stiffness and pCa 4.5, so
@@ -1293,13 +1280,14 @@ class DynamicParams:
     get_cardiac_params() / get_lethocerus_params() / get_drosophila_params() for
     the other presets.
 
-    Field order is fixed by _DYNAMIC_DEFAULTS and is what tree_flatten and
-    tree_unflatten rely on, so entries must never be reordered.
+    Field order is derived from _DYNAMIC_DEFAULTS by tree_flatten and
+    tree_unflatten; nothing addresses a field by position.
 
     Usage:
-        static, dynamic = get_skeletal_params()
+        static, dynamic, z0, d0 = get_skeletal_params()
         dynamic = dynamic.copy(xb_r01_coeff=350.0)   # validates field names
-        result = run(topo, dynamic_params=dynamic)
+        result = run(topo, pCa=4.5, z_line=z0, lattice_spacing=d0,
+                     dynamic_params=dynamic)
     """
 
     __slots__ = DYNAMIC_FIELDS
@@ -1311,7 +1299,13 @@ class DynamicParams:
         Defaults are skeletal fast-twitch values (~26°C); see
         ``_DYNAMIC_DEFAULTS`` at module level for values + citations.
         Use get_cardiac_params() for cardiac-specific defaults.
+
+        Raises:
+            TypeError: on any name that is not a DynamicParams field.
         """
+        invalid = set(kwargs) - set(DYNAMIC_FIELDS)
+        if invalid:
+            raise TypeError(f"Unknown parameter: {sorted(invalid)}. Valid: {list(DYNAMIC_FIELDS)}")
         for name, default in _DYNAMIC_DEFAULTS.items():
             object.__setattr__(self, name,
                 jnp.asarray(kwargs.get(name, default)))
@@ -1351,7 +1345,7 @@ class DynamicParams:
         """Create copy with updated values (JIT-compatible).
 
         Example:
-            _, dynamic = get_skeletal_params()
+            _, dynamic, *_ = get_skeletal_params()
             modified = dynamic.copy(xb_r01_coeff=400.0, tm_k_01=60000.0)
         """
         # Validate keys before constructing (Python-level, not traced)
@@ -1363,42 +1357,11 @@ class DynamicParams:
         kwargs = {name: updates.get(name, getattr(self, name)) for name in DYNAMIC_FIELDS}
         return DynamicParams(**kwargs)
 
-    def with_drivers(self, pCa, z_line, lattice_spacing) -> 'DynamicParams':
-        """Copy with only the three driver fields replaced — the scan-body fast path.
-
-        Called once per timestep, so it is on the hottest path in the model.
-        Unlike copy(), it skips the full kwargs rebuild and the jnp.asarray()
-        conversions, and shares references for the other 46 fields rather than
-        emitting an identity copy for each. Those copies are individually
-        trivial but there is one per field per timestep, which XLA otherwise
-        has to schedule.
-
-        Args:
-            pCa: Resolved calcium (from Drivers, or the constant default)
-            z_line: Resolved z-line position (nm)
-            lattice_spacing: Resolved lattice spacing (nm)
-
-        Returns:
-            New DynamicParams identical except for the three driver fields
-        """
-        # Bypass __init__ entirely — create empty instance and copy attrs
-        new = object.__new__(DynamicParams)
-        for name in DYNAMIC_FIELDS:
-            if name == 'pCa':
-                object.__setattr__(new, name, pCa)
-            elif name == 'z_line':
-                object.__setattr__(new, name, z_line)
-            elif name == 'lattice_spacing':
-                object.__setattr__(new, name, lattice_spacing)
-            else:
-                object.__setattr__(new, name, getattr(self, name))
-        return new
-
     def __repr__(self) -> str:
         return f"DynamicParams(thick_k={float(self.thick_k):.1f}, thin_k={float(self.thin_k):.1f}, ...)"
 
 
-def get_skeletal_params() -> Tuple[StaticParams, DynamicParams]:
+def get_skeletal_params() -> Tuple[StaticParams, DynamicParams, float, float]:
     """Fast-twitch skeletal muscle, ~26 °C. The model's baseline.
 
     Vertebrate lattice geometry (1 thick : 2 thin, 3 heads per crown) with
@@ -1419,26 +1382,27 @@ def get_skeletal_params() -> Tuple[StaticParams, DynamicParams]:
     kinetic coefficients (xb_r01_coeff, xb_r40) are inherited placeholders with
     no literature source at all — see their entries before trusting them.
 
-    OPERATING POINT: pass z_line explicitly. The default of 900 nm is short for
-    skeletal muscle; the physiological working range is 1000-1300 nm
-    (sarcomere length 2.0-2.6 µm), and force-length behaviour is strongly
-    dependent on it.
+    OPERATING POINT: the returned z0 = 900 nm is short for skeletal muscle; the
+    physiological working range is 1000-1300 nm (sarcomere length 2.0-2.6 µm),
+    and force-length behaviour is strongly dependent on it.
 
-        static, dynamic = get_skeletal_params()
-        result = run(topo, pCa=4.5, z_line=1100.0)   # SL ~2.2 µm
+        static, dynamic, z0, d0 = get_skeletal_params()
+        result = run(topo, pCa=4.5, z_line=1100.0, lattice_spacing=d0)   # SL ~2.2 µm
 
     Returns:
-        (StaticParams, DynamicParams)
+        (StaticParams, DynamicParams, z0, d0): z0 is the preset's natural
+        half-sarcomere length (z_line, nm from the M-line), d0 its lattice
+        spacing (thick-to-thin surface separation, nm).
 
     Example:
-        static, dynamic = get_skeletal_params()
+        static, dynamic, z0, d0 = get_skeletal_params()
         static = static.replace(n_crowns=60)
         dynamic = dynamic.copy(thick_k=9000.0)
     """
-    return StaticParams(), DynamicParams()
+    return StaticParams(), DynamicParams(), 900.0, 14.0
 
 
-def get_cardiac_params() -> Tuple[StaticParams, DynamicParams]:
+def get_cardiac_params() -> Tuple[StaticParams, DynamicParams, float, float]:
     """Generic cardiac muscle, ~27 °C.
 
     Same vertebrate lattice geometry as skeletal — the structural difference
@@ -1459,8 +1423,8 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams]:
     OPERATING POINT: cardiac sarcomeres work short, 900-1100 nm z-line
     (SL 1.8-2.2 µm):
 
-        static, dynamic = get_cardiac_params()
-        result = run(topo, pCa=4.5, z_line=950.0)   # SL ~1.9 µm
+        static, dynamic, z0, d0 = get_cardiac_params()
+        result = run(topo, pCa=4.5, z_line=950.0, lattice_spacing=d0)   # SL ~1.9 µm
 
     UNVERIFIED: the shared default tm_J_M = 2.70 was calibrated against a cardiac
     force-pCa target, but that calibration is not confirmed — see the tm_J_M
@@ -1539,10 +1503,10 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams]:
                                    L≈138 nm); Linke 1998 PNAS 95:8052
 
     Returns:
-        (StaticParams, DynamicParams)
+        (StaticParams, DynamicParams, z0, d0) — z0/d0 as in get_skeletal_params().
 
     Example:
-        static, dynamic = get_cardiac_params()
+        static, dynamic, z0, d0 = get_cardiac_params()
         dynamic = dynamic.copy(tm_Keq_01=1e6)
     """
     cardiac_overrides = {
@@ -1586,10 +1550,10 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams]:
         'titin_rest': 140.0,      # exponent offset; value from a slack length
                                   # measured at SL 1.85 µm (z=925 → L≈138 nm)
     }
-    return StaticParams(), DynamicParams(**cardiac_overrides)
+    return StaticParams(), DynamicParams(**cardiac_overrides), 900.0, 14.0
 
 
-def get_lethocerus_params() -> Tuple[StaticParams, DynamicParams]:
+def get_lethocerus_params() -> Tuple[StaticParams, DynamicParams, float, float]:
     """Lethocerus (giant water bug) indirect flight muscle.
 
     Indirect flight muscle (IFM) is the power source for insect flight, and it is
@@ -1804,14 +1768,16 @@ def get_lethocerus_params() -> Tuple[StaticParams, DynamicParams]:
     thick_starts = [1] * n_thick is the natural "no myosin superlattice" choice
     and matches n_superlattice_classes = 1:
 
-        static, dynamic = get_lethocerus_params()
+        static, dynamic, z0, d0 = get_lethocerus_params()
         topo = SarcTopology.create(
             nrows=4, ncols=3, static_params=static, dynamic_params=dynamic,
             thick_starts=[1] * n_thick,   # no thick superlattice; thin 3-fold is automatic
         )
 
     Returns:
-        Tuple of (static_params, dynamic_params)
+        (StaticParams, DynamicParams, z0, d0) — z0/d0 as in get_skeletal_params().
+        z0 = 900 nm is the inherited vertebrate default, NOT this muscle's
+        anatomical operating point; see CHOOSING z_line in get_lethocerus_params().
     """
     # Tier tags: [M] measured, [I] inferred, [G] guess — see docstring for full
     # sourcing/confidence. Every value is a literature-informed starting point.
@@ -1835,10 +1801,10 @@ def get_lethocerus_params() -> Tuple[StaticParams, DynamicParams]:
         'titin_rest': 50.0,   # [L-unverified] nm; IFM I-band length, van Straaten 1999
                               #     -- number NOT located in that paper; see docstring
     }
-    return StaticParams(**static_overrides), DynamicParams(**dynamic_overrides)
+    return StaticParams(**static_overrides), DynamicParams(**dynamic_overrides), 900.0, 14.0
 
 
-def get_drosophila_params() -> Tuple[StaticParams, DynamicParams]:
+def get_drosophila_params() -> Tuple[StaticParams, DynamicParams, float, float]:
     """Drosophila melanogaster indirect flight muscle.
 
     The same insect flight muscle geometry as get_lethocerus_params(), plus a
@@ -1885,13 +1851,15 @@ def get_drosophila_params() -> Tuple[StaticParams, DynamicParams]:
     shapes: 2x3, 4x3, 4x6, 6x6, 6x9, 8x3. Note that 4x4 — the usual go-to size
     elsewhere — does NOT satisfy this and will raise.
 
-        static, dynamic = get_drosophila_params()
+        static, dynamic, z0, d0 = get_drosophila_params()
         topo = SarcTopology.create(
             nrows=4, ncols=3, static_params=static, dynamic_params=dynamic,
         )   # thin 3-fold registration + thick superlattice both automatic
 
     Returns:
-        Tuple of (static_params, dynamic_params)
+        (StaticParams, DynamicParams, z0, d0) — z0/d0 as in get_skeletal_params().
+        z0 = 900 nm is the inherited vertebrate default, NOT this muscle's
+        anatomical operating point; see CHOOSING z_line in get_lethocerus_params().
     """
     # Tier tags [M]/[I]/[G] and full sourcing: see get_lethocerus_params() docstring
     # (geometry is shared; only n_superlattice_classes differs).
@@ -1915,7 +1883,7 @@ def get_drosophila_params() -> Tuple[StaticParams, DynamicParams]:
         'titin_b': 0.025,     # [I] nm^-1; see get_lethocerus_params() docstring
         'titin_rest': 50.0,   # [L-unverified] nm; see get_lethocerus_params() docstring
     }
-    return StaticParams(**static_overrides), DynamicParams(**dynamic_overrides)
+    return StaticParams(**static_overrides), DynamicParams(**dynamic_overrides), 900.0, 14.0
 
 
 # Alias for tiered architecture

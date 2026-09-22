@@ -60,11 +60,11 @@ Usage:
     from multifil_jax.core.sarc_geometry import SarcTopology
     from multifil_jax.core.params import get_skeletal_params
 
-    static, dynamic = get_skeletal_params()
+    static, dynamic, z0, d0 = get_skeletal_params()
     topo = SarcTopology.create(nrows=2, ncols=2, static_params=static,
                                dynamic_params=dynamic)
 
-    result = run(topo, pCa=4.5, z_line=900.0, duration_ms=1000,
+    result = run(topo, pCa=4.5, z_line=z0, lattice_spacing=d0, duration_ms=1000,
                  dynamic_params=dynamic, static_params=static)
     print(result.summary())
 """
@@ -653,16 +653,14 @@ def _run_sim_kernel(
     def create_and_equilibrate(constants, z0, pCa0, ls0):
         """Create state from topology + constants and solve equilibrium.
 
-        The drivers are baked in first. The thin frame is anchored on the
-        Z-disc, so every reconstruction of an absolute position needs the
-        Z-line this state is actually being built at — which is z0, not
-        whatever default sits in `constants`.
+        The thin frame is anchored on the Z-disc, so every reconstruction of an
+        absolute position needs the Z-line this state is built at: z0, the
+        first sample of the z_line trace.
         """
-        constants = constants.with_drivers(pCa0, z0, ls0)
         state = realize_state(topology, constants, z0, pCa0, ls0)
-        state = update_nearest_neighbors(state, constants, topology)
+        state = update_nearest_neighbors(state, topology, z0, ls0)
         state, _residual, _, _, _, _ = solve_equilibrium(
-            state, constants, topology,
+            state, constants, topology, z0, ls0,
             n_cg_steps=n_cg_steps,
             n_newton_steps=n_newton_steps,
         )
@@ -682,7 +680,7 @@ def _run_sim_kernel(
         l0 = z_trace[0]  # reference z for Poisson scaling
 
         # Subpopulation: build the K unscaled population constants once per sim
-        # (rate scales are per-sim; drivers are resolved per step inside timestep).
+        # (rate scales are per-sim; the drivers reach the kernels per step).
         if is_subpop_active:
             scale_matrix = subpop['scale_matrix']  # (K, F)
             constants_k = [
@@ -736,18 +734,17 @@ def _run_sim_kernel(
                 tm_subpop=tm_subpop,
             )
 
-            # POST-SOLVE constants: these carry the emergent new_ls, and must,
+            # POST-SOLVE drivers: these carry the emergent new_ls, and must,
             # because force and the reported lattice_spacing are post-solve
             # quantities. The Q-matrix metrics deliberately do NOT use them —
-            # they read trace.constants, which carries the PRE-solve spacing the
+            # they read trace.drivers, which carries the PRE-solve spacing the
             # rates were actually evaluated at. Both are right for their own
             # question; do not unify them. See compute_all_metrics.
-            constants_for_metrics = constants.with_drivers(pCa_val, z_val, new_ls)
             drivers_for_metrics = Drivers(pCa=pCa_val, z_line=z_val, lattice_spacing=new_ls)
-            force = axial_force_at_mline(new_state, constants_for_metrics, topology)
+            force = axial_force_at_mline(new_state, constants, topology)
 
             all_metrics = compute_all_metrics(
-                old_state, new_state, constants_for_metrics, drivers_for_metrics,
+                old_state, new_state, constants, drivers_for_metrics,
                 topology, force, solver_residual, n_iters, dt, trace,
                 residual_norm, solver_tolerance,
             )
@@ -787,11 +784,12 @@ def _run_sim_kernel(
 
 def run(
     topology: SarcTopology,
+    *,
+    pCa: Union[float, List[float], jnp.ndarray],
+    z_line: Union[float, List[float], jnp.ndarray],
+    lattice_spacing: Union[float, List[float], jnp.ndarray],
     duration_ms: float = 1000.0,
     dt: float = 1.0,
-    pCa: Union[float, List[float], jnp.ndarray] = 4.5,
-    z_line: Union[float, List[float], jnp.ndarray] = 900.0,
-    lattice_spacing: Union[float, List[float], jnp.ndarray] = 14.0,
     K_lat: Union[float, List[float], None] = None,
     nu: Union[float, List[float]] = 0.0,
     dynamic_params: Union[DynamicParams, Dict[str, Union[float, List[float]]]] = None,
@@ -813,13 +811,20 @@ def run(
     (1, 2, 4, ..., 16384), so a 225-run sweep and a 256-run sweep
     share the same compiled kernel.
 
+    Everything after `topology` is keyword-only. The three drivers (pCa, z_line,
+    lattice_spacing) are REQUIRED and have no defaults: they are not physics
+    constants and do not live in DynamicParams. Each preset returns its natural
+    z_line and lattice_spacing as z0, d0 — pass those when you have no other
+    operating point in mind.
+
     Args:
         topology: Pre-constructed SarcTopology (from SarcTopology.create())
-        duration_ms: Simulation duration in milliseconds
-        dt: Timestep in milliseconds
         pCa: Calcium as -log10([Ca]) -- float, list (sweep), or array (trace)
         z_line: Z-line position (nm) -- float, list (sweep), or array (trace)
-        lattice_spacing: Lattice spacing (nm) -- float, list, or array
+        lattice_spacing: Lattice spacing (nm) -- float, list, or array. In
+            dynamic LS mode (K_lat set) it is the reference d0 and initial guess.
+        duration_ms: Simulation duration in milliseconds
+        dt: Timestep in milliseconds
         K_lat: Lattice stiffness per thick filament (pN/nm). None = fixed LS.
                Float or list (sweep). Internally scaled by n_thick.
         nu: Poisson exponent. Applied to the CENTRE-TO-CENTRE spacing, since
@@ -844,8 +849,9 @@ def run(
                         SKELETAL kinetics everywhere else, silently. To sweep one
                         field of a non-skeletal preset, use the candidate-LIST
                         form instead:
-                            run(topo, dynamic_params=[dynamic.copy(tm_J_M=v)
-                                                      for v in values])
+                            run(topo, pCa=..., z_line=z0, lattice_spacing=d0,
+                                dynamic_params=[dynamic.copy(tm_J_M=v)
+                                                for v in values])
                         (This has already invalidated one cardiac calibration.)
         replicates: Number of statistical replicates per sweep point
         rng_seed: Base random seed
@@ -876,10 +882,10 @@ def run(
         from multifil_jax.core.sarc_geometry import SarcTopology
         from multifil_jax.core.params import get_skeletal_params, StaticParams
 
-        static, dynamic = get_skeletal_params()
+        static, dynamic, z0, d0 = get_skeletal_params()
         topo = SarcTopology.create(nrows=2, ncols=2, static_params=static, dynamic_params=dynamic)
 
-        result = run(topo, pCa=4.5, z_line=900.0, duration_ms=100)
+        result = run(topo, pCa=4.5, z_line=z0, lattice_spacing=d0, duration_ms=100)
         print(result.summary())
     """
     n_steps = int(duration_ms / dt)
@@ -924,7 +930,11 @@ def run(
     param_axis = {}        # field name -> axis name to index it with
 
     # 1. Waveform inputs (z_line, pCa, lattice_spacing) — one table each.
+    #    Each must be finite everywhere: there is no fallback value behind them.
     for name, value in [('z_line', z_line), ('pCa', pCa), ('lattice_spacing', lattice_spacing)]:
+        elems = value if isinstance(value, list) else [value]
+        if not all(np.all(np.isfinite(np.asarray(v, dtype=float))) for v in elems):
+            raise ValueError(f"{name} contains non-finite values")
         if isinstance(value, list):
             if not value:
                 raise ValueError(f"{name} sweep list is empty")

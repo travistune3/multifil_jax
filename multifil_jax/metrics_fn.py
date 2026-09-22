@@ -166,7 +166,7 @@ from typing import Dict, TYPE_CHECKING
 
 from multifil_jax.kernels.forces import xb_axial_force_by_state, xb_axial_work
 from multifil_jax.kernels.transitions import xb_expected_crossings
-from multifil_jax.core.state import (Drivers, resolve_value, MetricsDict,
+from multifil_jax.core.state import (Drivers, MetricsDict,
                                      thick_axial, thin_axial)
 
 if TYPE_CHECKING:
@@ -273,17 +273,18 @@ def compute_all_metrics(
     Args:
         old_state: State BEFORE timestep
         new_state: State AFTER timestep (equilibrium solved)
-        constants: DynamicParams with resolved physics values
-        drivers: Drivers NamedTuple with per-step pCa/z_line/ls
+        constants: DynamicParams with physics values
+        drivers: Drivers NamedTuple with this step's pCa/z_line and the
+            POST-solve lattice spacing
         topology: SarcTopology for structural lookups
         force: Scalar M-line force (already computed)
         solver_residual: Scalar equilibrium solver residual (pN)
         newton_iters: Number of Newton iterations used by solver
         dt: Timestep size (ms)
         trace: KineticsTrace from kinetics_step — the MID state (post
-            thin_transitions, pre thick_transitions), the driver-resolved
-            constants at the PRE-solve lattice spacing, the resolved
-            subpopulation tuple, and the closure-tear mask. Required, not
+            thin_transitions, pre thick_transitions), the drivers at the
+            PRE-solve lattice spacing, the subpopulation tuple, and the
+            closure-tear mask. Required, not
             optional: every realised transition count and every Q-matrix metric
             below reads it, because those are the state and the generator that
             actually drove this step.
@@ -293,13 +294,13 @@ def compute_all_metrics(
         solver_tolerance: the axial convergence tolerance used (pN), so the raw
             residual can be read against a physical scale.
 
-    THE TWO CONSTANTS OBJECTS DIFFER ON PURPOSE. `constants`/`drivers` carry the
-    SOLVED lattice spacing, and the mechanics metrics must use them —
-    `xb_axial_force_by_state` and the reported `lattice_spacing` are post-solve
-    quantities. `trace.constants` carries the PRE-solve spacing, and the Q-matrix
-    metrics must use that, because it is the spacing the rates were evaluated at.
-    Do not "unify" them; in fixed-LS mode they agree anyway, and in dynamic-LS
-    mode each is right for its own question.
+    THE TWO DRIVERS DIFFER ON PURPOSE. `drivers` carries the SOLVED lattice
+    spacing, and the mechanics metrics must use it — `xb_axial_force_by_state`
+    and the reported `lattice_spacing` are post-solve quantities.
+    `trace.drivers` carries the PRE-solve spacing, the one the rates were
+    evaluated at. Do not "unify" them; in fixed-LS mode they agree anyway, and
+    in dynamic-LS mode each is right for its own question. `constants` is the
+    one physics object both share.
 
     Returns:
         MetricsDict with all metric values (supports both dict and attribute access)
@@ -312,17 +313,14 @@ def compute_all_metrics(
     mid_xb = trace.state.thick.xb_states
     new_tm = new_state.thin.tm_states
 
-    z_line_for_pos = resolve_value(drivers.z_line, constants.z_line)
+    z_line = drivers.z_line
+    lattice_spacing = drivers.lattice_spacing
     f_xb_loose, f_xb_tight_1, f_xb_tight_2 = xb_axial_force_by_state(
         thick_axial(new_state, topology),
-        thin_axial(new_state, topology, z_line_for_pos), new_xb,
+        thin_axial(new_state, topology, z_line), new_xb,
         new_state.thick.xb_bound_to,
-        resolve_value(drivers.lattice_spacing, constants.lattice_spacing),
+        lattice_spacing,
         constants, topology)
-
-    # Resolve driver values
-    z_line = resolve_value(drivers.z_line, constants.z_line)
-    lattice_spacing = resolve_value(drivers.lattice_spacing, constants.lattice_spacing)
 
     # ========================================================================
     # CROSSBRIDGE STATE COUNTS
@@ -448,12 +446,12 @@ def compute_all_metrics(
     # NEW z_line gives exactly the pre-solve absolute positions. (That is the
     # same number the explicit `thin.axial + dz` used to produce; the invariant
     # this comment used to assert is now true by construction.)
-    ls_old = trace.constants.lattice_spacing
+    ls_old = trace.drivers.lattice_spacing
     work_xb = xb_axial_work(
         thick_axial(old_state, topology),
-        thin_axial(old_state, topology, z_line_for_pos), ls_old,
+        thin_axial(old_state, topology, z_line), ls_old,
         thick_axial(new_state, topology),
-        thin_axial(new_state, topology, z_line_for_pos), lattice_spacing,
+        thin_axial(new_state, topology, z_line), lattice_spacing,
         new_xb, new_state.thick.xb_bound_to, constants, topology)
 
     # ========================================================================

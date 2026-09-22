@@ -151,7 +151,7 @@ def count_transitions(old_state: 'State', new_state: 'State') -> Dict[str, int]:
 
 
 def validate_forces_numerical(state: 'State', constants: 'DynamicParams',
-                              topology: 'SarcTopology',
+                              topology: 'SarcTopology', z_line, lattice_spacing,
                               epsilon: float = 1e-4, tolerance: float = 1.0) -> bool:
     """Check the analytic force kernel against the gradient of an energy function.
 
@@ -196,9 +196,10 @@ def validate_forces_numerical(state: 'State', constants: 'DynamicParams',
 
     Args:
         state: State to evaluate at, including crossbridge attachment
-        constants: DynamicParams with spring constants, titin parameters,
-            z_line and lattice_spacing
+        constants: DynamicParams with spring constants and titin parameters
         topology: SarcTopology supplying rest spacings and crossbridge targets
+        z_line: Z-line position the state is at (nm)
+        lattice_spacing: lattice spacing the state is at (nm)
         epsilon: Unused. Retained so existing call sites keep working; the
             comparison uses autodiff, which needs no step size.
         tolerance: Maximum tolerated discrepancy (pN). See SENSITIVITY above.
@@ -224,16 +225,15 @@ def validate_forces_numerical(state: 'State', constants: 'DynamicParams',
     forces_analytical = compute_forces_vectorized(
         u_thick, u_thin,
         constants.thick_k, constants.thin_k,
-        constants.z_line, constants.lattice_spacing,
+        z_line, lattice_spacing,
         constants.titin_a, constants.titin_b, constants.titin_rest,
         xb_states, xb_bound_to, constants, topology
     )
 
     # Compute numerical forces via jax.grad on total energy
-    z_line = constants.z_line
     thick_k = constants.thick_k
     thin_k = constants.thin_k
-    d = constants.lattice_spacing
+    d = lattice_spacing
 
     # ------------------------------------------------------------------ setup
     # Per-crossbridge constants. Which spring configuration applies depends on
@@ -371,7 +371,8 @@ def validate_forces_numerical(state: 'State', constants: 'DynamicParams',
 
 
 def validate_equilibrium(state: 'State', constants: 'DynamicParams',
-                         topology: 'SarcTopology', tolerance: float = 1.0) -> bool:
+                         topology: 'SarcTopology', z_line, lattice_spacing,
+                         tolerance: float = 1.0) -> bool:
     """Check whether a state is actually at mechanical equilibrium.
 
     Evaluates the FULL force residual — backbone springs, crossbridges and titin
@@ -399,6 +400,8 @@ def validate_equilibrium(state: 'State', constants: 'DynamicParams',
         state: State to check, normally one returned by solve_equilibrium
         constants: DynamicParams with physics values
         topology: SarcTopology with structural index maps
+        z_line: Z-line position the state is at (nm)
+        lattice_spacing: lattice spacing the state is at (nm)
         tolerance: Maximum allowed residual (pN)
 
     Returns:
@@ -406,7 +409,8 @@ def validate_equilibrium(state: 'State', constants: 'DynamicParams',
     """
     from multifil_jax.kernels.forces import compute_forces_from_state_vectorized
 
-    forces = compute_forces_from_state_vectorized(state, constants, topology)
+    forces = compute_forces_from_state_vectorized(state, constants, topology,
+                                                  z_line, lattice_spacing)
     max_residual = float(jnp.max(jnp.abs(forces)))
 
     print(f"Equilibrium Validation:")

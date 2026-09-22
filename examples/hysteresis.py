@@ -84,7 +84,7 @@ def plot_metric_corner(results, metric_name='axial_force', last_n=20, cmap='viri
 
 print("Creating topology and running stiffness parameter sweep...")
 
-static, dynamic = get_skeletal_params()
+static, dynamic, z0, d0 = get_skeletal_params()
 topo_vert = SarcTopology.create(nrows=2, 
                                   ncols=2, 
                                   static_params=static, 

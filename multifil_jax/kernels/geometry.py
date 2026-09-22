@@ -187,8 +187,9 @@ def calculate_xb_to_bs_distances(xb_base_positions: jnp.ndarray,
 
 def update_nearest_neighbors(
     state,
-    constants,
-    topology: 'SarcTopology'
+    topology: 'SarcTopology',
+    z_line,
+    lattice_spacing,
 ):
     """Recompute every crossbridge's nearest binding site and its distances.
 
@@ -205,14 +206,15 @@ def update_nearest_neighbors(
             TRUE axial positions — the binding search compares against the
             M-line at 0 and against absolute site coordinates, so it cannot be
             done in the displacement frame.
-        constants: DynamicParams, for the current lattice_spacing
         topology: SarcTopology with the precomputed candidate lists
+        z_line: current Z-line position (nm), anchors the thin frame
+        lattice_spacing: current lattice spacing (nm)
 
     Returns:
         new_state: State with xb_nearest_bs and xb_distances updated
     """
     thick_pos = thick_axial(state, topology)
-    thin_pos = thin_axial(state, topology, constants.z_line)
+    thin_pos = thin_axial(state, topology, z_line)
 
     n_thick, n_crowns = thick_pos.shape
     n_xb_per_crown = topology.n_xb_per_crown
@@ -248,7 +250,7 @@ def update_nearest_neighbors(
         thin_pos,
         nearest_thin,
         nearest_site,
-        constants.lattice_spacing
+        lattice_spacing
     )
 
     # Store site_idx only - thin filament is implicit from topology.xb_to_thin_id
@@ -284,7 +286,7 @@ if __name__ == "__main__":
     print("="*60)
 
     # Create test state using SarcTopology
-    static_params, dynamic_params = get_skeletal_params()
+    static_params, dynamic_params, *_ = get_skeletal_params()
     np.random.seed(42)
     geometry = SarcTopology.create(nrows=2, ncols=2, static_params=static_params, dynamic_params=dynamic_params)
 

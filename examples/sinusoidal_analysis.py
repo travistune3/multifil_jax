@@ -364,7 +364,7 @@ if __name__ == "__main__":
     print("Step 2: Executing grid via run()")
     print("-" * 60)
 
-    static, dynamic = get_skeletal_params()
+    static, dynamic, z0, d0 = get_skeletal_params()
     topo = SarcTopology.create(
         nrows=NROWS,
         ncols=NCOLS,

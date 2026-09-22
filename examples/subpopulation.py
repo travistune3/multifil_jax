@@ -25,11 +25,11 @@ print("=" * 70)
 print("Subpopulation Feature")
 print("=" * 70)
 
-static, dynamic = get_skeletal_params()
+static, dynamic, z0, d0 = get_skeletal_params()
 topo = SarcTopology.create(nrows=4, ncols=4, static_params=static, dynamic_params=dynamic)
 topo = jax.device_put(topo)
 
-RUN_KWARGS = dict(pCa=4.5, z_line=1100.0, duration_ms=200, dt=1.0)
+RUN_KWARGS = dict(pCa=4.5, z_line=1100.0, lattice_spacing=d0, duration_ms=200, dt=1.0)
 
 # ===========================================================================
 # 1. MEAN-FIELD: fraction sweep of a "weak motor" mutant

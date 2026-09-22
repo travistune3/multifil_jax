@@ -12,11 +12,11 @@ See `docs/README.md` for a detailed walkthrough and `docs/INSTALL.md` for instal
 from multifil_jax import run, get_skeletal_params, SarcTopology
 import jax
 
-static, dynamic = get_skeletal_params()
+static, dynamic, z0, d0 = get_skeletal_params()   # z0, d0: preset z_line / lattice spacing
 topo = SarcTopology.create(nrows=2, ncols=2, static_params=static, dynamic_params=dynamic)
 topo = jax.device_put(topo)
 
-result = run(topo, pCa=4.5, z_line=900.0, duration_ms=1000)
+result = run(topo, pCa=4.5, z_line=z0, lattice_spacing=d0, duration_ms=1000)
 print(result.axial_force.mean())
 ```
 

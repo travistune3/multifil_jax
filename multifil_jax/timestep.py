@@ -19,20 +19,20 @@ structure permits without modification.
 
 STEP ORDER
 
-    1. resolve drivers        merge per-step pCa / z_line / lattice_spacing over
-                              the constant defaults
-    2. update nearest sites   recompute each head's target and its strain, since
+    1. update nearest sites   recompute each head's target and its strain, since
                               the lattice moved during the previous solve
-    3. thin transitions       tropomyosin sites sample new states, coupled to
+    2. thin transitions       tropomyosin sites sample new states, coupled to
                               their chain neighbours
-    4. thick transitions      heads sample new states; binding bookkeeping is
+    3. thick transitions      heads sample new states; binding bookkeeping is
                               updated on both filaments
     --- kinetics_step() returns here, with a KineticsTrace of what it saw ---
-    5. solve equilibrium      Newton-CG until net force on every node vanishes
+    4. solve equilibrium      Newton-CG until net force on every node vanishes
 
-Note that no step of the kinetics phase reads z_line. Ising cooperativity takes
-its neighbour information straight from tm_states, so nothing here depends on
-filament tension — which is what lets a multi-sarcomere extension run every
+The drivers (pCa, z_line, lattice_spacing) arrive as one Drivers bundle and are
+handed to each kernel as the explicit scalars it uses. In the kinetics phase
+z_line is read only to place the thin sites for the nearest-site search. Ising
+cooperativity takes its neighbour information straight from tm_states, so
+nothing here depends on filament tension — which is what lets a multi-sarcomere extension run every
 sarcomere's chemistry independently before one joint solve.
 
 A NOTE ON Z-LINE CHANGES. When z_line moves between steps, the thin filament
@@ -51,7 +51,7 @@ from multifil_jax.kernels.geometry import update_nearest_neighbors
 from multifil_jax.kernels.transitions import (thin_transitions, thick_transitions,
                                               xb_binned_generator)
 from multifil_jax.kernels.solver import solve_equilibrium
-from multifil_jax.core.state import Drivers, KineticsTrace, resolve_value
+from multifil_jax.core.state import Drivers, KineticsTrace
 
 if TYPE_CHECKING:
     from multifil_jax.core.sarc_geometry import SarcTopology
@@ -74,7 +74,7 @@ def kinetics_step(state: 'State',
                   tm_subpop=None) -> Tuple['State', jnp.ndarray, KineticsTrace]:
     """Run the stochastic half of a timestep: everything except the force solve.
 
-    Resolves the drivers, updates crossbridge geometry, then samples new
+    Updates crossbridge geometry, then samples new
     tropomyosin and crossbridge states. Leaves the lattice out of equilibrium —
     the caller is responsible for solving it, either immediately (timestep()) or
     after gathering several coupled sarcomeres.
@@ -82,7 +82,7 @@ def kinetics_step(state: 'State',
     Args:
         state: Current State NamedTuple (pure state, no embedded params)
         constants: DynamicParams/Constants with physics values
-        drivers: Drivers NamedTuple with per-step pCa/z_line/ls (NaN = use constant)
+        drivers: Drivers NamedTuple with this step's pCa/z_line/lattice_spacing
         topology: SarcTopology for indexing
         rng_key: JAX random key for stochastic transitions
         dt: Timestep size (ms) -- keyword-only, JIT static
@@ -91,45 +91,28 @@ def kinetics_step(state: 'State',
         (state_after_kinetics, new_rng_key, trace)
 
         trace is a KineticsTrace: the MID state (after thin_transitions, before
-        thick_transitions), the driver-resolved constants, the resolved
-        subpopulation tuple, and the closure-tear mask. Everything a metric
+        thick_transitions), the drivers it ran at, the subpopulation tuple,
+        and the closure-tear mask. Everything a metric
         needs to describe the step that actually happened, gathered once here
         rather than re-derived — see core/state.KineticsTrace.
 
-        trace.constants carries the driver values baked in, so callers do not
-        have to redo the NaN-merge. A coupled solver may substitute a different
-        z_line before equilibrating, via constants.with_drivers(...).
+        trace.drivers carries the pre-solve drivers. A coupled solver may
+        substitute a different z_line before equilibrating, via
+        trace.drivers._replace(z_line=...).
 
         THE TRACE IS A WITHIN-STEP VALUE. It holds a whole State, so it must
         never be put in a scan carry or a scan output.
     """
-    # Step 0: Resolve drivers -- merge time-varying overrides with constants
-    pCa = resolve_value(drivers.pCa, constants.pCa)
-    z_line = resolve_value(drivers.z_line, constants.z_line)
-    lattice_spacing = resolve_value(drivers.lattice_spacing, constants.lattice_spacing)
-
-    # Build a resolved constants with current driver values
-    resolved_constants = constants.with_drivers(pCa, z_line, lattice_spacing)
-
-    # Resolve subpopulation constants_k with the same drivers (rate scales are
-    # already baked in; with_drivers only sets pCa/z_line/lattice_spacing).
-    def _resolve_subpop(sp):
-        if sp is None:
-            return None
-        mode, constants_k, extra = sp
-        return (mode, [ck.with_drivers(pCa, z_line, lattice_spacing) for ck in constants_k], extra)
-    xb_subpop_r = _resolve_subpop(xb_subpop)
-    tm_subpop_r = _resolve_subpop(tm_subpop)
-
     # Step 1: Update nearest binding sites using topology
-    state = update_nearest_neighbors(state, resolved_constants, topology)
+    state = update_nearest_neighbors(state, topology, drivers.z_line,
+                                     drivers.lattice_spacing)
 
     # Step 2: Thin filament transitions. Neighbour states are counted inside
     # thin_transitions from the current tm_states, so there is nothing to
     # precompute here.
     rng_key, thin_key = jax.random.split(rng_key)
     state, _P_thin, torn = thin_transitions(
-        state, resolved_constants, topology, thin_key, dt, tm_subpop=tm_subpop_r)
+        state, constants, topology, drivers.pCa, thin_key, dt, tm_subpop=tm_subpop)
 
     # Step 3: build the crossbridge generator and exponentiate it — ONCE.
     # `state` is at this instant exactly what the generator must be built from.
@@ -138,15 +121,15 @@ def kinetics_step(state: 'State',
     # Until 2026-09-11 metrics_fn took a SECOND exponential of its own, of a
     # different (absorbing) generator; the exact estimator needs no such
     # generator, so the duplication went with it.
-    bins = xb_binned_generator(state, resolved_constants, topology, dt,
-                               xb_subpop=xb_subpop_r)
+    bins = xb_binned_generator(state, constants, topology, drivers.pCa,
+                               drivers.lattice_spacing, dt, xb_subpop=xb_subpop)
 
     # Capture the trace HERE, between the two transition calls, because `state`
     # and `bins` together are exactly the step thick_transitions is about to
     # take. A metric that describes that step has to read these, or it describes
     # a step that never happened.
-    trace = KineticsTrace(state=state, constants=resolved_constants,
-                          xb_subpop=xb_subpop_r, torn=torn, xb_bins=bins)
+    trace = KineticsTrace(state=state, drivers=drivers,
+                          xb_subpop=xb_subpop, torn=torn, xb_bins=bins)
 
     # Step 4: Thick filament transitions
     rng_key, thick_key = jax.random.split(rng_key)
@@ -180,14 +163,14 @@ def timestep(state: 'State',
 
     Tiered Architecture:
         state: Pure simulation state (Tier 0)
-        constants: Physics parameters including default pCa/z_line/ls (Tier 2)
-        drivers: Time-varying overrides for pCa/z_line/ls (Tier 3)
+        constants: Physics parameters (Tier 2)
+        drivers: This step's pCa/z_line/lattice_spacing (Tier 3)
         topology: Structural index data (Tier 1)
 
     Args:
         state: Current State NamedTuple (pure state, no embedded params)
         constants: DynamicParams/Constants with physics values
-        drivers: Drivers NamedTuple with per-step pCa/z_line/ls (NaN = use constant)
+        drivers: Drivers NamedTuple with this step's pCa/z_line/lattice_spacing
         topology: SarcTopology for indexing
         rng_key: JAX random key for stochastic transitions
         dt: Timestep size (ms) -- keyword-only, JIT static
@@ -206,9 +189,8 @@ def timestep(state: 'State',
             prescribed one otherwise.
         n_iters: Newton iterations taken, useful for spotting configurations
             where the solve is struggling.
-        trace: KineticsTrace for this step — the mid state, the resolved
-            constants, the resolved subpopulation tuple and the closure-tear
-            mask. Feed it straight to compute_all_metrics. Within-step only;
+        trace: KineticsTrace for this step — the mid state, the pre-solve
+            drivers, the subpopulation tuple and the closure-tear mask. Feed it straight to compute_all_metrics. Within-step only;
             never carry it through a scan. See kinetics_step.
         solver_residual_norm: max(|F| / tol_vec), dimensionless. <= 1 means
             converged, in BOTH lattice-spacing modes.
@@ -221,7 +203,7 @@ def timestep(state: 'State',
 
     (new_state, solver_residual, new_ls, n_iters,
      residual_norm, tol_axial) = solve_equilibrium(
-        state, trace.constants, topology,
+        state, constants, topology, drivers.z_line, drivers.lattice_spacing,
         K_lat=K_lat, d_ref=d_ref,
         n_cg_steps=n_cg_steps,
         n_newton_steps=n_newton_steps,

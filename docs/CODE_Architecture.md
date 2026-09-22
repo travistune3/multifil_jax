@@ -17,21 +17,31 @@ The v3.0 architecture separates concerns into four tiers:
 | 0 | **State** | `State` NamedTuple | Pure simulation state (no params/geometry) |
 | 1 | **Topology** | `SarcTopology` | Structural index maps. Changing requires recompile. |
 | 2 | **Constants** | `DynamicParams` | Physics values. Sweepable without recompile. Alias: `Constants` |
-| 3 | **Drivers** | `Drivers` | Per-timestep overrides (pCa, z_line, lattice_spacing) |
+| 3 | **Drivers** | `Drivers` | Per-timestep values (pCa, z_line, lattice_spacing) |
 
-**Kernel signature:** `kernel(state, constants, drivers, topology, rng_key, *, dt)`
+**Orchestrator signature:** `kinetics_step(state, constants, drivers, topology, rng_key, *, dt)`
 
-### `resolve_value()` Pattern
+### Explicit driver threading
 
-`resolve_value(driver_val, constant_val)` — selects Tier 3 if not NaN, else Tier 2:
+The drivers are **not** in `DynamicParams`, and there is no fallback value
+behind them. `run()` requires all three (keyword-only, no defaults) and rejects
+non-finite input. Each preset returns its natural operating point alongside the
+params: `static, dynamic, z0, d0 = get_skeletal_params()`.
 
-```python
-# In core/state.py
-def resolve_value(driver_val, constant_val):
-    return jnp.where(jnp.isnan(driver_val), constant_val, driver_val)
-```
+`Drivers(pCa, z_line, lattice_spacing)` is a plain NamedTuple used only at the
+orchestration layer — `kinetics_step`, `timestep`, `compute_all_metrics` and
+`KineticsTrace`. Below that, each kernel takes the scalars it actually uses as
+required positional arguments right after `topology`, so its signature states
+its driver dependence:
 
-Used in every kernel to merge per-step overrides with defaults without branching.
+| Kernel | Driver arguments |
+|--------|------------------|
+| `update_nearest_neighbors(state, topology, z_line, lattice_spacing)` | both geometry drivers |
+| `thin_transitions(state, constants, topology, pCa, rng_key, dt, ...)` | `pCa` |
+| `xb_binned_generator(state, constants, topology, pCa, lattice_spacing, dt, ...)` | `pCa`, spacing |
+| `solve_equilibrium(state, constants, topology, z_line, lattice_spacing, ...)` | both (spacing = initial d in dynamic LS) |
+| `compute_forces_from_state_vectorized(state, constants, topology, z_line, lattice_spacing)` | both |
+| `axial_force_at_mline(state, constants, topology)` | none |
 
 ### vmap-outside-scan Architecture
 
@@ -51,12 +61,13 @@ into one GPU kernel — maximum parallelism with minimum kernel launch overhead.
 
 ```python
 result = run(
-    topology,            # SarcTopology (Tier 1)
+    topology,            # SarcTopology (Tier 1); everything after is keyword-only
+    *,
+    pCa,                 # REQUIRED  float | list[float] | array(n_steps)
+    z_line,              # REQUIRED  float | list[float] | array(n_steps)
+    lattice_spacing,     # REQUIRED  float | list[float] | array(n_steps)
     duration_ms=1000.0,
     dt=1.0,
-    pCa=4.5,             # float | list[float] | array(n_steps)
-    z_line=900.0,        # float | list[float] | array(n_steps)
-    lattice_spacing=14.0,
     K_lat=None,          # float | list[float] | None  — lattice stiffness
     nu=0.0,              # float | list[float]          — Poisson exponent
     dynamic_params=None, # DynamicParams | dict[str, float|list] | list[DynamicParams]
@@ -119,29 +130,31 @@ from multifil_jax.simulation import run
 from multifil_jax.core.sarc_geometry import SarcTopology
 from multifil_jax.core.params import StaticParams, get_skeletal_params
 
-static, dynamic = get_skeletal_params()
+static, dynamic, z0, d0 = get_skeletal_params()
 topo = SarcTopology.create(nrows=2, ncols=2, static_params=static, dynamic_params=dynamic)
+drv = dict(z_line=z0, lattice_spacing=d0)
 
 # Simple isometric
-result = run(topo, pCa=4.5, z_line=900.0, duration_ms=1000, static_params=static)
+result = run(topo, pCa=4.5, **drv, duration_ms=1000, static_params=static)
 
 # pCa sweep
-result = run(topo, pCa=[9.0, 6.0, 4.5], replicates=5)
+result = run(topo, pCa=[9.0, 6.0, 4.5], **drv, replicates=5)
 
 # DynamicParams sweep (dict form — skeletal base, see warning above)
-result = run(topo, pCa=4.5, dynamic_params={'thick_k': [5000, 7500, 10000]})
+result = run(topo, pCa=4.5, **drv, dynamic_params={'thick_k': [5000, 7500, 10000]})
 
 # Preset-preserving sweep (candidate-list form)
-result = run(topo, pCa=4.5,
+result = run(topo, pCa=4.5, **drv,
              dynamic_params=[dynamic.copy(thick_k=k) for k in (5000, 7500, 10000)])
 
-# Dynamic lattice spacing
-result = run(topo, pCa=4.5, K_lat=5.0, nu=0.5, duration_ms=500)
+# Dynamic lattice spacing (lattice_spacing is the reference d0 / initial guess)
+result = run(topo, pCa=4.5, **drv, K_lat=5.0, nu=0.5, duration_ms=500)
 ```
 
 ### Species presets
 
-`core/params.py` ships four `(StaticParams, DynamicParams)` factories:
+`core/params.py` ships four `(StaticParams, DynamicParams, z0, d0)` factories
+(z0 = natural z_line, d0 = lattice spacing, both nm; all four currently 900 / 14):
 
 | Factory | Geometry | Notes |
 |---------|----------|-------|
@@ -302,16 +315,17 @@ no runtime branch). When `K_lat` is not None, passes `K_lat` and `d_ref` to
 
 **Workflow:**
 
-1. **resolve_value** — merge Drivers (Tier 3) with Constants (Tier 2) via `with_drivers()`
-2. **update_nearest_neighbors** — per-XB geometry (axial/radial distance to nearest site)
-3. **thin_transitions** — TM 4-state Markov transitions, 54 unique Q matrices
-4. **thick_transitions** — XB 6-state Markov transitions (binned Q → gather)
-5. **solve_equilibrium** — Newton-CG solver (unified fixed/dynamic LS)
+1. **update_nearest_neighbors** — per-XB geometry (axial/radial distance to nearest site)
+2. **thin_transitions** — TM 4-state Markov transitions, 54 unique Q matrices
+3. **thick_transitions** — XB 6-state Markov transitions (binned Q → gather)
+4. **solve_equilibrium** — Newton-CG solver (unified fixed/dynamic LS)
 
-Steps 1–4 are `kinetics_step()`. Step 5 is the mechanical solve.
+Steps 1–3 are `kinetics_step()`. Step 4 is the mechanical solve. Each kernel
+gets its drivers as explicit scalars from the `Drivers` bundle (see §1).
 
-No step of the kinetics phase reads the resolved `z_line` — cooperativity is
-derived from neighbouring TM states, not from filament tension.
+In the kinetics phase `z_line` is read only to place the thin sites for the
+nearest-site search — cooperativity is derived from neighbouring TM states, not
+from filament tension.
 It is deprecated and slated for removal.
 
 `xb_subpop`/`tm_subpop` are `(mode, constants_k, extra)` tuples or `None`;
@@ -371,10 +385,14 @@ new_state = state._replace(thick=state.thick._replace(axial=new_axial))
 state = realize_state(topology, constants, z_line, pCa, lattice_spacing)
 ```
 
-**Drivers** — per-step overrides (NaN = use constant):
+**Drivers** — per-step values, always finite (no fallback):
 ```python
-Drivers(pCa=jnp.nan, z_line=jnp.nan, lattice_spacing=jnp.nan)
+Drivers(pCa=4.5, z_line=900.0, lattice_spacing=14.0)
 ```
+
+**KineticsTrace** carries `drivers` — the PRE-solve drivers the kinetics ran at.
+The scan body builds a second, POST-solve `Drivers(pCa, z_line, new_ls)` for the
+mechanics metrics. Both are passed to `compute_all_metrics` with one `constants`.
 
 ---
 
@@ -514,9 +532,11 @@ illustrative.
 
 ### DynamicParams / Constants (JAX PyTree, sweepable)
 
-All 49 physical parameters as JAX arrays. Sweepable without recompile:
+All 46 physical parameters as JAX arrays. Sweepable without recompile. The
+drivers are not fields; an unknown name raises (`TypeError` from `__init__`,
+`ValueError` from `copy()` and from `run(dynamic_params={...})`):
 ```python
-dynamic = DynamicParams(thick_k=7500.0, thin_k=5500.0, pCa=4.5, ...)
+dynamic = DynamicParams(thick_k=7500.0, thin_k=5500.0, ...)
 dynamic_modified = dynamic.copy(thick_k=9000.0)
 ```
 
@@ -524,17 +544,11 @@ Defaults live in the `_DYNAMIC_DEFAULTS` ordered dict at the top of `params.py`,
 with literature citations inline. That dict is the single source of truth:
 `__slots__`, `DYNAMIC_FIELDS`, and `__init__` all derive from it, so **adding a
 parameter is one edit**. Insertion order is the `tree_flatten`/`tree_unflatten`
-order.
+order; it is derived, never positional — nothing indexes a field by position.
 
 Current defaults are literature-anchored, not the old pre-3.0 values:
 `thick_k=7500` (whole-filament ≈ 144 pN/nm) and `thin_k=5500` (≈ 61 pN/nm), per
 Brunello 2014 / Mijailovich 2021 — these replace the uncited 2020/1743.
-
-**Drivers fast path** — creates new DynamicParams with only the 3 driver fields updated:
-```python
-constants = base_constants.with_drivers(pCa, z_line, lattice_spacing)
-```
-Avoids ~46 redundant identity-copy XLA ops per timestep.
 
 ---
 
@@ -594,7 +608,7 @@ argument, making the anti-cooperative mistake structurally unrepresentable.
 
 **File:** `multifil_jax/kernels/geometry.py`
 
-`update_nearest_neighbors(state, constants, topology)` → updated `State`
+`update_nearest_neighbors(state, topology, z_line, lattice_spacing)` → updated `State`
 
 **Logic:**
 - For each XB, finds the single nearest candidate binding site via a fixed-width
@@ -698,7 +712,7 @@ absorb float32 drift.
 ### Axial forces (for equilibrium solver and output)
 - `axial_force_at_mline(state, constants)` — total M-line force (pN)
 - `compute_forces_vectorized(...)` — per-node axial residual forces for solver
-- `compute_forces_from_state_vectorized(state, constants, topology)` — convenience wrapper
+- `compute_forces_from_state_vectorized(state, constants, topology, z_line, lattice_spacing)` — convenience wrapper
 
 Force contributions: thick spring chain, thin spring chain, XB (converter + globular
 springs for states 2-4), titin (exponential model).
@@ -723,7 +737,7 @@ rather than replicating them — it is the *other component of the same rotation
 
 ```python
 solve_equilibrium(
-    state, constants, topology,
+    state, constants, topology, z_line, lattice_spacing,
     K_lat=None, d_ref=None, tolerance=None,
     n_newton_steps=16, n_cg_steps=6,
     precond_params=None, prefactored_precond=None,
@@ -731,7 +745,7 @@ solve_equilibrium(
 ```
 
 Returns a 4-tuple: the equilibrated state, scalar max residual (pN), the
-lattice spacing used (solved `d` in dynamic mode, `constants.lattice_spacing` in
+lattice spacing used (solved `d` in dynamic mode, the prescribed `lattice_spacing` in
 fixed mode), and the number of Newton iterations used. `K_lat is None` selects
 fixed LS mode at trace time (no runtime branch).
 
@@ -823,8 +837,8 @@ metrics = compute_all_metrics(
 )
 ```
 
-`constants`/`drivers` carry the **solved** lattice spacing (force and the
-reported `lattice_spacing` are post-solve quantities); `trace.constants` carries
+`drivers` carries the **solved** lattice spacing (force and the
+reported `lattice_spacing` are post-solve quantities); `trace.drivers` carries
 the **pre-solve** one (the rates were evaluated there). Both are correct for
 their own question and must not be unified.
 
@@ -966,8 +980,9 @@ sp = Subpopulation.mean_field(0.5, xb_srx_kmax=0.3, xb_r01_coeff=4.0)
 sp = Subpopulation.random(0.5, seed=0, xb_srx_kmax=0.3)
 sp = Subpopulation.c_zone(topo, 350.0, 650.0, xb_r01_coeff=2.0)
 
-result = run(topo, pCa=4.5, subpopulation=sp)
-result = run(topo, pCa=4.5, subpopulation=[sp_a, sp_b, sp_c])   # sweep axis
+result = run(topo, pCa=4.5, z_line=z0, lattice_spacing=d0, subpopulation=sp)
+result = run(topo, pCa=4.5, z_line=z0, lattice_spacing=d0,
+             subpopulation=[sp_a, sp_b, sp_c])   # sweep axis
 ```
 
 | Mode | Mechanism | Determinism |
@@ -998,7 +1013,7 @@ global scale, bit-for-bit, in every mode.
 | `multifil_jax/simulation.py` | `run()`, `SimulationResult`, `_run_sim_kernel`, `BATCH_BUCKETS` |
 | `multifil_jax/timestep.py` | `kinetics_step()`, `timestep()` — single step orchestrator |
 | `multifil_jax/metrics_fn.py` | `compute_all_metrics()` — 43-metric MetricsDict |
-| `multifil_jax/core/state.py` | State hierarchy, `realize_state()`, `Drivers`, `KineticsTrace`, `resolve_value()`, `MetricsDict`, `PreconditionerParams` |
+| `multifil_jax/core/state.py` | State hierarchy, `realize_state()`, `Drivers`, `KineticsTrace`, `MetricsDict`, `PreconditionerParams` |
 | `multifil_jax/core/params.py` | `StaticParams`, `DynamicParams`/`Constants`, `_DYNAMIC_DEFAULTS`, the four species presets |
 | `multifil_jax/core/sarc_geometry.py` | `SarcTopology` — PyTree topology, `create()`, `valid_xb_targets()` |
 | `multifil_jax/core/subpopulation.py` | `Subpopulation` dataclass + mask generation |
@@ -1029,7 +1044,7 @@ global scale, bit-for-bit, in every mode.
 |-----|-------------|
 | 1A | TM/XB diagonal rates: `-(a + b)` instead of `vmap(ordered_sum)` |
 | 1B | `expm_pade6_batch` squaring: `fori_loop(0, 18, ...)` |
-| 2A | `DynamicParams.with_drivers()` fast path for scan body |
+| 2A | Drivers threaded as explicit scalars — no per-step DynamicParams rebuild (`with_drivers()` deleted) |
 | 2B | `precond_params` built once before scan, reused |
 | 3A | Thomas algorithm replaces Lineax cusparse; pre-factored before scan |
 | 3B | `thick_transitions` per-XB probability gather: `vmap(lambda P, s: P[s])(P_all, states)` |

@@ -84,7 +84,7 @@ def plot_metric_corner(results, metric_name='axial_force', last_n=20, cmap='viri
 
 print("Creating topology and running stiffness parameter sweep...")
 
-static, dynamic = get_skeletal_params()
+static, dynamic, z0, d0 = get_skeletal_params()
 topo = SarcTopology.create(nrows=2, 
                            ncols=2, 
                            static_params=static, 
@@ -158,7 +158,7 @@ print("=" * 60)
 start = time.time()
 result = run(topo, 
              pCa=4.0, 
-             z_line=1100.0, 
+             z_line=1100.0, lattice_spacing=d0, 
              duration_ms=10, 
              dt=1.0)
 result.axial_force.block_until_ready()
@@ -168,7 +168,7 @@ print(f"First run (with JIT): {time.time() - start:.2f}s")
 start = time.time()
 result = run(topo, 
              pCa=4.0, 
-             z_line=1100.0, 
+             z_line=1100.0, lattice_spacing=d0, 
              duration_ms=10, 
              dt=1.0, 
              rng_seed=1)
@@ -192,7 +192,7 @@ start = time.time()
 # jax.profiler.start_trace("/tmp/jax-trace")
 result = run(topo, 
              pCa=4.0, 
-             z_line=1100.0, 
+             z_line=1100.0, lattice_spacing=d0, 
              duration_ms=25, 
              dt=1.0)
 result.axial_force.block_until_ready()
@@ -208,7 +208,7 @@ print(f'Execution Time: {end-start:.2f}s')
 # LARGER GRID EXAMPLE (15x15 sweep)
 # =============================================================================
 
-static, dynamic = get_skeletal_params()
+static, dynamic, z0, d0 = get_skeletal_params()
 topo_4x4 = SarcTopology.create(nrows=4, 
                                ncols=4, 
                                static_params=static, 
@@ -242,7 +242,7 @@ for n in sizes:
     topo_n = jax.device_put(topo_n)
     r = run(topo_n, 
             pCa=4.0, 
-            z_line=1100.0, 
+            z_line=1100.0, lattice_spacing=d0, 
             duration_ms=10, 
             dt=1.0)
     results_by_size.append(r)

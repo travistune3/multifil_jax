@@ -97,8 +97,10 @@ important concept in this codebase.
 
 ### StaticParams and DynamicParams (the parameters)
 
-`multifil_jax/core/params.py` provides four preset factories, each returning a
-`(StaticParams, DynamicParams)` pair:
+`multifil_jax/core/params.py` provides four preset factories, each returning
+`(StaticParams, DynamicParams, z0, d0)` — the parameters plus the preset's
+natural operating point: z0 the half-sarcomere length (z_line, nm from the
+M-line) and d0 the lattice spacing (nm). All four currently return 900 / 14.
 
 | Factory | Muscle type | Notes |
 |---------|-------------|-------|
@@ -122,16 +124,18 @@ recompile.
 
 **DynamicParams** is a JAX-aware data structure containing all the actual
 physics: spring stiffnesses, rate function coefficients, calcium binding
-constants, cooperativity coupling strengths, and default values for pCa, z_line,
-and lattice spacing. Because `DynamicParams` is a JAX PyTree, its values can be
+constants and cooperativity coupling strengths. It does **not** hold pCa, z_line
+or lattice spacing — those are drivers (Tier 3), passed to `run()` explicitly.
+Because `DynamicParams` is a JAX PyTree, its values can be
 swept across — you can run hundreds of physical parameter combinations without
-recompiling. There are 49 fields, all defined with literature citations in the
+recompiling. There are 46 fields, all defined with literature citations in the
 `_DYNAMIC_DEFAULTS` dictionary at the top of `params.py`.
 
-To modify parameters, use `.copy()`, which validates field names:
+To modify parameters, use `.copy()`, which validates field names (as does the
+constructor — `DynamicParams(z_line=...)` is a `TypeError`):
 
 ```python
-static, dynamic = get_cardiac_params()
+static, dynamic, z0, d0 = get_cardiac_params()
 dynamic = dynamic.copy(thick_k=9000.0, xb_r05=0.15)
 ```
 
@@ -188,14 +192,19 @@ from multifil_jax.core.sarc_geometry import SarcTopology
 from multifil_jax.simulation import run
 import jax
 
-static, dynamic = get_skeletal_params()
+static, dynamic, z0, d0 = get_skeletal_params()
 topo = SarcTopology.create(nrows=2, ncols=2, static_params=static, dynamic_params=dynamic)
 topo = jax.device_put(topo)
 
-result = run(topo, pCa=4.5, z_line=900.0, duration_ms=1000, dt=1.0,
+result = run(topo, pCa=4.5, z_line=z0, lattice_spacing=d0, duration_ms=1000, dt=1.0,
              dynamic_params=dynamic, static_params=static)
 print(result.summary())
 ```
+
+The three drivers — `pCa`, `z_line`, `lattice_spacing` — are **required**
+keyword arguments with no defaults, and must be finite (a NaN raises
+`ValueError`). Everything after `topology` is keyword-only. The examples below
+assume `z0, d0` from the preset.
 
 Passing `dynamic_params` and `static_params` explicitly is optional for the
 skeletal preset (it *is* the default), but it is a good habit: `run()` falls back
@@ -571,7 +580,7 @@ pCa value, all in parallel:
 
 ```python
 result = run(topo, pCa=[9.0, 7.0, 6.0, 5.0, 4.5, 4.0], z_line=900.0,
-             duration_ms=1000, replicates=5)
+             lattice_spacing=d0, duration_ms=1000, replicates=5)
 # result.axial_force shape: (6, 5, 1000)
 # axis 0: pCa values, axis 1: replicates, axis 2: time
 ```
@@ -584,6 +593,7 @@ runs 3 × 3 = 9 combinations:
 result = run(topo,
              pCa=[9.0, 6.0, 4.5],
              z_line=[850.0, 900.0, 950.0],
+             lattice_spacing=d0,
              duration_ms=1000)
 # result.axial_force shape: (3, 3, 1, 1000)
 # (n_z_line, n_pCa, replicates, time)  <- z_line first, regardless of
@@ -597,7 +607,7 @@ the same way, using the `dynamic_params` argument as a dict:
 thick_sweep = [5000, 6000, 7500, 9000, 11000]   # pN/nm per segment
 thin_sweep  = [4000, 5500, 7000]                 # pN/nm per segment
 
-result = run(topo, pCa=4.5, z_line=900.0,
+result = run(topo, pCa=4.5, z_line=900.0, lattice_spacing=d0,
              dynamic_params={'thick_k': thick_sweep, 'thin_k': thin_sweep},
              duration_ms=1000)
 # result.axial_force shape: (5, 3, 1, 1000)
@@ -608,7 +618,7 @@ You can also combine protocol sweeps with physical parameter sweeps:
 
 ```python
 result = run(topo,
-             pCa=[9.0, 4.5],
+             pCa=[9.0, 4.5], z_line=z0, lattice_spacing=d0,
              dynamic_params={'thick_k': [5000, 7500, 10000]},
              replicates=3,
              duration_ms=500)
@@ -628,10 +638,11 @@ general mechanism for sweeping many parameters at once. Pass a *list of
 `DynamicParams` objects*; each becomes one point on a `'candidates'` sweep axis:
 
 ```python
-static, dynamic = get_cardiac_params()          # cardiac base preserved
+static, dynamic, z0, d0 = get_cardiac_params()  # cardiac base preserved
 
 candidates = [dynamic.copy(thick_k=k) for k in (5000, 7500, 10000)]
-result = run(topo, pCa=4.5, dynamic_params=candidates, static_params=static)
+result = run(topo, pCa=4.5, z_line=z0, lattice_spacing=d0,
+             dynamic_params=candidates, static_params=static)
 # result.axial_force shape: (3, 1, n_steps)
 ```
 
@@ -648,7 +659,7 @@ t = np.arange(1000)
 # Calcium transient: starts high, decays exponentially
 pCa_trace = 4.0 + (9.0 - 4.0) * (1 - np.exp(-t / 100))
 
-result = run(topo, pCa=pCa_trace, z_line=900.0, duration_ms=1000)
+result = run(topo, pCa=pCa_trace, z_line=900.0, lattice_spacing=d0, duration_ms=1000)
 ```
 
 Arrays and lists cannot be mixed for the same parameter (one is a sweep axis,
@@ -820,14 +831,12 @@ the time-varying driver values, and a random number key, and returns a 6-tuple:
 kinetics_trace)`.
 Here is what happens, in order:
 
-**Step 0: Resolve drivers.** The simulation has two ways to specify values like
-pCa, z_line, and lattice spacing: as static defaults in `DynamicParams` (Tier 2)
-or as per-step values in `Drivers` (Tier 3). `resolve_value()` (`multifil_jax/core/state.py`)
-merges these: if the driver value is a valid number (not NaN), use
-it; otherwise use the constant default. This allows a parameter to be constant
-for most of a simulation but overridden at specific timesteps without branching.
-A merged `resolved_constants` object is built via `DynamicParams.with_drivers()`
-(`multifil_jax/core/params.py`) and used for all subsequent steps.
+**The drivers.** pCa, z_line and lattice spacing arrive each step as one
+`Drivers` bundle (`multifil_jax/core/state.py`), built in the scan body from the
+trace arrays `run()` prepared. They are not physics constants and have no
+fallback: each kernel below receives the specific drivers it uses as explicit
+arguments, so its signature says what it depends on (the thin transitions take
+only pCa; the nearest-site search takes z_line and lattice spacing).
 
 **Step 1: Update nearest binding sites.** For every crossbridge, `update_nearest_neighbors()`
 (`multifil_jax/kernels/geometry.py`) finds the nearest available actin binding
@@ -999,7 +1008,8 @@ from multifil_jax import Subpopulation
 
 # Half the motors have a 3× faster binding rate and a stabilized SRX state
 sp = Subpopulation.mean_field(0.5, xb_r01_coeff=3.0, xb_srx_kmax=0.3)
-result = run(topo, pCa=4.5, subpopulation=sp, dynamic_params=dynamic)
+result = run(topo, pCa=4.5, z_line=z0, lattice_spacing=d0,
+             subpopulation=sp, dynamic_params=dynamic)
 ```
 
 Three constructors, differing in *how* motors are assigned:
@@ -1084,9 +1094,9 @@ axial block, and the exact Jacobian diagonal inverse for the d block.
 
 | Call | Mode | What happens |
 |------|------|-------------|
-| `run(topo, pCa=4.5)` | Fixed LS | `lattice_spacing` held constant at 14.0 nm |
-| `run(topo, pCa=4.5, nu=0.5)` | Poisson LS | `ls = d0*(z0/z)^0.5` pre-computed as trace |
-| `run(topo, pCa=4.5, K_lat=5.0, nu=0.5)` | Dynamic LS | `d` solved from radial force balance |
+| `run(topo, pCa=4.5, z_line=z0, lattice_spacing=d0)` | Fixed LS | `lattice_spacing` held constant at d0 |
+| `run(..., nu=0.5)` | Poisson LS | `ls = d0*(z0/z)^0.5` pre-computed as trace |
+| `run(..., K_lat=5.0, nu=0.5)` | Dynamic LS | `d` solved from radial force balance; `lattice_spacing` is the reference/initial d |
 
 `K_lat` is specified as per-filament stiffness (pN/nm per thick filament).
 `run()` internally multiplies by `n_thick` so the lattice spacing deviation is
@@ -1138,18 +1148,16 @@ far larger than the kinetic noise it was hiding inside.
 
 **Tier 2 — Constants / DynamicParams** (`multifil_jax/core/params.py`):
 All physical parameters — spring stiffnesses, rate coefficients, energy
-parameters, calcium sensitivity constants. Also contains the "default" values
-of pCa, z_line, and lattice_spacing that are used when no per-step driver is
-provided. These can be swept freely across the batch dimension. The alias
+parameters, calcium sensitivity constants. It holds physics constants only —
+no pCa, z_line or lattice_spacing. These can be swept freely across the batch dimension. The alias
 `Constants = DynamicParams` is defined in `params.py`.
 
 **Tier 3 — Drivers** (`multifil_jax/core/state.py`, the `Drivers` NamedTuple):
-Per-timestep overrides for pCa, z_line, and lattice_spacing. At each step in
-the scan, the current values from the trace arrays are packaged into a `Drivers`
-object and passed to `timestep()`. The `resolve_value()` function merges Tier 3
-into Tier 2: if the driver is not NaN, use it; otherwise fall back to the
-constant. This allows a driver to be "off" (NaN) for most of the simulation
-and "active" only during specific steps.
+Per-timestep values of pCa, z_line, and lattice_spacing, always finite. At each
+step in the scan, the current values from the trace arrays are packaged into a
+`Drivers` object and passed to `timestep()`, which hands each kernel the
+individual scalars it uses. `run()` requires all three drivers; a constant is
+simply a trace that does not change.
 
 ---
 
@@ -1160,10 +1168,10 @@ and "active" only during specific steps.
 | `multifil_jax/simulation.py` | `run()` — the main entry point for all simulations |
 | `multifil_jax/simulation.py` | `SimulationResult` — the result container |
 | `multifil_jax/simulation.py` | `BATCH_BUCKETS`, `get_bucket_size()`, `_run_sim_kernel()` |
-| `multifil_jax/timestep.py` | `kinetics_step()` — stochastic phase (driver resolution through transitions), returns a `KineticsTrace` |
+| `multifil_jax/timestep.py` | `kinetics_step()` — stochastic phase (nearest sites through transitions), returns a `KineticsTrace` |
 | `multifil_jax/timestep.py` | `timestep()` — full step orchestrator (kinetics + solve) |
 | `multifil_jax/metrics_fn.py` | `compute_all_metrics()` — 57-metric MetricsDict |
-| `multifil_jax/core/state.py` | `State`, `realize_state()`, `Drivers`, `resolve_value()`, `MetricsDict` |
+| `multifil_jax/core/state.py` | `State`, `realize_state()`, `Drivers`, `MetricsDict` |
 | `multifil_jax/core/params.py` | `StaticParams`, `DynamicParams`, and the four species presets |
 | `multifil_jax/core/sarc_geometry.py` | `SarcTopology.create()` — topology builder; `valid_xb_targets()` |
 | `multifil_jax/core/subpopulation.py` | `Subpopulation` — mixed motor populations |

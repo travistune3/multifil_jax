@@ -28,7 +28,7 @@ from multifil_jax.core.params import StaticParams, DynamicParams, get_skeletal_p
 # ---------------------------------------------------------------------------
 # Topology (small 2x2 for fast examples)
 # ---------------------------------------------------------------------------
-static, dynamic = get_skeletal_params()
+static, dynamic, z0, d0 = get_skeletal_params()
 topo = SarcTopology.create(nrows=2, ncols=2, static_params=static, dynamic_params=dynamic)
 
 D0 = 14.0    # nm — reference lattice spacing

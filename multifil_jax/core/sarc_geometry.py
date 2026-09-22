@@ -55,7 +55,7 @@ Usage
 >>> from multifil_jax.core.sarc_geometry import SarcTopology
 >>> from multifil_jax.core.params import get_skeletal_params
 >>>
->>> static, dynamic = get_skeletal_params()
+>>> static, dynamic, z0, d0 = get_skeletal_params()
 >>> topo = SarcTopology.create(nrows=2, ncols=2, static_params=static,
 ...                            dynamic_params=dynamic)
 >>> topo = jax.device_put(topo)   # move to GPU once, reuse for every run
@@ -1512,7 +1512,7 @@ if __name__ == "__main__":
     # Test 1: Create geometry with skeletal parameters
     print("\nTest 1: Generate geometry with skeletal parameters")
     print("-" * 60)
-    static, dynamic = get_skeletal_params()
+    static, dynamic, *_ = get_skeletal_params()
     geometry = SarcTopology.create(nrows=2, ncols=2, static_params=static, dynamic_params=dynamic)
     print(f"Geometry: {geometry}")
     print(f"  thick_to_thin shape: {geometry.thick_to_thin.shape}")

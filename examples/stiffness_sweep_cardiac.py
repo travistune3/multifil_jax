@@ -11,7 +11,7 @@ from multifil_jax.core.sarc_geometry import SarcTopology
 from multifil_jax.simulation import run
 
 # ── Topology ─────────────────────────────────────────────────────────────────
-static, dynamic = get_cardiac_params()
+static, dynamic, z0, d0 = get_cardiac_params()
 topo = SarcTopology.create(nrows=4, ncols=4, static_params=static, dynamic_params=dynamic)
 topo = jax.device_put(topo)
 
@@ -27,7 +27,7 @@ t0 = time.time()
 results = run(
     topo,
     pCa=4.5,
-    z_line=1000.0,
+    z_line=1000.0, lattice_spacing=d0,
     duration_ms=1000,
     dt=1.0,
     replicates=3,
