@@ -35,12 +35,14 @@ cooperativity takes its neighbour information straight from tm_states, so
 nothing here depends on filament tension — which is what lets a multi-sarcomere extension run every
 sarcomere's chemistry independently before one joint solve.
 
-A NOTE ON Z-LINE CHANGES. When z_line moves between steps, the thin filament
-node positions are shifted before this function is called (see simulation.py's
-scan body), not left for the solver to discover. Handing the solver a lattice
-where the boundary has jumped but nothing else has moved would make it resolve
-the entire imposed displacement in one Newton solve, which is both slower and
-less accurate than applying the known rigid-body part analytically first.
+A NOTE ON Z-LINE CHANGES. Thin displacements are measured from a frame anchored
+on the Z-disc, so when z_line moves between steps the carried-over displacements
+place the whole thin filament rigidly translated with it — no explicit shift, and
+the known rigid-body part is never left for the solver to discover. Kinetics then
+runs on that rigidly translated configuration, so this step's binding search and
+strain-dependent rates see the translated XB strains. Only the solve that follows
+lets the thin filament stretch under its bound crossbridges and move off the
+Z-disc's rigid motion.
 """
 
 import jax

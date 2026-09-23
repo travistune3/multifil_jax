@@ -1137,8 +1137,10 @@ class StaticParams:
             _DYNAMIC_DEFAULTS before changing it.
 
     CROWN-FACE GEOMETRY
-        n_xb_per_crown: Myosin heads per crown. Sets total_xbs, so it is a
-            first-order cost driver. Vertebrate 3, insect flight muscle 4.
+        n_xb_per_crown: Crossbridges per crown, one per myosin MOLECULE, each
+            modelled single-headed (a molecule's two heads are not resolved).
+            Sets total_xbs, so it is a first-order cost driver. Vertebrate 3,
+            insect flight muscle 4.
         crown_rotation_deg: Azimuthal rotation between successive crowns. With
             3 heads at 60°, successive crowns land exactly on hexagonal
             neighbours; non-multiples of 60° (e.g. the insect 33.75°) do not,

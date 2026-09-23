@@ -826,9 +826,9 @@ If they produce the same shapes with different values, they share a kernel.
 
 Each millisecond of simulated time, `timestep()` (`multifil_jax/timestep.py`)
 is called once. It takes the current mechanical state, the physical parameters,
-the time-varying driver values, and a random number key, and returns a 6-tuple:
+the time-varying driver values, and a random number key, and returns an 8-tuple:
 `(new_state, new_rng_key, solver_residual, new_lattice_spacing, newton_iterations,
-kinetics_trace)`.
+kinetics_trace, residual_norm, tol_axial)`.
 Here is what happens, in order:
 
 **The drivers.** pCa, z_line and lattice spacing arrive each step as one
@@ -1170,7 +1170,7 @@ simply a trace that does not change.
 | `multifil_jax/simulation.py` | `BATCH_BUCKETS`, `get_bucket_size()`, `_run_sim_kernel()` |
 | `multifil_jax/timestep.py` | `kinetics_step()` — stochastic phase (nearest sites through transitions), returns a `KineticsTrace` |
 | `multifil_jax/timestep.py` | `timestep()` — full step orchestrator (kinetics + solve) |
-| `multifil_jax/metrics_fn.py` | `compute_all_metrics()` — 57-metric MetricsDict |
+| `multifil_jax/metrics_fn.py` | `compute_all_metrics()` — 43-metric MetricsDict |
 | `multifil_jax/core/state.py` | `State`, `realize_state()`, `Drivers`, `MetricsDict` |
 | `multifil_jax/core/params.py` | `StaticParams`, `DynamicParams`, and the four species presets |
 | `multifil_jax/core/sarc_geometry.py` | `SarcTopology.create()` — topology builder; `valid_xb_targets()` |

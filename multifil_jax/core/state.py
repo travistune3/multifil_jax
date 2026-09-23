@@ -149,10 +149,11 @@ def thick_axial(state: 'State', topology: 'SarcTopology') -> jnp.ndarray:
 def thin_axial(state: 'State', topology: 'SarcTopology', z_line) -> jnp.ndarray:
     """Absolute binding-site positions (nm) from the stored displacements.
 
-    The thin frame is anchored on the Z-disc, so the filament follows z_line
+    The thin frame is anchored on the Z-disc, so the FRAME follows z_line
     rigidly with no state update at all — moving the Z-line does not change any
     displacement. That is why the simulation loop has no per-step thin position
-    shift; see simulation.py.
+    shift; see simulation.py. The filament itself does not follow rigidly: with
+    crossbridges bound, the solve stretches it and its displacements change.
 
     Args:
         z_line: current Z-line position (nm).
