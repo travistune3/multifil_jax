@@ -654,13 +654,17 @@ Rate construction is shared; exponentiation is not, because the sampling path an
 the metrics path need exponentials of *different* generators. One matrix
 exponential per caller, never two.
 
-- `_build_xb_Q_bins(state, constants, topology)` → `(Q_bins, key)`.
-  Builds `(2 * n_xb_bins, 6, 6)` rate matrices — one block at permissiveness 0,
-  one at permissiveness 1, each evaluated at the `n_xb_bins` axial bin centers.
+- `_build_xb_Q_bins(state, constants, topology, pCa, z_line, lattice_spacing)` → `(Q_bins, key)`.
+  Builds `(3 * n_xb_bins, 6, 6)` rate matrices — closed (permissiveness 0),
+  open, and open-but-screened — each evaluated at the `n_xb_bins` axial bin
+  centers. The screened block is for targets in the thin-thin double-overlap
+  zone: between the M-line and the hiding line (how far the equal-length thin
+  filaments pass the M-line, mirrored from the opposite half). Its `r01` is
+  scaled by `1 - thin_thin_overlap_screening`; `r10` is not, so occupancy falls.
   Each XB's `key` is its axial bin — arithmetic on the uniform `xb_bin_edges`,
-  clipped at both ends — plus its
-  permissiveness bit. The key depends only on geometry and permissiveness, never
-  on rates, so it is shared across subpopulations.
+  clipped at both ends — plus its block. The key depends only on geometry,
+  permissiveness and the hiding line, never on rates, so it is shared across
+  subpopulations.
 - `_xb_Q_resolved(...)` → `(Q_bins, key, labels)`. All subpopulation handling
   (`mean_field` blends generators, `explicit` keeps them stacked), no
   exponentials. This is the shared stage that guarantees sampling and metrics

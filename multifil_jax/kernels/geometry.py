@@ -75,7 +75,9 @@ def find_nearest_binding_sites_fixed_width(
                     excluded, since the fixed-width array is padded
       visible mask  sites at or past the M-line (position <= 0) are excluded,
                     so a head cannot bind across it into the opposite
-                    half-sarcomere
+                    half-sarcomere. Sites on THIS side but inside the
+                    thin-thin double-overlap zone stay candidates; their
+                    screening is a rate, applied in _build_xb_Q_bins
 
     Masked candidates are set to infinite distance rather than removed, keeping
     the array shape static for XLA. If every candidate is masked the argmin

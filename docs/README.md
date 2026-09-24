@@ -849,7 +849,11 @@ Two details are easy to get wrong. The *search* uses the myosin head position �
 the crown base plus a 13 nm reach — but the *recorded distance* is measured from
 the crown base. And binding sites that have crossed past the M-line (position
 ≤ 0) are masked out entirely rather than clamped, so crossbridges near the M-line
-cannot bind behind it.
+cannot bind behind it. When the half-sarcomere is shorter than the thin filament,
+the opposite half's thin filaments reach the same distance past the M-line into
+this half (the *hiding line*). Sites between the M-line and the hiding line are
+still found by the search, but their attachment rate is scaled by
+`1 - thin_thin_overlap_screening` (default 1: no binding there).
 
 **Step 2: Thin filament (tropomyosin) transitions.** `thin_transitions()`
 (`multifil_jax/kernels/transitions.py`) applies a four-state stochastic Markov

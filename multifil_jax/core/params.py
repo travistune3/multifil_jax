@@ -830,6 +830,24 @@ _DYNAMIC_DEFAULTS = {
                              #     effectively a free parameter, and a natural first
                              #     candidate when fitting. The 5-figure precision is
                              #     an artifact of that derivation, not significance.
+    'thin_thin_overlap_screening': 1.0,
+                             # [G] 0-1. How strongly the opposite half-sarcomere's
+                             #     thin filaments block attachment in the double-
+                             #     overlap zone: a target site between the M-line and
+                             #     the hiding line (how far the thin filaments pass
+                             #     the M-line) has r01 scaled by (1 - this). r10 is
+                             #     NOT scaled, so the weak-state occupancy falls.
+                             #     1 = binding impossible there (this model's
+                             #     original intent), 0 = no effect. Mijailovich et
+                             #     al. 2019 J Gen Physiol 151:680 use a ~65%
+                             #     binding-rate reduction (= 0.65), stated as a
+                             #     simulation choice without derivation. Only acts
+                             #     when the half-sarcomere is shorter than the thin
+                             #     filament. Every thin filament here has the same
+                             #     length; cardiac thin filaments are close to that
+                             #     (1.04 +/- 0.03 um rat papillary, Burgoyne et al.
+                             #     2008 Cardiovasc Res 77:707), so at SL 1.9 nearly
+                             #     all of them pass the M-line.
     'xb_r12_coeff': 0.6,     # [F] ms⁻¹ weak→strong. THIS IS THE WORKING STROKE, and
                              #     Pi release, lumped into one step — the only
                              #     transition in the model that moves the spring rest
@@ -1407,8 +1425,15 @@ def get_skeletal_params() -> Tuple[StaticParams, DynamicParams, float, float]:
 def get_cardiac_params() -> Tuple[StaticParams, DynamicParams, float, float]:
     """Generic cardiac muscle, ~27 °C.
 
-    Same vertebrate lattice geometry as skeletal — the structural difference
-    between the two is small — but different kinetics throughout. Cardiac
+    Same vertebrate lattice geometry as skeletal except a shorter thin filament
+    (14 pseudo-repeats = 1008 nm vs 15 = 1080 nm), and different kinetics
+    throughout. Burgoyne et al. 2008 Cardiovasc Res 77:707, Table 1, measured
+    rat papillary thin filaments (Z-disc centre to pointed end, electron
+    tomography) at 1.04 +/- 0.03 um (131 filaments), mouse 1.03 +/- 0.03. Whole
+    pseudo-repeats bracket that mean: 14 is ~1 SD short, 15 is ~1.3 SD long. thin_k is per SEGMENT, so the
+    shorter filament keeps the same stiffness per unit length and is stiffer
+    overall. At the cardiac operating point the thin filament still passes the
+    M-line (by 108 nm at z_line 900), so thin_thin_overlap_screening acts here. Cardiac
     myosin (beta-MHC) cycles several times more slowly than fast skeletal
     myosin, cardiac troponin C releases calcium faster, and cardiac titin is
     the shorter, stiffer N2B isoform.
@@ -1552,7 +1577,8 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams, float, float]:
         'titin_rest': 140.0,      # exponent offset; value from a slack length
                                   # measured at SL 1.85 µm (z=925 → L≈138 nm)
     }
-    return StaticParams(), DynamicParams(**cardiac_overrides), 900.0, 14.0
+    return (StaticParams(n_polymers_per_thin=14), DynamicParams(**cardiac_overrides),
+            900.0, 14.0)
 
 
 def get_lethocerus_params() -> Tuple[StaticParams, DynamicParams, float, float]:

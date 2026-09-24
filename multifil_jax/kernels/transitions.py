@@ -91,6 +91,7 @@ from .rate_functions import (
 # same potential by construction rather than by review.
 from .forces import (xb_elastic_energy, xb_geometry, xb_polar_forces,
                      polar_to_filament)
+from multifil_jax.core.state import thin_axial
 
 
 # ============================================================================
@@ -986,6 +987,7 @@ def xb_rate_matrix(xb_distances: jnp.ndarray,
                    lattice_spacing: float,
                    spring_constants: jnp.ndarray,
                    permissiveness: jnp.ndarray,
+                   site_access: jnp.ndarray,
                    ca_concentration: float,
                    temp_celsius: float,
                    params: 'DynamicParams') -> jnp.ndarray:
@@ -1029,6 +1031,9 @@ def xb_rate_matrix(xb_distances: jnp.ndarray,
             [:, 8:12] g_k_tight_1, g_rest_tight_1, c_k_tight_1, c_rest_tight_1
         permissiveness: (n_xb,) 1 if the target site's tropomyosin is open,
             else 0. Gates attachment entirely.
+        site_access: (n_xb,) fraction of the attachment rate that survives
+            thin-thin overlap screening: 1 - thin_thin_overlap_screening for a
+            target past the hiding line, 1 otherwise. Scales r01 only.
         ca_concentration: Calcium concentration (M), for SRX recruitment
         temp_celsius: Temperature (C), which sets kT for every Boltzmann and
             Bell term
@@ -1144,9 +1149,14 @@ def xb_rate_matrix(xb_distances: jnp.ndarray,
     srx_b = params.xb_srx_b
     srx_ca50 = params.xb_srx_ca50
 
-    # 0 DRX <-> 1 Loose : attachment, gated by tropomyosin permissiveness
-    r01 = xb_rate_01(permissiveness, r01_coeff, E_weak)
-    r10 = xb_rate_10(r01, U_DRX, U_loose)
+    # 0 DRX <-> 1 Loose : attachment, gated by tropomyosin permissiveness.
+    # site_access (thin-thin overlap screening) scales the FORWARD rate only:
+    # r10 comes from the unscreened r01, so a screened site is bound less often
+    # rather than just more slowly. Scaling both would leave the weak-state
+    # occupancy untouched, which is not what screening means.
+    r01_open = xb_rate_01(permissiveness, r01_coeff, E_weak)
+    r10 = xb_rate_10(r01_open, U_DRX, U_loose)
+    r01 = site_access * r01_open
 
     # 1 Loose <-> 2 Tight_1 : weak-to-strong isomerization (Pi release)
     r12 = xb_rate_12(r12_coeff, E_diff)
@@ -1206,20 +1216,33 @@ def _build_xb_Q_bins(
     constants: 'DynamicParams',
     topology: 'SarcTopology',
     pCa,
+    z_line,
     lattice_spacing,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Evaluate crossbridge rate matrices on a distance grid, and index each head.
 
-    The cost-saving step behind thick_transitions. A head's rates depend on two
-    things: its axial distance to its target site (continuous) and whether that
-    target's tropomyosin is open (binary). Rather than build a rate matrix per
+    The cost-saving step behind thick_transitions. A head's rates depend on three
+    things: its axial distance to its target site (continuous), whether that
+    target's tropomyosin is open (binary), and whether the target lies in the
+    thin-thin double-overlap zone (binary). Rather than build a rate matrix per
     head, build them on a grid:
 
-        n_xb_bins axial positions x 2 permissiveness levels
+        n_xb_bins axial positions x 3 blocks
 
-    laid out as one block at permissiveness 0 followed by one block at
-    permissiveness 1. Each head is then assigned the index of the cell it falls
-    in, and gathers from there.
+    laid out as closed (permissiveness 0), open, and open-but-screened. A
+    closed site binds at no rate, screened or not, so the fourth combination
+    needs no block of its own. Each head is then assigned the index of the
+    cell it falls in, and gathers from there.
+
+    THE HIDING LINE. Every thin filament has the same length, so when the
+    half-sarcomere is shorter than the thin filament, the thin filaments pass
+    the M-line by the same amount. By symmetry the opposite half's thin
+    filaments reach the same distance into THIS half: hiding_line = how far our
+    filaments pass the M-line. A target site between the M-line and the hiding
+    line sits in the double-overlap zone, where the opposing filament gets in
+    the way, and its attachment rate is scaled by
+    1 - constants.thin_thin_overlap_screening. Sites past the M-line on our
+    own filament are excluded earlier, by the binding-site search.
 
     Bin assignment is arithmetic on the uniform topology.xb_bin_edges, clipped at
     both ends — heads outside the grid range are treated as if at the nearest
@@ -1245,10 +1268,11 @@ def _build_xb_Q_bins(
         constants: DynamicParams with the xb_* rates and spring constants
         topology: SarcTopology with bin edges/centres, xb_to_thin_id, xb_valid
         pCa: this step's calcium level
+        z_line: this step's Z-line position (nm), which places the hiding line
         lattice_spacing: this step's (pre-solve) lattice spacing, nm
 
     Returns:
-        Q_bins: (2 * n_bins, 6, 6) rate matrices, permissiveness-0 block first
+        Q_bins: (3 * n_bins, 6, 6) rate matrices: closed, open, open-screened
         key: (n_xb_total,) index into Q_bins for each crossbridge
     """
     xb_states = state.thick.xb_states
@@ -1283,8 +1307,12 @@ def _build_xb_Q_bins(
         # r01 (the only entry rate into a bound state) is exactly 0 for every
         # bin position — a hard gate, not a distance-decay approximation.
         permissiveness = (nearest_tm_states == 3).astype(jnp.float32) * topology.xb_valid.astype(jnp.float32)
+        thin_pos = thin_axial(state, topology, z_line)
+        hiding_line = jnp.maximum(0.0, -jnp.min(thin_pos))
+        screened = thin_pos[thin_indices, site_indices] < hiding_line
     else:
         permissiveness = jnp.ones(n_xb_total) * 0.5
+        screened = jnp.zeros(n_xb_total, dtype=bool)
 
     ca_conc = 10.0 ** (-pCa)
     n_bins = topology.xb_bin_centers.shape[0]   # static integer known to XLA
@@ -1305,13 +1333,16 @@ def _build_xb_Q_bins(
     ])
     springs_grid = jnp.broadcast_to(spring_vec, (n_bins, 12))  # (n_bins, 12)
 
-    # Q matrices for AP=0 and AP=1 at each bin position
-    Q_ap0 = xb_rate_matrix(dist_grid, d, springs_grid,
-                            jnp.zeros(n_bins), ca_conc, constants.temp_celsius, constants)
-    Q_ap1 = xb_rate_matrix(dist_grid, d, springs_grid,
-                            jnp.ones(n_bins),  ca_conc, constants.temp_celsius, constants)
-    # Layout: [0..n_bins-1] = AP=0, [n_bins..2*n_bins-1] = AP=1
-    Q_bins = jnp.concatenate([Q_ap0, Q_ap1], axis=0)         # (2*n_bins, 6, 6)
+    # Q matrices at each bin position: closed, open, open-but-screened
+    ones = jnp.ones(n_bins)
+    Q_ap0 = xb_rate_matrix(dist_grid, d, springs_grid, jnp.zeros(n_bins), ones,
+                           ca_conc, constants.temp_celsius, constants)
+    Q_ap1 = xb_rate_matrix(dist_grid, d, springs_grid, ones, ones,
+                           ca_conc, constants.temp_celsius, constants)
+    Q_scr = xb_rate_matrix(dist_grid, d, springs_grid, ones,
+                           ones * (1.0 - constants.thin_thin_overlap_screening),
+                           ca_conc, constants.temp_celsius, constants)
+    Q_bins = jnp.concatenate([Q_ap0, Q_ap1, Q_scr], axis=0)  # (3*n_bins, 6, 6)
 
     # Assign each XB to a bin. The edges are uniform (a linspace), so the bin is
     # arithmetic, not a binary search: ~30x cheaper on GPU at 25,600 heads.
@@ -1320,8 +1351,9 @@ def _build_xb_Q_bins(
     bin_idx = jnp.floor((x_axial - edges[0]) * (n_bins / (edges[-1] - edges[0]))).astype(jnp.int32)
     bin_idx = jnp.clip(bin_idx, 0, n_bins - 1)
 
-    ap  = permissiveness.astype(jnp.int32)                         # 0 or 1
-    key = ap * n_bins + bin_idx                                    # in [0, 2*n_bins)
+    ap    = permissiveness.astype(jnp.int32)                       # 0 or 1
+    block = ap * (1 + screened.astype(jnp.int32))                  # 0, 1 or 2
+    key   = block * n_bins + bin_idx                               # in [0, 3*n_bins)
 
     return Q_bins, key
 
@@ -1331,6 +1363,7 @@ def _xb_Q_resolved(
     constants: 'DynamicParams',
     topology: 'SarcTopology',
     pCa,
+    z_line,
     lattice_spacing,
     xb_subpop=None,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, Optional[jnp.ndarray]]:
@@ -1353,7 +1386,8 @@ def _xb_Q_resolved(
         state: Current State NamedTuple
         constants: DynamicParams with physics values
         topology: SarcTopology with xb_bin_edges, xb_bin_centers, eye_6
-        pCa, lattice_spacing: this step's drivers, shared by every population
+        pCa, z_line, lattice_spacing: this step's drivers, shared by every
+            population
         xb_subpop: None for the standard single-population path, or a tuple
             (mode, constants_k, extra) for subpopulations. constants_k is a
             length-K list of DynamicParams (population 0 = WT). For
@@ -1372,11 +1406,12 @@ def _xb_Q_resolved(
         labels: None, or (n_xb_total,) population index for mode=='explicit'
     """
     if xb_subpop is None:
-        Q_bins, key = _build_xb_Q_bins(state, constants, topology, pCa, lattice_spacing)
+        Q_bins, key = _build_xb_Q_bins(state, constants, topology, pCa, z_line,
+                                       lattice_spacing)
         return Q_bins, key, None
 
     mode, constants_k, extra = xb_subpop
-    built = [_build_xb_Q_bins(state, ck, topology, pCa, lattice_spacing)
+    built = [_build_xb_Q_bins(state, ck, topology, pCa, z_line, lattice_spacing)
              for ck in constants_k]
     key = built[0][1]  # shared across populations (geometry/permissiveness only)
 
@@ -1447,13 +1482,14 @@ def xb_binned_generator(
     constants: 'DynamicParams',
     topology: 'SarcTopology',
     pCa,
+    z_line,
     lattice_spacing,
     dt: float,
     xb_subpop=None,
 ) -> XBBins:
     """Build the step's crossbridge generator and exponentiate it, once.
 
-    Evaluates 2 * n_xb_bins matrix exponentials instead of one per head — on the
+    Evaluates 3 * n_xb_bins matrix exponentials instead of one per head — on the
     distance grid rather than per head, so the cost does not grow with lattice
     size. Bin resolution is a genuine accuracy/cost tradeoff; see
     _build_xb_Q_bins and StaticParams.n_xb_bins / xb_bin_lo / xb_bin_hi.
@@ -1467,6 +1503,7 @@ def xb_binned_generator(
         constants: DynamicParams with physics values
         topology: SarcTopology with xb_bin_edges, xb_bin_centers, eye_6
         pCa: this step's calcium level
+        z_line: this step's Z-line position (nm)
         lattice_spacing: this step's (pre-solve) lattice spacing, nm
         dt: Timestep length (ms)
         xb_subpop: see _xb_Q_resolved
@@ -1475,7 +1512,7 @@ def xb_binned_generator(
         XBBins
     """
     Q_bins, key, labels = _xb_Q_resolved(state, constants, topology, pCa,
-                                         lattice_spacing, xb_subpop)
+                                         z_line, lattice_spacing, xb_subpop)
     P_bins, G_bins = _expm_bins(Q_bins, dt, topology.eye_6, with_integral=True)
     return XBBins(Q=Q_bins, P=P_bins, G=G_bins, key=key, labels=labels)
 

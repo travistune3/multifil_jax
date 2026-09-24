@@ -124,7 +124,8 @@ def kinetics_step(state: 'State',
     # different (absorbing) generator; the exact estimator needs no such
     # generator, so the duplication went with it.
     bins = xb_binned_generator(state, constants, topology, drivers.pCa,
-                               drivers.lattice_spacing, dt, xb_subpop=xb_subpop)
+                               drivers.z_line, drivers.lattice_spacing, dt,
+                               xb_subpop=xb_subpop)
 
     # Capture the trace HERE, between the two transition calls, because `state`
     # and `bins` together are exactly the step thick_transitions is about to
