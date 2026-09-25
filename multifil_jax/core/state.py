@@ -324,7 +324,9 @@ def realize_state(
     """Create pure State from topology and constants.
 
     Returns a State NamedTuple with NO embedded params/geometry/constants.
-    These are passed separately to kernels.
+    These are passed separately to kernels. Every head starts in state 0 and
+    every tropomyosin unit in state 0; run() then draws the heads from their
+    resting distribution (kernels.transitions.xb_rest_states).
 
     Args:
         topology: SarcTopology (SarcTopology) from SarcTopology.create()

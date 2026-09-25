@@ -249,6 +249,17 @@ while the subpopulation *scale values* and masks ride the batch axis and do not.
 Scan carry is `(state, rng_key, current_ls)` — the third element tracks the
 emergent lattice spacing (identity passthrough for fixed LS).
 
+**Every simulation starts relaxed.** `realize_state` builds the structural state
+(all tropomyosin blocked, no head bound) and the equilibrium is solved on it; then,
+before the scan, `transitions.xb_rest_states` draws every head from the stationary
+distribution of its own ap=0 generator at pCa 9 (the same binned Q the scan uses).
+With attachment gated off, the detached states {0 DRX, 4 Free_2, 5 SRX} are a
+closed class, so the draw solves `pi Q = 0` on that 3x3 block and puts no head in a
+bound state. Subpopulation heads draw from their own population's generator. The
+draw uses `fold_in(rng_key, 0)`, so the scan's key is untouched. A run whose first
+pCa is not 9 is therefore a step from rest, and no pre-stimulus settling time is
+needed.
+
 There is ONE subpopulation path. No subpopulation is the mean-field case with
 K = 1, fraction 1.0 and no scaled field (`1.0 * Q` is exact), and a transition
 kernel whose rates no population scales is handed `None`, which
@@ -387,7 +398,9 @@ new_state = state._replace(thick=state.thick._replace(axial=new_axial))
 **State creation:**
 ```python
 state = realize_state(topology, constants, z_line, pCa, lattice_spacing)
+state = xb_rest_states(state, constants, topology, z_line, lattice_spacing, key)  # heads at rest
 ```
+`realize_state` puts every head in state 0; `run()` then draws them from rest (§4).
 
 **Drivers** — per-step values, always finite (no fallback):
 ```python

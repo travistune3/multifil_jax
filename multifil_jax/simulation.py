@@ -84,6 +84,7 @@ from multifil_jax.kernels.solver import build_prefactored_preconditioner
 from multifil_jax.core.sarc_geometry import SarcTopology
 from multifil_jax.kernels.geometry import update_nearest_neighbors
 from multifil_jax.kernels.solver import solve_equilibrium
+from multifil_jax.kernels.transitions import xb_rest_states
 from multifil_jax.kernels.forces import axial_force_at_mline
 from multifil_jax.timestep import timestep
 from multifil_jax.metrics_fn import compute_all_metrics
@@ -617,6 +618,12 @@ def _run_sim_kernel(
             return ('explicit', constants_k, subpop[mask])
 
         xb_subpop, tm_subpop = _pops('xb_', 'xb_mask'), _pops('tm_', 'tm_mask')
+
+        # Start relaxed: every head drawn from its own resting distribution. The
+        # draw has its own stream, folded off the sim's key, so the scan's key
+        # is untouched.
+        state = xb_rest_states(state, constants, topology, z_trace[0], ls_trace[0],
+                               jax.random.fold_in(b.rng_keys, 0), xb_subpop)
 
         def scan_fn(carry, inputs):
             old_state, k, current_ls = carry

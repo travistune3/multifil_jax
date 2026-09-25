@@ -1613,6 +1613,60 @@ def xb_expected_crossings(
     return jnp.stack(counts)
 
 
+#: The calcium level a simulation starts relaxed at.
+REST_PCA = 9.0
+
+
+def xb_rest_states(state: 'State',
+                   constants: 'DynamicParams',
+                   topology: 'SarcTopology',
+                   z_line,
+                   lattice_spacing,
+                   rng_key: jax.random.PRNGKey,
+                   xb_subpop=None) -> 'State':
+    """Draw every head from the stationary distribution of its own rate matrix
+    at rest: pCa 9, tropomyosin blocked.
+
+    run() starts from relaxed muscle. On a freshly realised state every
+    tropomyosin unit is 0, so every head gathers from the ap=0 block of the
+    same binned generator the scan uses, where attachment (r01) is exactly 0 and
+    r43 is structurally 0. The detached states {0 DRX, 4 Free_2, 5 SRX} are then
+    a closed class and the bound states get no inflow, so the resting occupancy
+    is pi Q_c = 0, sum(pi) = 1 on that 3x3 block, and exactly 0 bound. Solving
+    the block rather than the full 6x6 matters: at strained bins Tight_1's exit
+    rate is ~1e-10 /ms, which makes the full system singular to float32 and
+    leaks spurious mass onto a bound state. A head in a subpopulation draws
+    from its own population's generator.
+
+    Args:
+        state: a freshly realised State (all tropomyosin 0, no head bound)
+        constants: DynamicParams with physics values
+        topology: SarcTopology
+        z_line, lattice_spacing: the drivers the simulation starts at
+        rng_key: key for this draw
+        xb_subpop: see _xb_Q_resolved
+
+    Returns:
+        state with thick.xb_states drawn from rest
+    """
+    Q, key, labels = _xb_Q_resolved(state, constants, topology, REST_PCA,
+                                    z_line, lattice_spacing, xb_subpop)
+    detached = jnp.array([0, 4, 5])
+    Q_c = Q[..., detached, :][..., detached]
+    # pi Q_c = 0 with the last balance equation replaced by the normalisation
+    A = jnp.swapaxes(Q_c, -1, -2).at[..., -1, :].set(1.0)
+    b = jnp.zeros(Q_c.shape[:-1]).at[..., -1].set(1.0)
+    pi_c = jnp.linalg.solve(A, b[..., None])[..., 0]
+    pi = jnp.zeros(Q.shape[:-1]).at[..., detached].set(pi_c)
+    pi_xb = _gather_per_xb(pi, key, labels)                        # (n_xb_total, 6)
+
+    xb_states = state.thick.xb_states
+    u = jax.random.uniform(rng_key, shape=(pi_xb.shape[0],))
+    drawn = jnp.argmax(u[:, None] < jnp.cumsum(pi_xb, axis=1), axis=1)
+    return state._replace(thick=state.thick._replace(
+        xb_states=drawn.astype(jnp.int8).reshape(xb_states.shape)))
+
+
 def thick_transitions(state: 'State',
                      bins: XBBins,
                      topology: 'SarcTopology',
