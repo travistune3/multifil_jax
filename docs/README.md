@@ -163,6 +163,18 @@ which constraint failed rather than building a malformed lattice. Note that 4×4
 the usual go-to size elsewhere — does **not** work with `get_drosophila_params()`;
 use 4×3, 6×6, or 4×6.
 
+**The thin filament is three layers on one list of actin monomers.** Every
+monomer is kept (`n_mono` per filament). The *binding candidates* (`n_cand`) are
+the monomers whose azimuth falls within `target_zone_wiggle` of a thick
+filament's face — only those can be bound. The *mechanical nodes* (`n_nodes`)
+are an even grid `StaticParams.thin_node_spacing` (12 nm) apart from the Z-disc;
+every monomer moves with the linear interpolation of the two nodes around it,
+and the filament's stiffness is `DynamicParams.thin_EA` per unit length, so the
+binding window has no mechanical side effect. The *tropomyosin units* (`n_tm`)
+are the regulatory switches: by default (`StaticParams.tm_monomers_per_unit =
+None`) one unit per binding candidate; set it to 7 to give each unit the seven
+monomers of one tropomyosin molecule.
+
 Once created, the topology should be put on the GPU via `jax.device_put(topo)`.
 This copies all index arrays to GPU memory once rather than transferring them
 on every call.
@@ -296,8 +308,9 @@ actually used during the simulation, useful for aligning outputs with protocol
 timing.
 
 `result.topology_config` — a plain dictionary (no JAX arrays) listing the
-structural dimensions: `n_thick`, `n_thin`, `n_crowns`, `n_sites`, `n_titin`,
-`n_faces_per_thin`, `total_xbs`.
+structural dimensions: every integer of the topology (`n_thick`, `n_thin`,
+`n_crowns`, `n_mono`, `n_cand`, `n_nodes`, `n_tm`, `n_titin`, `n_faces_per_thin`,
+`total_xbs`, ...).
 
 `result.metadata` — `{'master_seed': ...}` only. Grid shape, axis names, and
 coordinates are first-class attributes, not metadata entries.
@@ -364,7 +377,7 @@ removed `frac_xb_*` keys used.
 - `'n_tm_state_0'` through `'n_tm_state_3'` — counts in each TM state
 
 All-site TM fractions are not exported: divide by
-`topology_config['n_thin'] * topology_config['n_sites']`. The former
+`topology_config['n_thin'] * topology_config['n_tm']`. The former
 `actin_permissiveness` was exactly `n_tm_state_3` over that same denominator.
 
 **Tropomyosin fractions restricted to the overlap zone** — an all-site
@@ -604,14 +617,14 @@ result = run(topo,
 the same way, using the `dynamic_params` argument as a dict:
 
 ```python
-thick_sweep = [5000, 6000, 7500, 9000, 11000]   # pN/nm per segment
-thin_sweep  = [4000, 5500, 7000]                 # pN/nm per segment
+thick_sweep = [5000, 6000, 7500, 9000, 11000]   # pN/nm per crown segment
+thin_sweep  = [48000, 66000, 84000]              # pN, thin_EA (per unit length)
 
 result = run(topo, pCa=4.5, z_line=900.0, lattice_spacing=d0,
-             dynamic_params={'thick_k': thick_sweep, 'thin_k': thin_sweep},
+             dynamic_params={'thick_k': thick_sweep, 'thin_EA': thin_sweep},
              duration_ms=1000)
 # result.axial_force shape: (5, 3, 1, 1000)
-# (n_thick_k, n_thin_k, replicates, time)
+# (n_thick_k, n_thin_EA, replicates, time)
 ```
 
 You can also combine protocol sweeps with physical parameter sweeps:
@@ -675,14 +688,14 @@ understanding what can and cannot be parallelized.
 
 When `run()` receives lists for multiple parameters, it builds a Cartesian
 product grid using `jnp.meshgrid`. If you pass 5 values for `thick_k` and 3
-values for `thin_k`, `meshgrid` produces a 5×3 grid of all combinations. The
+values for `thin_EA`, `meshgrid` produces a 5×3 grid of all combinations. The
 grid is then "flattened" to a single batch dimension of size 15. Replicates are
 tiled on top, giving a total batch of `15 × replicates` independent simulations.
 
 Each simulation in the batch gets its own entry in every input array. The batch
-dimension is arranged so that element 0 has `(thick_k[0], thin_k[0])`, element
-1 has `(thick_k[0], thin_k[1])`, element 2 has `(thick_k[0], thin_k[2])`,
-element 3 has `(thick_k[1], thin_k[0])`, and so on.
+dimension is arranged so that element 0 has `(thick_k[0], thin_EA[0])`, element
+1 has `(thick_k[0], thin_EA[1])`, element 2 has `(thick_k[0], thin_EA[2])`,
+element 3 has `(thick_k[1], thin_EA[0])`, and so on.
 
 These 15 (or 45, with replicates=3) simulations are then run using
 `jax.vmap`, a JAX function that takes a function designed for a single
@@ -773,9 +786,10 @@ efficient use of this codebase.
 Any field in `DynamicParams` can be swept. These are JAX arrays that vmap
 treats as regular data. You can run 1000 different spring stiffness values in
 one call and JAX sees it as a single batch computation. The list of sweepable
-physics parameters includes all spring constants (`thick_k`, `thin_k`,
-`titin_b`, `titin_a`), all rate function parameters, calcium binding
-constants, and the default pCa/z_line/lattice_spacing.
+physics parameters includes all stiffnesses (`thick_k`, `thin_EA`,
+`titin_b`, `titin_a`), all rate function parameters and calcium binding
+constants. The drivers (pCa, z_line, lattice_spacing) are not DynamicParams;
+they are `run()` arguments.
 
 `K_lat` and `nu` (lattice stiffness and Poisson exponent) can also be swept
 as lists. They join the Cartesian product grid alongside other sweep parameters.
@@ -851,7 +865,7 @@ the crown base. And binding sites that have crossed past the M-line (position
 ≤ 0) are masked out entirely rather than clamped, so crossbridges near the M-line
 cannot bind behind it. When the half-sarcomere is shorter than the thin filament,
 the opposite half's thin filaments reach the same distance past the M-line into
-this half (the *hiding line*). Sites between the M-line and the hiding line are
+this half (the *hiding line*, set by the thin filaments' tip). Sites between the M-line and the hiding line are
 still found by the search, but their attachment rate is scaled by
 `1 - thin_thin_overlap_screening` (default 1: no binding there).
 
@@ -866,13 +880,13 @@ transition probability matrix P via a matrix exponential, then used to draw
 stochastic transitions for each site. The matrix exponential is computed with a
 Padé approximation plus scaling-and-squaring via `expm_pade6_batch()`.
 
-Because a site's coupling depends only on the states of its two neighbors (each
-count capped at 2), and on whether a crossbridge is bound to it, there are just
-54 distinct rate matrices in the whole system — so one batched matrix exponential
-and a gather serve every site. The bound half carries the crossbridge lock: a
-head holding a site open divides that site's two exits from the open state by
-`(1 + xb_tm_K2)`, which is how McKillop & Geeves' measured `K_T(1 + K2)` enters
-the model. Section 13 covers the cooperativity model itself.
+Because a unit's coupling depends only on the states of its two neighbors (each
+count capped at 2), and on how many crossbridges are bound on it, there are just
+27 x (tm_max_heads + 1) distinct rate matrices in the whole system — 54 at the
+default one-unit-per-candidate wiring — so one batched matrix exponential and a
+gather serve every unit. The bound blocks carry the crossbridge lock: n heads on
+a unit divide its two exits from the open state by `(1 + xb_tm_K2)^n`, which is
+how McKillop & Geeves' measured `K_T(1 + K2)` per bound S1 enters the model. Section 13 covers the cooperativity model itself.
 
 A head can still be torn off when tropomyosin closes over it despite that bias,
 and `thin_transitions` returns the mask of heads that happened to — it is the only
@@ -1022,7 +1036,7 @@ Three constructors, differing in *how* motors are assigned:
 |---|---|---|
 | `Subpopulation.mean_field(fraction, **scales)` | no assignment — every motor sees the fraction-weighted average of the rate matrices | fast, deterministic, no replicate noise |
 | `Subpopulation.random(fraction, seed, **scales)` | each motor is independently mutant with probability `fraction` | realistic mosaicism; replicates give statistical power |
-| `Subpopulation.c_zone(topo, min_nm, max_nm, **scales)` | motors on crowns within an axial band from the M-line (default 350–650 nm) | cMyBP-C and other spatially localized effects |
+| `Subpopulation.c_zone(topo, min_nm, max_nm, z_line=None, **scales)` (z_line required with tm_* scales) | motors on crowns within an axial band from the M-line (default 350–650 nm) | cMyBP-C and other spatially localized effects |
 
 `mean_field` is not an approximation bolted on afterwards: it averages the
 underlying *rate matrices* before exponentiating them, which is the mathematically

@@ -211,28 +211,25 @@ def validate_forces_numerical(state: 'State', constants: 'DynamicParams',
     from multifil_jax.kernels.forces import compute_forces_vectorized
 
     n_thick, n_crowns = state.thick.displacement.shape
-    n_thin, n_sites = state.thin.displacement.shape
+    n_thin, n_nodes = state.thin.displacement.shape
+    n_mono = topology.n_mono
     n_thick_nodes = n_thick * n_crowns
 
     u_thick = state.thick.displacement
     u_thin = state.thin.displacement
     offsets_thick = topology.crown_offsets
-    offsets_thin = topology.binding_offsets
+    offsets_mono = topology.mono_offsets
     xb_states = state.thick.xb_states
     xb_bound_to = state.thick.xb_bound_to
 
     # Compute analytical forces
     forces_analytical = compute_forces_vectorized(
-        u_thick, u_thin,
-        constants.thick_k, constants.thin_k,
-        z_line, lattice_spacing,
-        constants.titin_a, constants.titin_b, constants.titin_rest,
-        xb_states, xb_bound_to, constants, topology
-    )
+        u_thick, u_thin, z_line, lattice_spacing,
+        xb_states, xb_bound_to, constants, topology)
 
     # Compute numerical forces via jax.grad on total energy
     thick_k = constants.thick_k
-    thin_k = constants.thin_k
+    thin_k = constants.thin_EA / topology.thin_node_spacing   # per node segment
     d = lattice_spacing
 
     # ------------------------------------------------------------------ setup
@@ -262,15 +259,16 @@ def validate_forces_numerical(state: 'State', constants: 'DynamicParams',
     c_rest = jnp.where(is_t2, constants.xb_c_rest_strong,
                        jnp.where(is_t1, constants.xb_c_rest_tight_1, constants.xb_c_rest_weak))
 
-    # Flat index of each head's partner site. Unbound heads carry -1, which would
-    # wrap when used as an index, so clamp — their contribution is zeroed by
+    # Flat index of each head's partner monomer. Unbound heads carry -1, which
+    # would wrap when used as an index, so clamp — their contribution is zeroed by
     # bound_weight regardless. No singularity results: r is never smaller than
     # the lattice spacing, so the energy stays smooth even at garbage offsets.
-    flat_site = (jnp.clip(topology.xb_to_thin_id, 0, n_thin - 1) * n_sites
-                 + jnp.clip(xb_bound_flat, 0, n_sites - 1))
+    flat_site = (jnp.clip(topology.xb_to_thin_id, 0, n_thin - 1) * n_mono
+                 + jnp.clip(xb_bound_flat, 0, n_mono - 1))
+    rows = jnp.arange(n_thin)[:, None]
 
-    # Titin molecules per thick filament. Must track the n_titin_per_thick
-    # default in compute_thick_passive_forces_vectorized; if the two ever
+    # Titin molecules per thick filament. Must track forces._N_TITIN_PER_THICK;
+    # written out here so this check stays independent of the kernel. If the two ever
     # diverge, this check fails at the tip crowns, which is the intended alarm.
     n_titin_per_thick = 6
     titin_a_over_b = constants.titin_a / constants.titin_b
@@ -290,11 +288,16 @@ def validate_forces_numerical(state: 'State', constants: 'DynamicParams',
         would report the difference as a force-law failure.
         """
         ut = u_flat[:n_thick_nodes].reshape(n_thick, n_crowns)
-        un = u_flat[n_thick_nodes:].reshape(n_thin, n_sites)
+        un = u_flat[n_thick_nodes:].reshape(n_thin, n_nodes)
 
-        # Absolute positions, for the two terms that genuinely need them.
+        # Absolute positions, for the two terms that genuinely need them. A
+        # monomer moves with the linear blend of the node M-line-side of it
+        # (mono_node) and the next one, weight mono_xi on the latter; past the
+        # last node that next one is the Z-disc, which does not move.
         pt = offsets_thick + ut
-        pn = z_line - offsets_thin + un
+        un_z = jnp.concatenate([un, jnp.zeros((n_thin, 1))], axis=1)
+        e, xi = topology.mono_node, topology.mono_xi
+        pm = z_line - offsets_mono + ((1.0 - xi) * un_z[rows, e] + xi * un_z[rows, e + 1])
 
         # Thick filament spring energy. The M-line is a fixed anchor at u = 0,
         # and the rest lengths cancel out of the extension entirely.
@@ -308,7 +311,7 @@ def validate_forces_numerical(state: 'State', constants: 'DynamicParams',
         # Thin filament spring energy. The Z-disc is the fixed anchor at u = 0.
         thin_energy = 0.0
         for i in range(n_thin):
-            for j in range(n_sites - 1):
+            for j in range(n_nodes - 1):
                 dx = un[i, j+1] - un[i, j]
                 thin_energy += 0.5 * thin_k * dx ** 2
             thin_energy += 0.5 * thin_k * un[i, -1] ** 2
@@ -320,7 +323,7 @@ def validate_forces_numerical(state: 'State', constants: 'DynamicParams',
         # Python loop — but the expression is written out here rather than
         # borrowed from the kernel under test.
         crown_pos = jnp.repeat(pt.reshape(-1), n_xb_per_crown)
-        site_pos = pn.reshape(-1)[flat_site]
+        site_pos = pm.reshape(-1)[flat_site]
         x = site_pos - crown_pos
         r = jnp.sqrt(x ** 2 + d ** 2)
         theta = jnp.arctan2(d, x)
@@ -407,10 +410,11 @@ def validate_equilibrium(state: 'State', constants: 'DynamicParams',
     Returns:
         True if the largest residual is below tolerance
     """
-    from multifil_jax.kernels.forces import compute_forces_from_state_vectorized
+    from multifil_jax.kernels.forces import compute_forces_vectorized
 
-    forces = compute_forces_from_state_vectorized(state, constants, topology,
-                                                  z_line, lattice_spacing)
+    forces = compute_forces_vectorized(
+        state.thick.displacement, state.thin.displacement, z_line, lattice_spacing,
+        state.thick.xb_states, state.thick.xb_bound_to, constants, topology)
     max_residual = float(jnp.max(jnp.abs(forces)))
 
     print(f"Equilibrium Validation:")

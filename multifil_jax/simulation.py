@@ -73,13 +73,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from functools import partial
-from typing import Dict, Tuple, List, Optional, Union
+from typing import Dict, Tuple, List, Optional, Union, NamedTuple
 
 from multifil_jax.core.params import (
     StaticParams, DynamicParams, get_skeletal_params, DYNAMIC_FIELDS,
-    FILAMENT_RADII_SUM
+    poisson_spacing
 )
-from multifil_jax.core.state import realize_state, State, Drivers, MetricsDict, build_preconditioner_params
+from multifil_jax.core.state import realize_state, State, Drivers, MetricsDict, build_preconditioner_params, thin_segment_k
 from multifil_jax.kernels.solver import build_prefactored_preconditioner
 from multifil_jax.core.sarc_geometry import SarcTopology
 from multifil_jax.kernels.geometry import update_nearest_neighbors
@@ -94,14 +94,12 @@ from multifil_jax.core.subpopulation import Subpopulation, generate_random_masks
 # SIMULATION RESULT
 # =============================================================================
 
-@jax.tree_util.register_pytree_node_class
 class SimulationResult:
     """Result container from run() with visualization and grid support.
 
     Consolidates all simulation outputs including:
     - Force and metrics time traces (force lives in metrics['axial_force'])
     - Input replay (z_line, pCa, lattice_spacing traces used)
-    - Final state for continuation
     - Grid metadata for parameter sweeps (coords, slicing, mean/std)
 
     Data Cube Convention:
@@ -116,20 +114,24 @@ class SimulationResult:
         z_line: (..., replicates, n_steps) Z-line position trace
         pCa: (..., replicates, n_steps) pCa trace
         lattice_spacing: (..., replicates, n_steps) lattice spacing trace
-        final_state: Nested dict or None if return_final_state=False
-        metadata: Dict with params, geometry, etc.
+        metadata: Dict with the master seed
         dt: Timestep in milliseconds
         name: Simulation/experiment name
-        _grid_shape: Tuple: shape without time
         _axis_names: List: ['pCa', 'thick_k', 'replicates', 'time']
         coords: Dict: {'pCa': [...], 'thick_k': [...], ...}
+        topology_config: the topology's structural integers (+ K_lat / nu in
+            dynamic-LS mode)
+
+    Every derived result (mean, std, indexing, sel, stack) is built by _map,
+    which applies ONE function to every metric and the three driver traces and
+    carries everything else across, so no field can be dropped by one of them.
     """
 
     __slots__ = (
         'metrics', 'rng_key',
         'z_line', 'pCa', 'lattice_spacing',
-        'final_state', 'metadata', 'dt', 'name',
-        '_grid_shape', '_axis_names', 'coords',
+        'metadata', 'dt', 'name',
+        '_axis_names', 'coords',
         'topology_config',
     )
 
@@ -140,11 +142,9 @@ class SimulationResult:
         z_line: jnp.ndarray,
         pCa: jnp.ndarray,
         lattice_spacing: jnp.ndarray,
-        final_state: Optional[Dict] = None,
         metadata: Optional[Dict] = None,
         dt: float = 1.0,
         name: str = "",
-        grid_shape: Tuple[int, ...] = None,
         axis_names: List[str] = None,
         coords: Dict[str, List] = None,
         topology_config: Optional[Dict] = None,
@@ -154,42 +154,33 @@ class SimulationResult:
         self.z_line = z_line
         self.pCa = pCa
         self.lattice_spacing = lattice_spacing
-        self.final_state = final_state
         self.metadata = metadata if metadata is not None else {}
         self.dt = float(dt)
         self.name = str(name)
-        self._grid_shape = grid_shape
         self._axis_names = axis_names if axis_names is not None else []
         self.coords = coords if coords is not None else {}
         self.topology_config = topology_config if topology_config is not None else {}
 
-    def tree_flatten(self) -> Tuple[Tuple, Tuple]:
-        """Flatten for JAX tree operations."""
-        children = (
-            self.metrics, self.rng_key,
-            self.z_line, self.pCa, self.lattice_spacing,
-            self.final_state,
-        )
-        aux_data = (
-            self.metadata, self.dt, self.name,
-            self._grid_shape, self._axis_names, self.coords,
-            self.topology_config,
-        )
-        return children, aux_data
+    _TRACES = ('z_line', 'pCa', 'lattice_spacing')
 
-    @classmethod
-    def tree_unflatten(cls, aux_data: Tuple, children: Tuple) -> 'SimulationResult':
-        """Reconstruct SimulationResult from flattened representation."""
-        (metrics, rng_key, z_line, pCa, lattice_spacing, final_state) = children
-        (metadata, dt, name, grid_shape, axis_names, coords,
-         topology_config) = aux_data
-        return cls(
-            metrics=MetricsDict(metrics), rng_key=rng_key,
-            z_line=z_line, pCa=pCa, lattice_spacing=lattice_spacing,
-            final_state=final_state, metadata=metadata, dt=dt, name=name,
-            grid_shape=grid_shape, axis_names=axis_names, coords=coords,
-            topology_config=topology_config,
+    def _with(self, metrics, traces, axis_names, coords, suffix='') -> 'SimulationResult':
+        """New result with these arrays and axes; every other field carried over."""
+        return SimulationResult(
+            metrics=MetricsDict(metrics), rng_key=self.rng_key, **traces,
+            metadata=self.metadata, dt=self.dt, name=self.name + suffix,
+            axis_names=axis_names, coords=coords, topology_config=self.topology_config,
         )
+
+    def _map(self, fn, axis_names, coords, suffix: str = '') -> 'SimulationResult':
+        """New result with fn applied to every metric and driver trace."""
+        return self._with({k: fn(v) for k, v in self.metrics.items()},
+                          {t: fn(getattr(self, t)) for t in self._TRACES},
+                          axis_names, coords, suffix)
+
+    @property
+    def grid_shape(self) -> Tuple[int, ...]:
+        """Shape without the time axis."""
+        return tuple(self.metrics['axial_force'].shape[:-1])
 
     @property
     def n_steps(self) -> int:
@@ -225,32 +216,19 @@ class SimulationResult:
         return float(jnp.mean(self.metrics['axial_force'][..., -n_avg:]))
 
     def _reduce_replicates(self, reduce_fn, suffix: str) -> 'SimulationResult':
-        """Collapse the replicate axis (axis -2) with reduce_fn on metrics.
+        """Collapse the replicate axis (axis -2) with reduce_fn.
 
-        Drivers (pCa, z_line, lattice_spacing) are identical across replicates by
-        construction, so they are always averaged regardless of reduce_fn (their
-        std would be 0).
+        The drivers are identical across replicates by construction, so
+        reduce_fn is applied to them too: their mean is the trace and their
+        std is 0.
         """
         if self.replicate_axis is None:
             raise ValueError("No replicate axis to reduce.")
-
-        new_metrics = MetricsDict({k: reduce_fn(v, axis=-2) for k, v in self.metrics.items()})
-        new_z = jnp.mean(self.z_line, axis=-2)
-        new_pCa = jnp.mean(self.pCa, axis=-2)
-        new_ls = jnp.mean(self.lattice_spacing, axis=-2)
-
-        new_coords = {k: v for k, v in self.coords.items() if k != 'replicates'}
-        new_axis_names = [n for n in self._axis_names if n != 'replicates']
-        force = new_metrics['axial_force']
-
-        return SimulationResult(
-            metrics=new_metrics, rng_key=self.rng_key,
-            z_line=new_z, pCa=new_pCa, lattice_spacing=new_ls,
-            final_state=None, metadata=self.metadata, dt=self.dt,
-            name=self.name + suffix,
-            grid_shape=force.shape[:-1] if force.ndim > 1 else None,
-            axis_names=new_axis_names, coords=new_coords,
-        )
+        return self._map(
+            lambda v: reduce_fn(v, axis=-2),
+            [n for n in self._axis_names if n != 'replicates'],
+            {k: v for k, v in self.coords.items() if k != 'replicates'},
+            suffix)
 
     def mean(self) -> 'SimulationResult':
         """Mean across the replicate axis (axis -2)."""
@@ -263,56 +241,27 @@ class SimulationResult:
     def __getitem__(self, key) -> 'SimulationResult':
         """Slice all tensors identically, return new SimulationResult.
 
-        Tracks axis bookkeeping: integer indices drop the axis from
-        `_axis_names`/`coords`; slice indices subset the coord list; opaque
-        keys (e.g. boolean masks) fall back to copying axis metadata as-is.
+        Accepts an int, a slice, or a tuple of them, applied to the leading
+        axes. An int drops its axis from `_axis_names`/`coords`; a slice
+        subsets that axis's coords. Anything else (a mask, an array, Ellipsis,
+        None) raises: the axis bookkeeping cannot follow it.
         """
-        new_metrics = MetricsDict({k: v[key] for k, v in self.metrics.items()})
-        new_z = self.z_line[key]
-        new_pCa = self.pCa[key]
-        new_ls = self.lattice_spacing[key]
-        new_force = new_metrics['axial_force']
-
-        # Update axis bookkeeping based on key shape
         key_tuple = key if isinstance(key, tuple) else (key,)
-        new_axis_names = list(self._axis_names)
-        new_coords = dict(self.coords)
-        axis_pos = 0
-        opaque = False
-        for k in key_tuple:
-            if axis_pos >= len(self._axis_names):
-                break
-            name = self._axis_names[axis_pos]
+        if len(key_tuple) > len(self._axis_names):
+            raise IndexError(f"{len(key_tuple)} indices for axes {self._axis_names}")
+        axis_names = list(self._axis_names)
+        coords = dict(self.coords)
+        for name, k in zip(self._axis_names, key_tuple):
             if isinstance(k, (int, np.integer)):
-                # Drop this axis
-                if name in new_axis_names:
-                    new_axis_names.remove(name)
-                new_coords.pop(name, None)
-                # Do not advance axis_pos in new_axis_names list, but original axis
-                # consumed: just skip
+                axis_names.remove(name)
+                coords.pop(name, None)
             elif isinstance(k, slice):
-                # Keep axis; subset coords
-                if name in new_coords:
-                    try:
-                        new_coords[name] = list(new_coords[name])[k]
-                    except Exception:
-                        opaque = True
+                if name in coords:
+                    coords[name] = list(coords[name])[k]
             else:
-                opaque = True
-            axis_pos += 1
-
-        if opaque:
-            # Fall back to original metadata for safety
-            new_axis_names = list(self._axis_names)
-            new_coords = dict(self.coords)
-
-        return SimulationResult(
-            metrics=new_metrics, rng_key=self.rng_key,
-            z_line=new_z, pCa=new_pCa, lattice_spacing=new_ls,
-            final_state=None, metadata=self.metadata, dt=self.dt, name=self.name,
-            grid_shape=new_force.shape[:-1] if new_force.ndim > 1 else None,
-            axis_names=new_axis_names, coords=new_coords,
-        )
+                raise TypeError(
+                    f"SimulationResult index must be int or slice per axis, got {type(k).__name__}")
+        return self._map(lambda v: v[key], axis_names, coords)
 
     def summary(self) -> str:
         """Return text summary of simulation results."""
@@ -340,30 +289,15 @@ class SimulationResult:
         Returns:
             Sliced SimulationResult
         """
-        idx = [slice(None)] * self.axial_force.ndim
-        new_axis_names = list(self._axis_names)
-        new_coords = dict(self.coords)
-
+        idx = [slice(None)] * len(self._axis_names)
         for axis_name, value in kwargs.items():
             if axis_name not in self.coords:
                 raise ValueError(f"Unknown axis '{axis_name}'. Available: {list(self.coords.keys())}")
             coord_list = self.coords[axis_name]
             if value not in coord_list:
                 raise ValueError(f"Value {value} not in {axis_name} coords: {coord_list}")
-            axis_idx = self._axis_names.index(axis_name)
-            val_idx = coord_list.index(value)
-            idx[axis_idx] = val_idx
-
-        result = self[tuple(idx)]
-        # Remove sliced axes from names/coords
-        for axis_name in kwargs:
-            if axis_name in new_axis_names:
-                new_axis_names.remove(axis_name)
-            new_coords.pop(axis_name, None)
-
-        result._axis_names = new_axis_names
-        result.coords = new_coords
-        return result
+            idx[self._axis_names.index(axis_name)] = coord_list.index(value)
+        return self[tuple(idx)]
 
     @classmethod
     def stack(cls, results: List['SimulationResult'], axis_name: str = 'structural',
@@ -383,36 +317,15 @@ class SimulationResult:
         """
         if not results:
             raise ValueError("Cannot stack empty list of results")
-
-        stacked_z = jnp.stack([r.z_line for r in results])
-        stacked_pCa = jnp.stack([r.pCa for r in results])
-        stacked_ls = jnp.stack([r.lattice_spacing for r in results])
-
-        # Stack metrics (includes axial_force and solver_residual)
-        metric_keys = list(results[0].metrics.keys())
-        stacked_metrics = MetricsDict({
-            k: jnp.stack([r.metrics[k] for r in results]) for k in metric_keys
-        })
-
-        # Build new axis names and coords
-        new_axis_names = [axis_name] + results[0]._axis_names
-        new_coords = dict(results[0].coords)
-        new_coords[axis_name] = axis_values if axis_values is not None else list(range(len(results)))
-
-        return cls(
-            metrics=stacked_metrics,
-            rng_key=results[-1].rng_key,
-            z_line=stacked_z,
-            pCa=stacked_pCa,
-            lattice_spacing=stacked_ls,
-            final_state=None,
-            metadata=results[0].metadata,
-            dt=results[0].dt,
-            name=results[0].name + "_stacked",
-            grid_shape=stacked_metrics['axial_force'].shape[:-1],
-            axis_names=new_axis_names,
-            coords=new_coords,
-        )
+        out = results[0]._with(
+            {k: jnp.stack([r.metrics[k] for r in results]) for k in results[0].metrics},
+            {t: jnp.stack([getattr(r, t) for r in results]) for t in cls._TRACES},
+            [axis_name] + results[0]._axis_names,
+            {**results[0].coords,
+             axis_name: axis_values if axis_values is not None else list(range(len(results)))},
+            "_stacked")
+        out.rng_key = results[-1].rng_key
+        return out
 
     def __repr__(self) -> str:
         force = self.metrics.get('axial_force')
@@ -511,7 +424,7 @@ def _resolve_explicit_masks(subpops, topology, total_batch, idx, fractions_b):
     mode = subpops[0].mode
     if mode == 'c_zone':
         xb_variants = jnp.stack([jnp.asarray(sp.xb_mask) for sp in subpops])  # (V, total_xbs)
-        tm_variants = jnp.stack([jnp.asarray(sp.tm_mask) for sp in subpops])  # (V, n_sites_total)
+        tm_variants = jnp.stack([jnp.asarray(sp.tm_mask) for sp in subpops])  # (V, n_thin * n_tm)
         if idx is not None:
             xb_mask_b = xb_variants[idx]
             tm_mask_b = tm_variants[idx]
@@ -533,20 +446,24 @@ def _resolve_explicit_masks(subpops, topology, total_batch, idx, fractions_b):
 
 def _resolve_subpopulation(subpopulation, topology, total_batch, flat_idx,
                            is_list_axis):
-    """Resolve a Subpopulation (single object or list) into static flags and
-    per-sim batched arrays for the kernel.
+    """Resolve a Subpopulation (single object or list) into the kernel's two
+    static arguments and its per-sim batched arrays.
 
     Returns:
-        (is_subpop_active, is_mean_field, subpop_has_xb, subpop_has_tm,
-         scaled_field_names, n_pops, subpop_arrays)
+        (mode, scaled_field_names, subpop_arrays)
 
-    subpop_arrays is None when inactive, else a dict of (total_batch, ...)
-    arrays: {'scale_matrix' (·,K,F), 'fractions' (·,K)} for mean-field, or
-    {'scale_matrix', 'xb_mask' (·,total_xbs), 'tm_mask' (·,n_sites_total)} for
-    explicit modes.
+    mode is 'mean_field' or 'explicit'. subpop_arrays is a dict of
+    (total_batch, ...) arrays: {'scale_matrix' (·,K,F), 'fractions' (·,K)} for
+    mean-field, or {'scale_matrix', 'xb_mask' (·,total_xbs),
+    'tm_mask' (·,n_thin * n_tm)} for explicit modes.
+
+    No subpopulation is the mean-field case with K = 1, fraction 1.0 and no
+    scaled field — the same path, not a separate one.
     """
     if subpopulation is None:
-        return (False, False, False, False, (), 1, None)
+        return ('mean_field', (),
+                {'scale_matrix': jnp.ones((total_batch, 1, 0), jnp.float32),
+                 'fractions': jnp.ones((total_batch, 1), jnp.float32)})
 
     subpops = subpopulation if is_list_axis else [subpopulation]
 
@@ -558,7 +475,6 @@ def _resolve_subpopulation(subpopulation, topology, total_batch, flat_idx,
         raise ValueError(f"All swept subpopulations must have the same K; got {sorted(n_pops_set)}")
     mode = subpops[0].mode
     n_pops = subpops[0].K
-    is_mean_field = (mode == 'mean_field')
 
     # Union of scaled fields (must all be xb_* or tm_* — mechanics use the WT base).
     field_set = set()
@@ -570,8 +486,6 @@ def _resolve_subpopulation(subpopulation, topology, total_batch, flat_idx,
             f"Subpopulation scales must be xb_* or tm_* fields; got {sorted(bad)}"
         )
     scaled_field_names = tuple(sorted(field_set))
-    subpop_has_xb = any(f.startswith('xb_') for f in scaled_field_names)
-    subpop_has_tm = any(f.startswith('tm_') for f in scaled_field_names)
 
     # Per-variant scale/fraction tables → gather (or broadcast) per sim.
     scale_variants = jnp.stack([sp.scale_array(scaled_field_names) for sp in subpops])  # (V,K,F)
@@ -585,47 +499,55 @@ def _resolve_subpopulation(subpopulation, topology, total_batch, flat_idx,
             scale_variants[0], (total_batch,) + scale_variants.shape[1:])
         fractions_b = jnp.broadcast_to(frac_variants[0], (total_batch, n_pops))
 
-    if is_mean_field:
-        subpop_arrays = {'scale_matrix': scale_matrix_b, 'fractions': fractions_b}
-    else:
-        xb_mask_b, tm_mask_b = _resolve_explicit_masks(
-            subpops, topology, total_batch, idx, fractions_b)
-        subpop_arrays = {'scale_matrix': scale_matrix_b,
-                         'xb_mask': xb_mask_b, 'tm_mask': tm_mask_b}
-
-    return (True, is_mean_field, subpop_has_xb, subpop_has_tm,
-            scaled_field_names, n_pops, subpop_arrays)
+    if mode == 'mean_field':
+        return mode, scaled_field_names, {'scale_matrix': scale_matrix_b,
+                                          'fractions': fractions_b}
+    xb_mask_b, tm_mask_b = _resolve_explicit_masks(
+        subpops, topology, total_batch, idx, fractions_b)
+    return 'explicit', scaled_field_names, {'scale_matrix': scale_matrix_b,
+                                            'xb_mask': xb_mask_b, 'tm_mask': tm_mask_b}
 
 
 # =============================================================================
 # MODULE-LEVEL SIMULATION KERNEL
 # =============================================================================
 
+class SimBatch(NamedTuple):
+    """Everything that differs between the simulations of one run(), each
+    leaf with a leading (batch,) axis. Padding, chunking, trimming and the
+    kernel's vmap all treat it as one pytree, so no per-sim input can be
+    forgotten by one of them.
+
+    Fields:
+        params: DynamicParams, every field (batch,)
+        z, pCa, ls: (batch, n_steps) driver traces
+        K_lat: (batch,) lattice stiffness, already x n_thick (dynamic LS only)
+        nu: (batch,) Poisson exponent
+        rng_keys: (batch, 2) one PRNG key per simulation
+        subpop: dict of per-sim subpopulation arrays (see _resolve_subpopulation)
+    """
+    params: DynamicParams
+    z: jnp.ndarray
+    pCa: jnp.ndarray
+    ls: jnp.ndarray
+    K_lat: jnp.ndarray
+    nu: jnp.ndarray
+    rng_keys: jnp.ndarray
+    subpop: object
+
 @partial(jax.jit, static_argnames=[
     'dt', 'unroll', 'is_dynamic_ls', 'n_cg_steps', 'n_newton_steps',
-    'is_subpop_active', 'is_mean_field', 'subpop_has_xb', 'subpop_has_tm',
-    'scaled_field_names', 'n_pops'])
+    'subpop_mode', 'scaled_field_names'])
 def _run_sim_kernel(
     topology: SarcTopology,
-    batched_params: DynamicParams,
-    z_batched: jnp.ndarray,
-    pCa_batched: jnp.ndarray,
-    ls_batched: jnp.ndarray,
-    rng_keys: jnp.ndarray,
+    batch: SimBatch,
     dt: float,
     unroll: int,
     n_cg_steps: int,
     n_newton_steps: int,
     is_dynamic_ls: bool = False,
-    K_lat_batched: jnp.ndarray = None,
-    nu_batched: jnp.ndarray = None,
-    subpop_arrays=None,
-    is_subpop_active: bool = False,
-    is_mean_field: bool = False,
-    subpop_has_xb: bool = False,
-    subpop_has_tm: bool = False,
+    subpop_mode: str = 'mean_field',
     scaled_field_names: tuple = (),
-    n_pops: int = 1,
 ):
     """JIT-compiled simulation kernel (unified fixed + dynamic LS).
 
@@ -634,16 +556,13 @@ def _run_sim_kernel(
 
     Args:
         topology: SarcTopology with pre-computed index maps (broadcast via closure)
-        batched_params: DynamicParams with batch dimension
-        z_batched: (batch, time) z-line values
-        pCa_batched: (batch, time) pCa values
-        ls_batched: (batch, time) lattice spacing values
-        rng_keys: (batch,) RNG keys
+        batch: SimBatch, every leaf (batch, ...); vmapped whole with in_axes=0
         dt: Timestep in ms (static)
         unroll: Scan unrolling factor (static)
         is_dynamic_ls: If True, solve lattice spacing as a DOF (static)
-        K_lat_batched: (batch,) per-sim lattice stiffness (ignored if not is_dynamic_ls)
-        nu_batched: (batch,) per-sim Poisson exponent (ignored if not is_dynamic_ls)
+        subpop_mode: 'mean_field' or 'explicit' (static)
+        scaled_field_names: the xb_*/tm_* fields the subpopulations scale,
+            the columns of batch.subpop['scale_matrix'] (static)
 
     Returns:
         MetricsDict with all metric scalars, shape (batch, time).
@@ -666,39 +585,38 @@ def _run_sim_kernel(
         )
         return state
 
-    def run_single_sim(state, constants, key, z_trace, pCa_trace, ls_trace,
-                       K_lat_val, nu_val, subpop=None):
-        """Run simulation with scan inside vmap."""
+    def run_single_sim(state, b):
+        """Run simulation with scan inside vmap. b is one simulation's SimBatch."""
+        constants, z_trace, pCa_trace, ls_trace = b.params, b.z, b.pCa, b.ls
+        K_lat_val, nu_val, subpop = b.K_lat, b.nu, b.subpop
         n_thick, n_crowns = state.thick.displacement.shape
-        n_thin, n_sites = state.thin.displacement.shape
+        n_thin, n_nodes = state.thin.displacement.shape
         precond_params = build_preconditioner_params(
-            n_thick, n_crowns, n_thin, n_sites,
-            constants.thick_k, constants.thin_k,
+            n_thick, n_crowns, n_thin, n_nodes,
+            constants.thick_k, thin_segment_k(constants, topology),
         )
         prefactored_precond = build_prefactored_preconditioner(precond_params)
 
         l0 = z_trace[0]  # reference z for Poisson scaling
 
-        # Subpopulation: build the K unscaled population constants once per sim
-        # (rate scales are per-sim; the drivers reach the kernels per step).
-        if is_subpop_active:
-            scale_matrix = subpop['scale_matrix']  # (K, F)
-            constants_k = [
-                constants.copy(**{
-                    name: getattr(constants, name) * scale_matrix[k, j]
-                    for j, name in enumerate(scaled_field_names)
-                })
-                for k in range(n_pops)
-            ]
-            if is_mean_field:
-                fractions = subpop['fractions']  # (K,)
-                xb_subpop = ('mean_field', constants_k, fractions) if subpop_has_xb else None
-                tm_subpop = ('mean_field', constants_k, fractions) if subpop_has_tm else None
-            else:
-                xb_subpop = ('explicit', constants_k, subpop['xb_mask']) if subpop_has_xb else None
-                tm_subpop = ('explicit', constants_k, subpop['tm_mask']) if subpop_has_tm else None
-        else:
-            xb_subpop = tm_subpop = None
+        # Subpopulation: the K population constants, built once per sim (rate
+        # scales are per-sim; the drivers reach the kernels per step). A kernel
+        # whose rates no population scales gets None = the wild type alone.
+        scale_matrix = subpop['scale_matrix']  # (K, F)
+        constants_k = [
+            constants.copy(**{name: getattr(constants, name) * scale_matrix[k, j]
+                              for j, name in enumerate(scaled_field_names)})
+            for k in range(scale_matrix.shape[0])
+        ]
+
+        def _pops(prefix, mask):
+            if not any(f.startswith(prefix) for f in scaled_field_names):
+                return None
+            if subpop_mode == 'mean_field':
+                return ('mean_field', constants_k, subpop['fractions'])
+            return ('explicit', constants_k, subpop[mask])
+
+        xb_subpop, tm_subpop = _pops('xb_', 'xb_mask'), _pops('tm_', 'tm_mask')
 
         def scan_fn(carry, inputs):
             old_state, k, current_ls = carry
@@ -713,10 +631,7 @@ def _run_sim_kernel(
 
             if is_dynamic_ls:
                 drivers = Drivers(pCa=pCa_val, z_line=z_val, lattice_spacing=current_ls)
-                # Scale the centre-to-centre spacing, not the surface gap: the
-                # filament radii do not change with sarcomere length.
-                d_ref = ((ls_val + FILAMENT_RADII_SUM) * (l0 / z_val) ** nu_val
-                         - FILAMENT_RADII_SUM)
+                d_ref = poisson_spacing(ls_val, l0, z_val, nu_val)
             else:
                 drivers = Drivers(pCa=pCa_val, z_line=z_val, lattice_spacing=ls_val)
                 d_ref = None
@@ -753,29 +668,15 @@ def _run_sim_kernel(
 
         _, metrics_out = jax.lax.scan(
             scan_fn,
-            (state, key, ls_trace[0]),
+            (state, b.rng_keys, ls_trace[0]),
             (z_trace, pCa_trace, ls_trace),
             unroll=unroll,
         )
         return metrics_out
 
-    batched_states = jax.vmap(create_and_equilibrate, in_axes=(0, 0, 0, 0))(
-        batched_params,
-        z_batched[:, 0], pCa_batched[:, 0], ls_batched[:, 0],
-    )
-
-    # Subpopulation batched arrays ride the vmap as one extra (dict) axis when
-    # active; when inactive the signature is unchanged (byte-identical trace).
-    vmap_in_axes = (0, 0, 0, 0, 0, 0, 0, 0)
-    vmap_args = [batched_states, batched_params, rng_keys,
-                 z_batched, pCa_batched, ls_batched, K_lat_batched, nu_batched]
-    if is_subpop_active:
-        vmap_in_axes = vmap_in_axes + (0,)
-        vmap_args.append(subpop_arrays)
-
-    batched_metrics = jax.vmap(run_single_sim, in_axes=vmap_in_axes)(*vmap_args)
-
-    return batched_metrics
+    batched_states = jax.vmap(create_and_equilibrate)(
+        batch.params, batch.z[:, 0], batch.pCa[:, 0], batch.ls[:, 0])
+    return jax.vmap(run_single_sim)(batched_states, batch)
 
 
 # =============================================================================
@@ -1055,12 +956,8 @@ def run(
     has_nonzero_nu = (any(v != 0.0 for v in nu) if isinstance(nu, list)
                       else float(nu) != 0.0)
     if not is_dynamic_ls and not ls_is_trace and has_nonzero_nu:
-        # Scale the centre-to-centre spacing (d + radii), then take the radii
-        # back off: the isovolumic argument is about filament PACKING, and the
-        # filaments themselves do not get thinner as the lattice closes.
-        d0 = ls_batched[:, 0:1] + FILAMENT_RADII_SUM       # (total_batch, 1)
-        ls_batched = (d0 * (z_batched[:, 0:1] / z_batched) ** nu_batched[:, None]
-                      - FILAMENT_RADII_SUM)
+        ls_batched = poisson_spacing(ls_batched[:, 0:1], z_batched[:, 0:1],
+                                     z_batched, nu_batched[:, None])
 
     # Batched DynamicParams — one lookup per field.
     def _param(name):
@@ -1072,30 +969,23 @@ def run(
 
     batched_params = DynamicParams(**{name: _param(name) for name in DYNAMIC_FIELDS})
 
-    # Subpopulation resolution → static flags + per-sim batched arrays.
-    (is_subpop_active, is_mean_field, subpop_has_xb, subpop_has_tm,
-     scaled_field_names, n_pops, subpop_arrays) = _resolve_subpopulation(
+    # Subpopulation resolution → two static args + per-sim batched arrays.
+    subpop_mode, scaled_field_names, subpop_arrays = _resolve_subpopulation(
         subpopulation, topology, total_batch, flat_idx,
         is_list_axis=isinstance(subpopulation, list),
     )
 
-    # Generate unique RNG keys
-    rng_keys = jax.random.split(jax.random.PRNGKey(rng_seed), total_batch)
+    batch = SimBatch(
+        params=batched_params, z=z_batched, pCa=pCa_batched, ls=ls_batched,
+        K_lat=K_lat_batched, nu=nu_batched,
+        rng_keys=jax.random.split(jax.random.PRNGKey(rng_seed), total_batch),
+        subpop=subpop_arrays)
 
-    # Pad batch to bucket size
+    # Pad batch to bucket size. The padding sims copy sim 0 and are trimmed
+    # off below; every sim is independent under vmap, so they change nothing.
     padded_batch = get_bucket_size(total_batch)
     if padded_batch > total_batch:
-        pad_n = padded_batch - total_batch
-        z_batched = _pad(z_batched, pad_n)
-        pCa_batched = _pad(pCa_batched, pad_n)
-        ls_batched = _pad(ls_batched, pad_n)
-        K_lat_batched = _pad(K_lat_batched, pad_n)
-        nu_batched = _pad(nu_batched, pad_n)
-        rng_keys = jnp.concatenate([rng_keys, jax.random.split(jax.random.PRNGKey(rng_seed + 1), pad_n)])
-        pad_kwargs = {name: _pad(getattr(batched_params, name), pad_n) for name in DYNAMIC_FIELDS}
-        batched_params = DynamicParams(**pad_kwargs)
-        if is_subpop_active:
-            subpop_arrays = jax.tree_util.tree_map(lambda x: _pad(x, pad_n), subpop_arrays)
+        batch = jax.tree_util.tree_map(lambda x: _pad(x, padded_batch - total_batch), batch)
 
     if verbose:
         print(f"Running simulation kernel (batch={total_batch}, padded={padded_batch})...")
@@ -1116,12 +1006,8 @@ def run(
         is_dynamic_ls=is_dynamic_ls,
         n_cg_steps=static_params.n_cg_steps,
         n_newton_steps=static_params.n_newton_steps,
-        is_subpop_active=is_subpop_active,
-        is_mean_field=is_mean_field,
-        subpop_has_xb=subpop_has_xb,
-        subpop_has_tm=subpop_has_tm,
+        subpop_mode=subpop_mode,
         scaled_field_names=scaled_field_names,
-        n_pops=n_pops,
     )
 
     # One chunk = the whole padded batch when not minibatching.
@@ -1131,19 +1017,9 @@ def run(
     starts = list(range(0, padded_batch, chunk_size))
 
     def _run_chunk(start):
-        end = start + chunk_size
-        chunk_subpop = (None if not is_subpop_active
-                        else jax.tree_util.tree_map(lambda x, s=start, e=end: x[s:e], subpop_arrays))
         return _run_sim_kernel(
             topology=topology,
-            batched_params=jax.tree_util.tree_map(lambda x, s=start, e=end: x[s:e], batched_params),
-            z_batched=z_batched[start:end],
-            pCa_batched=pCa_batched[start:end],
-            ls_batched=ls_batched[start:end],
-            rng_keys=rng_keys[start:end],
-            K_lat_batched=K_lat_batched[start:end],
-            nu_batched=nu_batched[start:end],
-            subpop_arrays=chunk_subpop,
+            batch=jax.tree_util.tree_map(lambda x: x[start:start + chunk_size], batch),
             **kernel_kwargs,
         )
 
@@ -1177,19 +1053,12 @@ def run(
                 batched_metrics[k][start:start + host.shape[0]] = host
             del chunk, host      # release the device buffer before the next one
 
-    # Slice back to actual batch size
-    if padded_batch > total_batch:
-        batched_metrics = MetricsDict({k: v[:total_batch] for k, v in batched_metrics.items()})
-        z_batched = z_batched[:total_batch]
-        pCa_batched = pCa_batched[:total_batch]
-        ls_batched = ls_batched[:total_batch]
-
-    # Reshape to data cube
+    # Trim the padding and reshape to the data cube, metrics and drivers alike.
     final_shape = grid_shape + (replicates, n_steps)
-    reshaped_metrics = MetricsDict({key: val.reshape(final_shape) for key, val in batched_metrics.items()})
-    reshaped_z = z_batched.reshape(final_shape)
-    reshaped_pCa = pCa_batched.reshape(final_shape)
-    reshaped_ls = ls_batched.reshape(final_shape)
+    reshaped_metrics, (reshaped_z, reshaped_pCa, reshaped_ls) = jax.tree_util.tree_map(
+        lambda v: v[:total_batch].reshape(final_shape),
+        (dict(batched_metrics), (batch.z, batch.pCa, batch.ls)))
+    reshaped_metrics = MetricsDict(reshaped_metrics)
 
     # Post-run solver convergence check. The test is the NORMALIZED residual,
     # which is <= 1 exactly when the solve converged — in both LS modes, and at
@@ -1217,15 +1086,7 @@ def run(
         print(f"Max solver residual: {max_residual:.4f} pN "
               f"(normalized {max_norm:.4f})")
 
-    topology_config = {
-        'n_thick': topology.n_thick,
-        'n_crowns': topology.n_crowns,
-        'n_thin': topology.n_thin,
-        'n_sites': topology.n_sites,
-        'n_titin': topology.n_titin,
-        'total_xbs': topology.total_xbs,
-        'n_faces_per_thin': topology.n_faces_per_thin,
-    }
+    topology_config = {name: getattr(topology, name) for name in topology._AUX}
     if is_dynamic_ls:
         topology_config['K_lat'] = K_lat
         topology_config['K_lat_eff'] = float(K_lat * topology.n_thick) if not isinstance(K_lat, list) else [float(k * topology.n_thick) for k in K_lat]
@@ -1237,15 +1098,13 @@ def run(
 
     return SimulationResult(
         metrics=reshaped_metrics,
-        rng_key=rng_keys[-1],
+        rng_key=batch.rng_keys[total_batch - 1],
         z_line=reshaped_z,
         pCa=reshaped_pCa,
         lattice_spacing=reshaped_ls,
-        final_state=None,
         metadata=metadata,
         dt=dt,
         name="run",
-        grid_shape=grid_shape,
         axis_names=axis_names,
         coords=coords,
         topology_config=topology_config,

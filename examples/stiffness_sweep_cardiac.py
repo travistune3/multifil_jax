@@ -17,7 +17,7 @@ topo = jax.device_put(topo)
 
 # ── Sweep definition ──────────────────────────────────────────────────────────
 thick_sweep = [float(dynamic.thick_k) * f for f in np.linspace(0.25, 3.0, 12)]
-thin_sweep  = [float(dynamic.thin_k)  * f for f in np.linspace(0.25, 3.0, 12)]
+thin_sweep  = [float(dynamic.thin_EA) * f for f in np.linspace(0.25, 3.0, 12)]
 
 print(f"Sweep: {len(thick_sweep)} thick × {len(thin_sweep)} thin = {len(thick_sweep)*len(thin_sweep)} conditions")
 
@@ -33,20 +33,20 @@ results = run(
     replicates=3,
     dynamic_params={
         'thick_k': thick_sweep,
-        'thin_k':  thin_sweep,
+        'thin_EA': thin_sweep,
     },
 )
 results.metrics['axial_force'].block_until_ready()
 print(f"Done in {time.time()-t0:.1f}s")
 
 # ── Extract metric ─────────────────────────────────────────────────────────────
-# Shape: (thick_k, thin_k, replicates, time)
+# Shape: (thick_k, thin_EA, replicates, time)
 # The per-step CHANGE in that energy is not a metric: it is the first
 # difference of the level trace, which is what np.diff gives here.
 data = np.diff(np.array(results.metrics['thick_energy_first_avg']), axis=-1)
 
 # Steady-state mean: last 100 timesteps, averaged over replicates and time
-steady = data[..., -200:].mean(axis=(-1, -2))   # (thick_k, thin_k)
+steady = data[..., -200:].mean(axis=(-1, -2))   # (thick_k, thin_EA)
 
 # ── Plot ───────────────────────────────────────────────────────────────────────
 fig, ax = plt.subplots(figsize=(7, 6))
@@ -61,7 +61,7 @@ im = ax.imshow(
 fig.colorbar(im, ax=ax, label='Δ thick_energy_first_avg per step (pN·nm)')
 
 ax.set_xlabel('thick_k (pN/nm)')
-ax.set_ylabel('thin_k (pN/nm)')
+ax.set_ylabel('thin_EA (pN)')
 ax.set_title('Stiffness sweep — cardiac params\nSteady-state Δ thick-filament tip energy')
 
 plt.tight_layout()

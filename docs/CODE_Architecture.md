@@ -40,7 +40,7 @@ its driver dependence:
 | `thin_transitions(state, constants, topology, pCa, rng_key, dt, ...)` | `pCa` |
 | `xb_binned_generator(state, constants, topology, pCa, lattice_spacing, dt, ...)` | `pCa`, spacing |
 | `solve_equilibrium(state, constants, topology, z_line, lattice_spacing, ...)` | both (spacing = initial d in dynamic LS) |
-| `compute_forces_from_state_vectorized(state, constants, topology, z_line, lattice_spacing)` | both |
+| `compute_forces_vectorized(u_thick, u_thin, z_line, lattice_spacing, xb_states, xb_bound_to, constants, topology)` | both |
 | `axial_force_at_mline(state, constants, topology)` | none |
 
 ### vmap-outside-scan Architecture
@@ -186,8 +186,9 @@ result.metrics['lattice_spacing']  # actual LS each step (emergent if dynamic)
 result.dt               # timestep (ms)
 result.coords           # {'pCa': [...], 'z_line': [...], ...}
 result._axis_names      # ['pCa', 'replicates', 'time']
-result.topology_config  # dict: n_thick, n_thin, n_crowns, n_sites, n_titin,
-                        #       n_faces_per_thin, total_xbs
+result.grid_shape       # shape without the time axis
+result.topology_config  # dict: every SarcTopology._AUX integer (n_thick, n_thin,
+                        #       n_mono, n_cand, n_nodes, n_tm, total_xbs, ...)
 result.metadata         # {'master_seed': int} — everything else is first-class
 ```
 
@@ -202,9 +203,12 @@ result.metadata         # {'master_seed': int} — everything else is first-clas
   stacks independent runs (different topologies allowed) into a new outer sweep axis
 - `.summary()` — human-readable text summary
 
-`.mean()`/`.std()` both route through `_reduce_replicates(reduce_fn, suffix)`;
-drivers (`z_line`/`pCa`/`lattice_spacing`) are always *averaged* over replicates
-regardless of which reduction was requested.
+Every derived result — `.mean()`, `.std()`, `result[...]`, `.sel()`,
+`SimulationResult.stack()` — is built by ONE `_map(fn)` that applies `fn` to every
+metric and the three driver traces and carries `topology_config`, `metadata` etc.
+across. `result[...]` accepts ints and slices only (per axis) and raises on
+anything else, since the axis bookkeeping cannot follow a mask. The result is not
+a pytree.
 
 ---
 
@@ -215,29 +219,26 @@ regardless of which reduction was requested.
 This is the vmapped+scanned simulation kernel:
 
 ```python
+class SimBatch(NamedTuple):   # every leaf has a leading (batch,) axis
+    params; z; pCa; ls; K_lat; nu; rng_keys; subpop
+
 @partial(jax.jit, static_argnames=[
     'dt', 'unroll', 'is_dynamic_ls', 'n_cg_steps', 'n_newton_steps',
-    'is_subpop_active', 'is_mean_field', 'subpop_has_xb', 'subpop_has_tm',
-    'scaled_field_names', 'n_pops'])
+    'subpop_mode', 'scaled_field_names'])
 def _run_sim_kernel(
-    topology,           # passed via closure (vmap in_axes=None)
-    batched_params,     # vmap in_axes=0
-    z_batched,          # (batch, n_steps)
-    pCa_batched,        # (batch, n_steps)
-    ls_batched,         # (batch, n_steps)
-    rng_keys,           # (batch,)
+    topology,             # passed via closure (vmap in_axes=None)
+    batch,                # SimBatch, vmapped whole with in_axes=0
     dt, unroll,
+    n_cg_steps, n_newton_steps,   # static — from StaticParams
     is_dynamic_ls=False,  # static — controls fixed vs dynamic LS code path
-    K_lat_batched=None,   # (batch,) lattice stiffness
-    nu_batched=None,      # (batch,) Poisson exponent
-    n_cg_steps=6,         # static — from StaticParams
-    n_newton_steps=16,    # static — from StaticParams (run() passes 4)
-    subpop_arrays=None,   # dict of (batch, ...) arrays, or None
-    is_subpop_active=False, is_mean_field=False,   # static subpop flags
-    subpop_has_xb=False, subpop_has_tm=False,
-    scaled_field_names=(), n_pops=1,
+    subpop_mode='mean_field',     # static — 'mean_field' or 'explicit'
+    scaled_field_names=(),        # static — columns of batch.subpop['scale_matrix']
 ) -> MetricsDict:         # shape (batch, n_steps) for each key
 ```
+
+`run()` builds ONE `SimBatch`; padding to the bucket size, minibatch chunking and
+trimming are each a single `tree_map` over it, so no per-sim input can be missed
+by one of them. Padding sims copy sim 0 and are trimmed off.
 
 `is_dynamic_ls` is a JIT static arg — fixed LS and dynamic LS compile to separate
 kernels. `K_lat` and `nu` are traced (not static), so different stiffness values
@@ -248,9 +249,12 @@ while the subpopulation *scale values* and masks ride the batch axis and do not.
 Scan carry is `(state, rng_key, current_ls)` — the third element tracks the
 emergent lattice spacing (identity passthrough for fixed LS).
 
-When a subpopulation is active, `subpop_arrays` joins the vmap as one extra
-(dict) axis; when inactive the vmap signature is unchanged, so the WT trace is
-byte-identical to a build without the feature.
+There is ONE subpopulation path. No subpopulation is the mean-field case with
+K = 1, fraction 1.0 and no scaled field (`1.0 * Q` is exact), and a transition
+kernel whose rates no population scales is handed `None`, which
+`transitions._populations` reads as that same single population. Measured at
+the S162 cleanup: bit-exact on the golden master and not slower (cardiac and
+Lethocerus 8x8, 512 sims x 200 steps, within ±1% run to run).
 
 All 43 metrics are always computed. No `metrics`/`manifest` in JIT
 `static_argnames` — changing metric selection never triggers recompilation.
@@ -340,16 +344,16 @@ It is deprecated and slated for removal.
 ```python
 State(
     thick = ThickState(
-        axial,          # (n_thick, n_crowns) crown positions (nm)
+        displacement,   # (n_thick, n_crowns) crown displacement from rest (nm)
         xb_states,      # (n_thick, n_crowns, n_xb_per_crown) XB states (0-5), int8
-        xb_bound_to,    # (n_thick, n_crowns, n_xb_per_crown) bound site index (-1=unbound)
-        xb_nearest_bs,  # (n_thick, n_crowns, n_xb_per_crown) nearest BS index
+        xb_bound_to,    # (n_thick, n_crowns, n_xb_per_crown) bound MONOMER index (-1=unbound)
+        xb_nearest_bs,  # (n_thick, n_crowns, n_xb_per_crown) nearest candidate MONOMER index
         xb_distances,   # (n_thick, n_crowns, n_xb_per_crown, 2) — (axial, radial) to that site
     ),
     thin = ThinState(
-        axial,           # (n_thin, n_sites) site positions (nm)
-        tm_states,       # (n_thin, n_sites) TM states (0-3), int8
-        bound_to,        # (n_thin, n_sites) XB address (-1=unbound)
+        displacement,    # (n_thin, n_nodes) NODE displacement from rest (nm)
+        tm_states,       # (n_thin, n_tm) tropomyosin UNIT states (0-3), int8
+        bound_to,        # (n_thin, n_cand) XB address per binding CANDIDATE (-1=unbound)
         # rests: moved to SarcTopology (Tier 1)
         # permissiveness: derived inline as (tm_states == 3).astype(float32)
     ),
@@ -416,25 +420,34 @@ topo = SarcTopology.create(
 
 **Key fields:**
 ```
-n_thick, n_crowns, n_thin, n_sites          # Dimensions (int, aux_data)
-n_titin, total_xbs, n_faces_per_thin, n_xb_per_crown, max_sites_per_face
+n_thick, n_crowns, n_thin, n_titin, total_xbs, n_faces_per_thin, n_xb_per_crown
+n_mono, n_cand, n_nodes, n_tm, max_mono_per_face     # thin layer sizes (aux_data)
+thin_node_spacing, tm_max_heads                      # node grid (nm); most heads per Tm unit
 
 crown_offsets      # (n_thick, n_crowns) crown rest positions from M-line
 crown_rests        # (n_thick, n_crowns) rest spacings between crowns
-binding_offsets    # (n_thin, n_sites) site rest positions
-binding_rests      # (n_thin, n_sites) rest spacings between sites
 titin_connections  # (n_titin, 4) (thick_idx, thick_face, thin_idx, thin_face)
+
+# THE THIN FILAMENT IS THREE LAYERS ON ONE MONOMER LIST
+mono_offsets       # (n_thin, n_mono) monomer rest distance from the Z-disc
+mono_angle, mono_strand                               # azimuth, long-pitch strand (m % 2)
+mono_node, mono_xi # (n_thin, n_mono) bracketing node and interpolation weight
+mono_tm            # (n_thin, n_mono) Tm unit covering each monomer
+cand_mono          # (n_thin, n_cand) monomer index of each binding candidate
+mono_cand          # (n_thin, n_mono) candidate index of each monomer, -1 if none
+face_to_monomers   # (n_thin, n_faces, max_mono_per_face) candidate monomers per face, -1 padded
+n_mono_per_face    # (n_thin, n_faces) valid count per face
+node_offsets       # (n_thin, n_nodes) even grid, thin_node_spacing apart from the Z-disc
+node_rests         # (n_thin, n_nodes) all thin_node_spacing
+tm_chains          # (n_thin, n_tm) strand of each unit
+tm_prev_neighbor   # (n_thin, n_tm) same-strand predecessor unit
+tm_next_neighbor   # (n_thin, n_tm) same-strand successor unit
+tm_rep_mono        # (n_thin, n_tm) monomer standing for the unit in position-based metrics
 
 xb_to_thin_id      # (total_xbs,) XB → target thin filament
 xb_to_thin_face    # (total_xbs,) XB → target face on that filament
-xb_to_site_indices # (total_xbs, max_sites_per_face) fixed-width candidate sites
+xb_to_mono_indices # (total_xbs, max_mono_per_face) fixed-width candidate monomers
 xb_valid           # (total_xbs,) bool — False where the XB has no real partner
-
-tm_chains          # (n_thin, n_sites) TM chain assignment (0 or 1)
-tm_prev_neighbor   # (n_thin, n_sites) same-chain predecessor site index
-tm_next_neighbor   # (n_thin, n_sites) same-chain successor site index
-face_to_sites      # (n_thin, n_faces, max_sites_per_face) site indices per face
-n_sites_per_face   # (n_thin, n_faces) valid count per face
 thick_to_thin      # (n_thick, 6, 2) hex-neighborhood map
 thin_to_thick      # (n_thin, n_faces, 2)
 thick_starts       # (n_thick,) crown level start offset
@@ -533,10 +546,10 @@ illustrative.
 ### DynamicParams / Constants (JAX PyTree, sweepable)
 
 All 46 physical parameters as JAX arrays. Sweepable without recompile. The
-drivers are not fields; an unknown name raises (`TypeError` from `__init__`,
-`ValueError` from `copy()` and from `run(dynamic_params={...})`):
+drivers are not fields; an unknown name raises (`TypeError` from `__init__` and
+`copy()`, `ValueError` from `run(dynamic_params={...})`):
 ```python
-dynamic = DynamicParams(thick_k=7500.0, thin_k=5500.0, ...)
+dynamic = DynamicParams(thick_k=7500.0, thin_EA=66000.0, ...)
 dynamic_modified = dynamic.copy(thick_k=9000.0)
 ```
 
@@ -547,8 +560,12 @@ parameter is one edit**. Insertion order is the `tree_flatten`/`tree_unflatten`
 order; it is derived, never positional — nothing indexes a field by position.
 
 Current defaults are literature-anchored, not the old pre-3.0 values:
-`thick_k=7500` (whole-filament ≈ 144 pN/nm) and `thin_k=5500` (≈ 61 pN/nm), per
-Brunello 2014 / Mijailovich 2021 — these replace the uncited 2020/1743.
+`thick_k=7500` per crown segment (whole-filament ≈ 144 pN/nm) and `thin_EA=66000`
+pN per unit length (≈ 61 pN/nm whole at 1080 nm), per Brunello 2014 / Mijailovich
+2021. `thin_EA` replaced the per-segment `thin_k=5500` in S162: the thin backbone
+is now an even node grid (`StaticParams.thin_node_spacing = 12` nm), so the
+binding window no longer changes the filament's stiffness. `core.state.thin_segment_k`
+is the only EA→k conversion.
 
 ---
 
@@ -562,7 +579,7 @@ Removed with it:
 |---|---|
 | `kernels/cooperativity.py` | the whole legacy module |
 | `legacy_coop=` kwarg on `run()` / `timestep()` (earlier spelled `ising_coop=`) | selected between the two models |
-| `State.subject_to_coop` | `(n_thin, n_sites)` bool field |
+| `State.subject_to_coop` | `(n_thin, n_tm)` bool field |
 | `tm_coop_magnitude`, `tm_span_base`, `tm_span_force50`, `tm_span_steep` | `DynamicParams` entries |
 | `tm_Keq_30` | `DynamicParams` entry, already unused — the 3→0 step is one-way |
 
@@ -612,7 +629,7 @@ argument, making the anti-cooperative mistake structurally unrepresentable.
 
 **Logic:**
 - For each XB, finds the single nearest candidate binding site via a fixed-width
-  gather over `topology.xb_to_site_indices` (constant width → full GPU parallelism)
+  gather over `topology.xb_to_mono_indices` (constant width → full GPU parallelism)
 - Site search uses the head position (crown base **+ 13 nm** reach); the stored
   distance is measured from the crown base, not the head
 - Stores `xb_distances` as `(axial, radial)` — radial is the current lattice
@@ -658,8 +675,9 @@ exponential per caller, never two.
   Builds `(3 * n_xb_bins, 6, 6)` rate matrices — closed (permissiveness 0),
   open, and open-but-screened — each evaluated at the `n_xb_bins` axial bin
   centers. The screened block is for targets in the thin-thin double-overlap
-  zone: between the M-line and the hiding line (how far the equal-length thin
-  filaments pass the M-line, mirrored from the opposite half). Its `r01` is
+  zone: between the M-line and the hiding line (how far the thin filaments'
+  TIP — their farthest monomer — passes the M-line, mirrored from the opposite
+  half). Its `r01` is
   scaled by `1 - thin_thin_overlap_screening`; `r10` is not, so occupancy falls.
   Each XB's `key` is its axial bin — arithmetic on the uniform `xb_bin_edges`,
   clipped at both ends — plus its block. The key depends only on geometry,
@@ -715,8 +733,11 @@ absorb float32 drift.
 
 ### Axial forces (for equilibrium solver and output)
 - `axial_force_at_mline(state, constants)` — total M-line force (pN)
-- `compute_forces_vectorized(...)` — per-node axial residual forces for solver
-- `compute_forces_from_state_vectorized(state, constants, topology, z_line, lattice_spacing)` — convenience wrapper
+- `compute_forces_vectorized(u_thick, u_thin, z_line, lattice_spacing, xb_states, xb_bound_to, constants, topology)` —
+  per-node axial residual for the solver. Physics constants are read from
+  `constants`, never passed separately. The XB reaction on a monomer is split
+  between its two bracketing thin nodes with `monomer_axial`'s weights (one
+  `segment_sum`), so the thin rows stay the exact gradient of the energy.
 
 Force contributions: thick spring chain, thin spring chain, XB (converter + globular
 springs for states 2-4), titin (exponential model).
@@ -877,7 +898,7 @@ fields — were deleted on 2026-09-19. See "Reconstructions" below.
 |-----|--------|
 | `z_line`, `pCa` | `result.z_line`, `result.pCa` — bit-identical, already stored |
 | `frac_xb_*` | count / `result.topology_config['total_xbs']` |
-| `frac_tm_state_*`, `actin_permissiveness` | count / (`n_thin` × `n_sites`) |
+| `frac_tm_state_*`, `actin_permissiveness` | count / (`n_thin` × `n_tm`) |
 | `n_bound` | `n_xb_loose + n_xb_tight_1 + n_xb_tight_2` |
 | `frac_tm_available_overlap` | `frac_tm_state_2_overlap + frac_tm_state_3_overlap` |
 | `xb_detach_atp` | `atp_expected - closure_detach_atp` |
@@ -895,7 +916,7 @@ The **overlap-zone** group (`compute_overlap_tm_fractions()`) restricts the TM
 fractions to crossbridge-reachable sites: within
 `[crown_offsets.min() - 13, crown_offsets.max() + 13]` (the same 13 nm head reach
 used in `geometry.py`) **and** past the hiding line (absolute position > 0,
-reconstructed with `thin_axial()`). The plain
+reconstructed with `monomer_axial()` at each unit's `tm_rep_mono`). The plain
 all-site fractions (counts over a constant denominator) average over *every*
 site, including the thick filament's bare zone and sites beyond its tip, so
 they are diluted by permanently unreachable sites. That is why the `_overlap`
@@ -983,6 +1004,7 @@ from multifil_jax import Subpopulation
 sp = Subpopulation.mean_field(0.5, xb_srx_kmax=0.3, xb_r01_coeff=4.0)
 sp = Subpopulation.random(0.5, seed=0, xb_srx_kmax=0.3)
 sp = Subpopulation.c_zone(topo, 350.0, 650.0, xb_r01_coeff=2.0)
+sp = Subpopulation.c_zone(topo, 350.0, 650.0, z_line=z0, tm_k_23=0.5)  # tm_* needs z_line
 
 result = run(topo, pCa=4.5, z_line=z0, lattice_spacing=d0, subpopulation=sp)
 result = run(topo, pCa=4.5, z_line=z0, lattice_spacing=d0,
@@ -993,7 +1015,7 @@ result = run(topo, pCa=4.5, z_line=z0, lattice_spacing=d0,
 |------|-----------|-------------|
 | `mean_field` | generator blend `Q_eff = Σ_k f_k Q_k`, then **one** expm | deterministic |
 | `random` | per-XB / per-site integer labels, Bernoulli(fraction) | masks redrawn per sim from `seed + sim_index` |
-| `c_zone` | labels by crown axial band (nm from M-line), default 350–650 | deterministic, built at construction |
+| `c_zone` | labels by crown axial band (nm from M-line), default 350–650; with tm_* scales, Tm units whose representative monomer sits in the same band at rest (so `z_line` is required) | deterministic, built at construction |
 
 **Constraints (all enforced, not conventions):**
 - Scale keys must be `xb_*` or `tm_*` fields — mechanics/forces always use the WT

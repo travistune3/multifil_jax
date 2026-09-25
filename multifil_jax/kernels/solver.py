@@ -87,7 +87,7 @@ from multifil_jax.kernels.forces import (
     _xb_radial_force_total,
     _titin_radial_force_total,
 )
-from multifil_jax.core.state import PreconditionerParams
+from multifil_jax.core.state import PreconditionerParams, thick_axial, monomer_axial, thin_segment_k
 
 if TYPE_CHECKING:
     from multifil_jax.core.sarc_geometry import SarcTopology
@@ -229,10 +229,10 @@ class PreFactoredPreconditioner(NamedTuple):
     all CG iterations/timestep x all timesteps.
 
     Factors can be either:
-    - Shared (single-filament): fields have shape (n_crowns,) / (n_sites,)
+    - Shared (single-filament): fields have shape (n_crowns,) / (n_nodes,)
       All filaments of the same type share the same factors. Broadcast via
       vmap in_axes=(None, 0) at apply time.
-    - Per-filament: fields have shape (n_thick, n_crowns) / (n_thin, n_sites)
+    - Per-filament: fields have shape (n_thick, n_crowns) / (n_thin, n_nodes)
       Each filament has its own factors (e.g. with XB binding corrections).
 
     Attributes:
@@ -291,7 +291,7 @@ def apply_preconditioner(
     n_thick: int,
     n_crowns: int,
     n_thin: int,
-    n_sites: int,
+    n_nodes: int,
 ) -> jnp.ndarray:
     """Apply pre-factored block-diagonal preconditioner: M^{-1} @ v.
 
@@ -302,7 +302,7 @@ def apply_preconditioner(
     Args:
         prefactored: Pre-factored preconditioner from build_prefactored_preconditioner()
         v: Position/force vector to precondition
-        n_thick, n_crowns, n_thin, n_sites: Static dimensions
+        n_thick, n_crowns, n_thin, n_nodes: Static dimensions
 
     Returns:
         M^{-1} @ v
@@ -310,7 +310,7 @@ def apply_preconditioner(
     n_thick_nodes = n_thick * n_crowns
 
     v_thick = v[:n_thick_nodes].reshape(n_thick, n_crowns)
-    v_thin = v[n_thick_nodes:].reshape(n_thin, n_sites)
+    v_thin = v[n_thick_nodes:].reshape(n_thin, n_nodes)
 
     # Determine if factors are shared (1D) or per-filament (2D)
     shared = prefactored.thick_factors.inv_diag.ndim == 1
@@ -499,22 +499,17 @@ def _run_newton(residual_fn, precond_mv, pos0, tol_vec, n_newton_steps, n_cg_ste
 
 def _newton_solve(
     u_init: jnp.ndarray,
-    thick_k: float,
-    thin_k: float,
     z_line: float,
     lattice_spacing: float,
-    titin_a: float,
-    titin_b: float,
-    titin_rest: float,
     xb_states: jnp.ndarray,
     xb_bound_to: jnp.ndarray,
-    params: 'DynamicParams',
+    constants: 'DynamicParams',
     precond_params: PreconditionerParams,
     topology: 'SarcTopology',
     n_thick: int,
     n_crowns: int,
     n_thin: int,
-    n_sites: int,
+    n_nodes: int,
     n_newton_steps: int,
     n_cg_steps: int,
     tol_vec: jnp.ndarray = None,
@@ -547,19 +542,16 @@ def _newton_solve(
     def residual_fn(u):
         """Compute force residual F(u) at given displacements."""
         u_thick = u[:n_thick_nodes].reshape(n_thick, n_crowns)
-        u_thin = u[n_thick_nodes:].reshape(n_thin, n_sites)
+        u_thin = u[n_thick_nodes:].reshape(n_thin, n_nodes)
         return compute_forces_vectorized(
-            u_thick, u_thin,
-            thick_k, thin_k, z_line, lattice_spacing,
-            titin_a, titin_b, titin_rest,
-            xb_states, xb_bound_to, params, topology
-        )
+            u_thick, u_thin, z_line, lattice_spacing,
+            xb_states, xb_bound_to, constants, topology)
 
     prefactored = prefactored_precond if prefactored_precond is not None else \
         build_prefactored_preconditioner(precond_params, negate=True, eps=1e-9)
     # The preconditioner is unchanged by the coordinate switch: the rest frame
     # is a constant offset, so dF/du == dF/dx exactly.
-    precond_mv = lambda v: apply_preconditioner(prefactored, v, n_thick, n_crowns, n_thin, n_sites)
+    precond_mv = lambda v: apply_preconditioner(prefactored, v, n_thick, n_crowns, n_thin, n_nodes)
     return _run_newton(residual_fn, precond_mv, u_init, tol_vec, n_newton_steps, n_cg_steps)
 
 
@@ -574,11 +566,8 @@ def _radial_residual(
     xb_states: jnp.ndarray,
     xb_bound_to: jnp.ndarray,
     z_line: float,
-    params,
+    constants,
     topology,
-    titin_a: float,
-    titin_b: float,
-    titin_rest: float,
     K_lat: float,
     d_ref: float,
 ) -> float:
@@ -588,11 +577,9 @@ def _radial_residual(
     """
     f_lat = -K_lat * (d - d_ref)
     f_xb = -_xb_radial_force_total(
-        xb_states, xb_bound_to, positions_thick, positions_thin, d, params, topology
+        xb_states, xb_bound_to, positions_thick, positions_thin, d, constants, topology
     )
-    f_titin = -_titin_radial_force_total(
-        positions_thick, z_line, d, titin_a, titin_b, titin_rest
-    )
+    f_titin = -_titin_radial_force_total(positions_thick, z_line, d, constants)
     return f_lat + f_xb + f_titin
 
 
@@ -603,7 +590,7 @@ def _apply_augmented_preconditioner(
     n_thick: int,
     n_crowns: int,
     n_thin: int,
-    n_sites: int,
+    n_nodes: int,
 ) -> jnp.ndarray:
     """Block-diagonal preconditioner for the augmented (n+1)-dim system.
 
@@ -612,29 +599,24 @@ def _apply_augmented_preconditioner(
     """
     v_axial = v[:-1]
     v_d = v[-1]
-    x_axial = apply_preconditioner(prefactored, v_axial, n_thick, n_crowns, n_thin, n_sites)
+    x_axial = apply_preconditioner(prefactored, v_axial, n_thick, n_crowns, n_thin, n_nodes)
     x_d = d_block_inv * v_d
     return jnp.concatenate([x_axial, jnp.array([x_d])])
 
 
 def _augmented_residual_fn(
     pos_aug: jnp.ndarray,
-    thick_k: float,
-    thin_k: float,
     z_line: float,
-    titin_a: float,
-    titin_b: float,
-    titin_rest: float,
     xb_states: jnp.ndarray,
     xb_bound_to: jnp.ndarray,
-    params,
+    constants,
     topology,
     K_lat: float,
     d_ref: float,
     n_thick: int,
     n_crowns: int,
     n_thin: int,
-    n_sites: int,
+    n_nodes: int,
 ) -> jnp.ndarray:
     """Augmented (n+1)-dim residual: [f_axial, f_radial].
 
@@ -646,23 +628,15 @@ def _augmented_residual_fn(
     u = pos_aug[:-1]
     n_thick_nodes = n_thick * n_crowns
     u_thick = u[:n_thick_nodes].reshape(n_thick, n_crowns)
-    u_thin = u[n_thick_nodes:].reshape(n_thin, n_sites)
+    u_thin = u[n_thick_nodes:].reshape(n_thin, n_nodes)
 
     f_axial = compute_forces_vectorized(
-        u_thick, u_thin,
-        thick_k, thin_k, z_line, d,
-        titin_a, titin_b, titin_rest,
-        xb_states, xb_bound_to, params, topology
-    )
+        u_thick, u_thin, z_line, d, xb_states, xb_bound_to, constants, topology)
 
     # The radial path needs true axial coordinates (XB reach, titin diagonal).
-    pos_thick = topology.crown_offsets + u_thick
-    pos_thin = z_line - topology.binding_offsets + u_thin
     f_rad = _radial_residual(
-        d, pos_thick, pos_thin, xb_states, xb_bound_to,
-        z_line, params, topology,
-        titin_a, titin_b, titin_rest,
-        K_lat, d_ref,
+        d, thick_axial(u_thick, topology), monomer_axial(u_thin, topology, z_line),
+        xb_states, xb_bound_to, z_line, constants, topology, K_lat, d_ref,
     )
 
     return jnp.concatenate([f_axial, jnp.array([f_rad])])
@@ -671,15 +645,10 @@ def _augmented_residual_fn(
 def _newton_solve_dynamic_ls(
     u_init: jnp.ndarray,
     d_init: float,
-    thick_k: float,
-    thin_k: float,
     z_line: float,
-    titin_a: float,
-    titin_b: float,
-    titin_rest: float,
     xb_states: jnp.ndarray,
     xb_bound_to: jnp.ndarray,
-    params,
+    constants,
     topology,
     K_lat: float,
     d_ref: float,
@@ -687,7 +656,7 @@ def _newton_solve_dynamic_ls(
     n_thick: int,
     n_crowns: int,
     n_thin: int,
-    n_sites: int,
+    n_nodes: int,
     n_newton_steps: int,
     n_cg_steps: int,
     tol_vec: jnp.ndarray = None,
@@ -699,15 +668,12 @@ def _newton_solve_dynamic_ls(
     """
     n_thick_nodes = n_thick * n_crowns
     u_thick_init = u_init[:n_thick_nodes].reshape(n_thick, n_crowns)
-    u_thin_init = u_init[n_thick_nodes:].reshape(n_thin, n_sites)
-    pos_thick_init = topology.crown_offsets + u_thick_init
-    pos_thin_init = z_line - topology.binding_offsets + u_thin_init
+    u_thin_init = u_init[n_thick_nodes:].reshape(n_thin, n_nodes)
 
     # Exact d-block Jacobian diagonal via scalar autodiff
     J_dd = jax.grad(_radial_residual, argnums=0)(
-        d_init, pos_thick_init, pos_thin_init,
-        xb_states, xb_bound_to, z_line, params, topology,
-        titin_a, titin_b, titin_rest, K_lat, d_ref
+        d_init, thick_axial(u_thick_init, topology), monomer_axial(u_thin_init, topology, z_line),
+        xb_states, xb_bound_to, z_line, constants, topology, K_lat, d_ref
     )
     d_block_inv = -1.0 / J_dd
 
@@ -715,14 +681,13 @@ def _newton_solve_dynamic_ls(
 
     def residual_fn(pos_aug):
         return _augmented_residual_fn(
-            pos_aug, thick_k, thin_k, z_line,
-            titin_a, titin_b, titin_rest, xb_states, xb_bound_to,
-            params, topology, K_lat, d_ref,
-            n_thick, n_crowns, n_thin, n_sites,
+            pos_aug, z_line, xb_states, xb_bound_to,
+            constants, topology, K_lat, d_ref,
+            n_thick, n_crowns, n_thin, n_nodes,
         )
 
     precond_mv = lambda v: _apply_augmented_preconditioner(
-        prefactored_precond, d_block_inv, v, n_thick, n_crowns, n_thin, n_sites
+        prefactored_precond, d_block_inv, v, n_thick, n_crowns, n_thin, n_nodes
     )
     _clamp_d = lambda x: x.at[-1].set(jnp.maximum(x[-1], 1.0))
     return _run_newton(residual_fn, precond_mv, pos_aug0, tol_vec, n_newton_steps, n_cg_steps,
@@ -733,7 +698,7 @@ def _newton_solve_dynamic_ls(
 # CONVERGENCE TOLERANCE
 # ============================================================================
 
-def _force_scale(state: 'State', constants: 'DynamicParams') -> jnp.ndarray:
+def _force_scale(state: 'State', constants: 'DynamicParams', thin_k) -> jnp.ndarray:
     """RMS backbone spring force in the incoming state (pN).
 
     The natural scale for "how big is a force here". It is read from the
@@ -756,11 +721,11 @@ def _force_scale(state: 'State', constants: 'DynamicParams') -> jnp.ndarray:
     u_t = state.thick.displacement
     u_n = state.thin.displacement
     f_t = jnp.diff(u_t, axis=1, prepend=0.0) * constants.thick_k
-    f_n = jnp.diff(u_n, axis=1, append=0.0) * constants.thin_k
+    f_n = jnp.diff(u_n, axis=1, append=0.0) * thin_k
     return jnp.sqrt(jnp.mean(jnp.concatenate([f_t.ravel() ** 2, f_n.ravel() ** 2])))
 
 
-def _convergence_tolerance(state, constants, n_axial, K_lat, d_ref):
+def _convergence_tolerance(state, constants, thin_k, n_axial, K_lat, d_ref):
     """Per-row convergence tolerance, and the axial tolerance as a scalar.
 
         tol = solver_atol + solver_rtol * scale
@@ -786,7 +751,7 @@ def _convergence_tolerance(state, constants, n_axial, K_lat, d_ref):
         (tol_vec, tol_axial) — the vector to hand _run_newton, and the scalar
         axial tolerance in pN, which is what gets exported as a metric.
     """
-    tol_axial = constants.solver_atol + constants.solver_rtol * _force_scale(state, constants)
+    tol_axial = constants.solver_atol + constants.solver_rtol * _force_scale(state, constants, thin_k)
     if K_lat is None:
         return jnp.full((n_axial,), tol_axial), tol_axial
     scale_rad = jnp.abs(K_lat) * d_ref
@@ -856,17 +821,18 @@ def solve_equilibrium(
     u_thick = state.thick.displacement
     u_thin = state.thin.displacement
     n_thick, n_crowns = u_thick.shape
-    n_thin, n_sites = u_thin.shape
+    n_thin, n_nodes = u_thin.shape
     n_thick_nodes = n_thick * n_crowns
-    n_axial = n_thick_nodes + n_thin * n_sites
+    n_axial = n_thick_nodes + n_thin * n_nodes
 
-    tol_vec, tol_axial = _convergence_tolerance(state, constants, n_axial, K_lat, d_ref)
+    thin_k = thin_segment_k(constants, topology)
+    tol_vec, tol_axial = _convergence_tolerance(state, constants, thin_k, n_axial, K_lat, d_ref)
 
     if precond_params is None:
         from multifil_jax.core.state import build_preconditioner_params
         precond_params = build_preconditioner_params(
-            n_thick, n_crowns, n_thin, n_sites,
-            constants.thick_k, constants.thin_k,
+            n_thick, n_crowns, n_thin, n_nodes,
+            constants.thick_k, thin_k,
         )
 
     u_init = jnp.concatenate([u_thick.flatten(), u_thin.flatten()])
@@ -874,13 +840,10 @@ def solve_equilibrium(
     if K_lat is None:
         # Fixed LS: standard n-DOF solve
         u_final, n_iters, final_residual, residual_norm = _newton_solve(
-            u_init,
-            constants.thick_k, constants.thin_k,
-            z_line, lattice_spacing,
-            constants.titin_a, constants.titin_b, constants.titin_rest,
+            u_init, z_line, lattice_spacing,
             state.thick.xb_states, state.thick.xb_bound_to,
             constants, precond_params, topology,
-            n_thick, n_crowns, n_thin, n_sites,
+            n_thick, n_crowns, n_thin, n_nodes,
             n_newton_steps, n_cg_steps,
             tol_vec=tol_vec,
             prefactored_precond=prefactored_precond,
@@ -892,15 +855,12 @@ def solve_equilibrium(
         if prefactored_precond is None:
             prefactored_precond = build_prefactored_preconditioner(precond_params)
         pos_aug_final, n_iters, final_residual, residual_norm = _newton_solve_dynamic_ls(
-            u_init, lattice_spacing,
-            constants.thick_k, constants.thin_k,
-            z_line,
-            constants.titin_a, constants.titin_b, constants.titin_rest,
+            u_init, lattice_spacing, z_line,
             state.thick.xb_states, state.thick.xb_bound_to,
             constants, topology,
             K_lat, d_ref,
             prefactored_precond,
-            n_thick, n_crowns, n_thin, n_sites,
+            n_thick, n_crowns, n_thin, n_nodes,
             n_newton_steps, n_cg_steps,
             tol_vec=tol_vec,
         )
@@ -908,7 +868,7 @@ def solve_equilibrium(
         new_lattice_spacing = pos_aug_final[-1]
 
     new_u_thick = new_u[:n_thick_nodes].reshape(n_thick, n_crowns)
-    new_u_thin = new_u[n_thick_nodes:].reshape(n_thin, n_sites)
+    new_u_thin = new_u[n_thick_nodes:].reshape(n_thin, n_nodes)
     new_state = state._replace(
         thick=state.thick._replace(displacement=new_u_thick),
         thin=state.thin._replace(displacement=new_u_thin),

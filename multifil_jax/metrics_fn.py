@@ -24,7 +24,7 @@ entirely. Subtract a relaxed (pCa 9) baseline before interpreting active force.
 Occupancy is exported as COUNTS (`n_xb_*`, `n_tm_state_*`) plus the two
 `*_overlap` FRACTIONS. The all-site fractions are not exported because they are
 the counts over a constant — divide by `topology_config['total_xbs']` or by
-`n_thin * n_sites`. The `*_overlap` variants cannot be recovered that way: they
+`n_thin * n_tm`. The `*_overlap` variants cannot be recovered that way: they
 average only over sites a crossbridge could reach, and their denominator moves
 with the geometry. Prefer them when comparing across geometries — see
 compute_overlap_tm_fractions() for why the difference bites.
@@ -167,7 +167,7 @@ from typing import Dict, TYPE_CHECKING
 from multifil_jax.kernels.forces import xb_axial_force_by_state, xb_axial_work
 from multifil_jax.kernels.transitions import xb_expected_crossings
 from multifil_jax.core.state import (Drivers, MetricsDict,
-                                     thick_axial, thin_axial)
+                                     thick_axial, monomer_axial)
 
 if TYPE_CHECKING:
     from multifil_jax.core.sarc_geometry import SarcTopology
@@ -228,7 +228,10 @@ def compute_overlap_tm_fractions(
     tm_states = state.thin.tm_states
     # TRUE positions: both the crown-span window and the M-line gate below are
     # absolute-coordinate tests, so the displacements have to be lifted first.
-    thin_pos = thin_axial(state, topology, z_line)
+    # Each unit sits at its representative monomer.
+    thin_pos = jnp.take_along_axis(
+        monomer_axial(state.thin.displacement, topology, z_line),
+        topology.tm_rep_mono, axis=1)
 
     near_bound = topology.crown_offsets.min() - 13.0
     far_bound = topology.crown_offsets.max() + 13.0
@@ -316,8 +319,8 @@ def compute_all_metrics(
     z_line = drivers.z_line
     lattice_spacing = drivers.lattice_spacing
     f_xb_loose, f_xb_tight_1, f_xb_tight_2 = xb_axial_force_by_state(
-        thick_axial(new_state, topology),
-        thin_axial(new_state, topology, z_line), new_xb,
+        thick_axial(new_state.thick.displacement, topology),
+        monomer_axial(new_state.thin.displacement, topology, z_line), new_xb,
         new_state.thick.xb_bound_to,
         lattice_spacing,
         constants, topology)
@@ -407,14 +410,14 @@ def compute_all_metrics(
     a_tit = constants.titin_a
     b_tit = constants.titin_b
     L0_tit = constants.titin_rest
-    thick_tip_new = thick_axial(new_state, topology)[:, -1]
+    thick_tip_new = thick_axial(new_state.thick.displacement, topology)[:, -1]
     axial_dist_new = z_line - thick_tip_new
     titin_length_new = jnp.sqrt(axial_dist_new**2 + lattice_spacing**2)
     extension_new = titin_length_new - L0_tit
     titin_energy_new = (a_tit / b_tit) * (jnp.exp(b_tit * extension_new) - 1.0)
     titin_energy_avg = jnp.mean(titin_energy_new)
 
-    thick_tip_old = thick_axial(old_state, topology)[:, -1]
+    thick_tip_old = thick_axial(old_state.thick.displacement, topology)[:, -1]
     axial_dist_old = z_line - thick_tip_old
     titin_length_old = jnp.sqrt(axial_dist_old**2 + lattice_spacing**2)
     extension_old = titin_length_old - L0_tit
@@ -448,10 +451,10 @@ def compute_all_metrics(
     # this comment used to assert is now true by construction.)
     ls_old = trace.drivers.lattice_spacing
     work_xb = xb_axial_work(
-        thick_axial(old_state, topology),
-        thin_axial(old_state, topology, z_line), ls_old,
-        thick_axial(new_state, topology),
-        thin_axial(new_state, topology, z_line), lattice_spacing,
+        thick_axial(old_state.thick.displacement, topology),
+        monomer_axial(old_state.thin.displacement, topology, z_line), ls_old,
+        thick_axial(new_state.thick.displacement, topology),
+        monomer_axial(new_state.thin.displacement, topology, z_line), lattice_spacing,
         new_xb, new_state.thick.xb_bound_to, constants, topology)
 
     # ========================================================================

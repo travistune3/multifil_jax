@@ -12,7 +12,7 @@ WHICH SITES A HEAD MAY EVEN CONSIDER
 Not all of them. A head projects from its crown in one azimuthal direction and
 can only reach the thin filament it faces, and only the sites on the face of
 that filament pointing back at it. That candidate list is fixed by the lattice
-geometry, so it is precomputed once into topology.xb_to_site_indices rather than
+geometry, so it is precomputed once into topology.xb_to_mono_indices rather than
 being searched each step. The search here is only over that short list.
 
 The list is stored at a FIXED WIDTH for every head, padded where a head has
@@ -49,7 +49,7 @@ import jax
 import jax.numpy as jnp
 from typing import Dict, Tuple, TYPE_CHECKING
 
-from multifil_jax.core.state import thick_axial, thin_axial
+from multifil_jax.core.state import thick_axial, monomer_axial
 
 if TYPE_CHECKING:
     from multifil_jax.core.sarc_geometry import SarcTopology
@@ -63,8 +63,8 @@ def find_nearest_binding_sites_fixed_width(
     xb_positions: jnp.ndarray,
     bs_positions: jnp.ndarray,
     xb_to_thin_id: jnp.ndarray,
-    xb_to_site_indices: jnp.ndarray,
-    n_sites_per_face_flat: jnp.ndarray,
+    xb_to_mono_indices: jnp.ndarray,
+    n_mono_per_face_flat: jnp.ndarray,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Find each crossbridge's nearest reachable binding site.
 
@@ -89,32 +89,32 @@ def find_nearest_binding_sites_fixed_width(
 
     Args:
         xb_positions: (n_xb,) axial positions of crossbridges
-        bs_positions: (n_thin, n_sites) axial positions of binding sites
+        bs_positions: (n_thin, n_mono) axial positions of candidate monomers
         xb_to_thin_id: (n_xb,) target thin filament for each XB
-        xb_to_site_indices: (n_xb, max_sites_per_face) FIXED-WIDTH site indices
-        n_sites_per_face_flat: (n_xb,) pre-gathered valid counts per XB
+        xb_to_mono_indices: (n_xb, max_mono_per_face) FIXED-WIDTH site indices
+        n_mono_per_face_flat: (n_xb,) pre-gathered valid counts per XB
 
     Returns:
         nearest_thin_idx: (n_xb,) which thin filament
         nearest_site_idx: (n_xb,) which site on that thin filament
     """
     n_xb = xb_positions.shape[0]
-    max_sites_per_face = xb_to_site_indices.shape[1]
+    max_mono_per_face = xb_to_mono_indices.shape[1]
 
-    # Unified Gather: bs_positions[thin_id, site_indices] for ALL XBs at once
-    def gather_face_positions(thin_idx, site_indices):
-        return bs_positions[thin_idx, site_indices]  # (max_sites_per_face,)
+    # Unified Gather: bs_positions[thin_id, mono_indices] for ALL XBs at once
+    def gather_face_positions(thin_idx, mono_indices):
+        return bs_positions[thin_idx, mono_indices]  # (max_mono_per_face,)
 
     face_bs_positions = jax.vmap(gather_face_positions)(
-        xb_to_thin_id, xb_to_site_indices
-    )  # (n_xb, max_sites_per_face)
+        xb_to_thin_id, xb_to_mono_indices
+    )  # (n_xb, max_mono_per_face)
 
     # Compute distances for ALL sites in fixed-width window
-    # Shape: (n_xb, max_sites_per_face)
+    # Shape: (n_xb, max_mono_per_face)
     distances = jnp.abs(face_bs_positions - xb_positions[:, None])
 
     # Mask: (1) beyond valid site count, (2) site is behind M-line (position <= 0)
-    count_mask = jnp.arange(max_sites_per_face) < n_sites_per_face_flat[:, None]
+    count_mask = jnp.arange(max_mono_per_face) < n_mono_per_face_flat[:, None]
     visible_mask = face_bs_positions > 0.0
     valid_mask = count_mask & visible_mask
     masked_distances = jnp.where(valid_mask, distances, jnp.inf)
@@ -124,7 +124,7 @@ def find_nearest_binding_sites_fixed_width(
 
     # Gather actual site indices
     nearest_site_idx = jnp.take_along_axis(
-        xb_to_site_indices, min_local_idx[:, None], axis=1
+        xb_to_mono_indices, min_local_idx[:, None], axis=1
     ).squeeze(1)
 
     return xb_to_thin_id, nearest_site_idx
@@ -153,7 +153,7 @@ def calculate_xb_to_bs_distances(xb_base_positions: jnp.ndarray,
 
     Args:
         xb_base_positions: (n_xb,) XB base (crown) axial positions WITHOUT +13 offset
-        bs_positions: (n_thin, n_sites) BS axial positions
+        bs_positions: (n_thin, n_mono) BS axial positions
         nearest_thin: (n_xb,) which thin filament
         nearest_site: (n_xb,) which site
         lattice_spacing: Radial distance (nm)
@@ -215,8 +215,8 @@ def update_nearest_neighbors(
     Returns:
         new_state: State with xb_nearest_bs and xb_distances updated
     """
-    thick_pos = thick_axial(state, topology)
-    thin_pos = thin_axial(state, topology, z_line)
+    thick_pos = thick_axial(state.thick.displacement, topology)
+    thin_pos = monomer_axial(state.thin.displacement, topology, z_line)
 
     n_thick, n_crowns = thick_pos.shape
     n_xb_per_crown = topology.n_xb_per_crown
@@ -232,18 +232,18 @@ def update_nearest_neighbors(
     # used, by reference, to bound the overlap zone in metrics_fn.py.
     xb_head_positions = xb_base_positions + 13.0
 
-    # Pre-gather n_sites_per_face for each XB
-    n_sites_per_face_flat = topology.n_sites_per_face[
+    # Pre-gather n_mono_per_face for each XB
+    n_mono_per_face_flat = topology.n_mono_per_face[
         topology.xb_to_thin_id, topology.xb_to_thin_face
     ]
 
-    # Find nearest binding sites using fixed-width gather
+    # Find nearest candidate monomers using fixed-width gather
     nearest_thin, nearest_site = find_nearest_binding_sites_fixed_width(
         xb_head_positions,
         thin_pos,
         topology.xb_to_thin_id,
-        topology.xb_to_site_indices,
-        n_sites_per_face_flat,
+        topology.xb_to_mono_indices,
+        n_mono_per_face_flat,
     )
 
     # Calculate distances using BASE position (WITHOUT +13 offset)
@@ -295,7 +295,7 @@ if __name__ == "__main__":
     print(f"\nSarcTopology created: {geometry}")
     print(f"  total_xbs: {geometry.total_xbs}")
     print(f"  xb_to_thin_id shape: {geometry.xb_to_thin_id.shape}")
-    print(f"  xb_to_site_indices shape: {geometry.xb_to_site_indices.shape}")
+    print(f"  xb_to_mono_indices shape: {geometry.xb_to_mono_indices.shape}")
 
     # Test fixed-width nearest neighbor search
     print("\nTest: Fixed-width nearest neighbor search")
@@ -303,11 +303,11 @@ if __name__ == "__main__":
 
     # Create mock positions
     n_thin = geometry.n_thin
-    n_sites = geometry.n_sites
-    bs_positions = jnp.linspace(50, 1200, n_thin * n_sites).reshape(n_thin, n_sites)
+    n_mono = geometry.n_mono
+    bs_positions = jnp.linspace(50, 1200, n_thin * n_mono).reshape(n_thin, n_mono)
     xb_positions = jnp.linspace(100, 1100, geometry.total_xbs)
 
-    n_sites_per_face_flat = geometry.n_sites_per_face[
+    n_mono_per_face_flat = geometry.n_mono_per_face[
         geometry.xb_to_thin_id, geometry.xb_to_thin_face
     ]
 
@@ -315,8 +315,8 @@ if __name__ == "__main__":
         xb_positions,
         bs_positions,
         geometry.xb_to_thin_id,
-        geometry.xb_to_site_indices,
-        n_sites_per_face_flat,
+        geometry.xb_to_mono_indices,
+        n_mono_per_face_flat,
     )
 
     print(f"Nearest thin shape: {nearest_thin.shape}")
@@ -337,8 +337,8 @@ if __name__ == "__main__":
             xb_pos,
             bs_pos,
             geometry.xb_to_thin_id,
-            geometry.xb_to_site_indices,
-            n_sites_per_face_flat,
+            geometry.xb_to_mono_indices,
+            n_mono_per_face_flat,
         )
 
     batched_results = jax.vmap(find_nearest_kernel)(batched_xb_positions, batched_bs_positions)

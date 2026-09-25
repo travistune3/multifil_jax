@@ -30,7 +30,8 @@ topo = SarcTopology.create(nrows=2, ncols=2, static_params=static, dynamic_param
 topo = jax.device_put(topo)
 
 print(f" Topology: {topo.n_thick} thick, {topo.n_thin} thin filaments")
-print(f" Crowns: {topo.n_crowns}/thick, Sites: {topo.n_sites}/thin")
+print(f" Crowns: {topo.n_crowns}/thick, binding candidates: {topo.n_cand}/thin, "
+      f"thin nodes: {topo.n_nodes}")
 print(f" Total XBs: {topo.total_xbs}")
 
 #%%

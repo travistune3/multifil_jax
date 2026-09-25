@@ -33,7 +33,7 @@ POSITIONS ARE STORED AS DISPLACEMENTS FROM REST
 -----------------------------------------------
 `thick.displacement` and `thin.displacement` are offsets from the rest frame,
 not absolute axial coordinates. Absolute positions are reconstructed on demand
-by thick_axial() / thin_axial() below.
+by thick_axial() / monomer_axial() below.
 
 The reason is float32. Absolute node positions run to ~1000 nm, where
 consecutive float32 values are ~1e-4 nm apart, while the strain a backbone
@@ -46,7 +46,7 @@ with nothing attached, and a 14.9% force error at 16x the default stiffness
 against a float64 reference.
 
 In displacement coordinates the rest lengths cancel algebraically — both
-`crown_offsets` and `binding_offsets` ARE the cumulated rest frames — so the
+`crown_offsets` and `node_offsets` ARE the cumulated rest frames — so the
 backbone laws collapse to diff(u) * k with no subtraction of large numbers at
 all. The error becomes relative (~float32 eps) and stiffness-independent. At
 rest with no load the residual is now exactly zero.
@@ -77,7 +77,7 @@ from .sarc_geometry import SarcTopology
 # compilation by avoiding Python dict overhead. Use ._replace() for updates.
 #
 # State is PURE simulation state: no embedded params, geometry, or constants.
-# Spring constants (thick_k, thin_k) moved to DynamicParams/Constants.
+# Filament stiffnesses (thick_k, thin_EA) live in DynamicParams.
 # bare_zone (StaticParams) is baked into topology.crown_offsets (Topology, Tier 1).
 # Topology (SarcTopology/SarcTopology) passed as separate argument.
 
@@ -92,23 +92,22 @@ class ThickState(NamedTuple):
     displacement: jnp.ndarray    # (n_thick, n_crowns) crown offset from rest;
                                  # absolute = topology.crown_offsets + this
     xb_states: jnp.ndarray       # (n_thick, n_crowns, n_xb_per_crown) crossbridge states (0-5), int8
-    xb_bound_to: jnp.ndarray     # (n_thick, n_crowns, n_xb_per_crown) bound site indices (-1 if unbound)
-    xb_nearest_bs: jnp.ndarray   # (n_thick, n_crowns, n_xb_per_crown) nearest binding site indices
-    xb_distances: jnp.ndarray    # (n_thick, n_crowns, n_xb_per_crown, 2) distances to nearest BS
+    xb_bound_to: jnp.ndarray     # (n_thick, n_crowns, n_xb_per_crown) bound MONOMER index (-1 if unbound)
+    xb_nearest_bs: jnp.ndarray   # (n_thick, n_crowns, n_xb_per_crown) nearest candidate MONOMER index
+    xb_distances: jnp.ndarray    # (n_thick, n_crowns, n_xb_per_crown, 2) distances to that monomer
 
 
 class ThinState(NamedTuple):
-    """Thin filament state arrays.
+    """Thin filament state arrays, one per layer (see SarcTopology).
 
     All arrays have leading dimension n_thin (number of thin filaments).
-    Spring constant (k) moved to Constants (Tier 2).
-    Structural arrays (tm_chains, connectivity, face_to_sites, binding_rests) in Topology.
+    Spring constant in Constants (Tier 2); structure in Topology.
     permissiveness is derived on-demand: (tm_states == 3).astype(float32)
     """
-    displacement: jnp.ndarray    # (n_thin, n_sites) site offset from rest;
-                                 # absolute = z_line - topology.binding_offsets + this
-    tm_states: jnp.ndarray       # (n_thin, n_sites) tropomyosin states (0-3), int8
-    bound_to: jnp.ndarray        # (n_thin, n_sites) XB bound to this site (-1 if unbound)
+    displacement: jnp.ndarray    # (n_thin, n_nodes) NODE offset from rest;
+                                 # absolute = z_line - topology.node_offsets + this
+    tm_states: jnp.ndarray       # (n_thin, n_tm) tropomyosin UNIT states (0-3), int8
+    bound_to: jnp.ndarray        # (n_thin, n_cand) XB bound to this CANDIDATE (-1 if unbound)
 
 
 class State(NamedTuple):
@@ -124,13 +123,13 @@ class State(NamedTuple):
         - preconditioner → rebuilt from Topology + Constants at solve time
         - titin → constants.titin_a/b/rest + topology.titin_connections
         - thick.crown_starts, thick.connectivity → Topology
-        - thin.tm_chains, thin.connectivity, thin.face_to_sites → Topology
+        - thin.tm_chains, thin.connectivity, thin.face_to_monomers → Topology
     """
     thick: ThickState
     thin: ThinState
 
 
-def thick_axial(state: 'State', topology: 'SarcTopology') -> jnp.ndarray:
+def thick_axial(u_thick: jnp.ndarray, topology: 'SarcTopology') -> jnp.ndarray:
     """Absolute crown positions (nm) from the stored displacements.
 
     `topology.crown_offsets` is the cumulative sum of `crown_rests`, so this is
@@ -140,28 +139,58 @@ def thick_axial(state: 'State', topology: 'SarcTopology') -> jnp.ndarray:
     Backbone forces must NOT go through here: they read the displacements
     directly, which is the entire point of the coordinate change.
 
+    Takes the displacement ARRAY, not a State, because the solver's residual
+    has displacements and no State.
+
+    Args:
+        u_thick: (n_thick, n_crowns) crown displacements, state.thick.displacement
+
     Returns:
         (n_thick, n_crowns) absolute axial positions, nm from the M-line.
     """
-    return topology.crown_offsets + state.thick.displacement
+    return topology.crown_offsets + u_thick
 
 
-def thin_axial(state: 'State', topology: 'SarcTopology', z_line) -> jnp.ndarray:
-    """Absolute binding-site positions (nm) from the stored displacements.
+def monomer_axial(u_thin: jnp.ndarray, topology: 'SarcTopology', z_line) -> jnp.ndarray:
+    """Absolute actin MONOMER positions (nm) from the thin node displacements.
 
-    The thin frame is anchored on the Z-disc, so the FRAME follows z_line
-    rigidly with no state update at all — moving the Z-line does not change any
-    displacement. That is why the simulation loop has no per-step thin position
-    shift; see simulation.py. The filament itself does not follow rigidly: with
-    crossbridges bound, the solve stretches it and its displacements change.
+    A monomer between node e = mono_node and the next node toward the Z-disc
+    moves with the linear blend (1 - xi) * u[e] + xi * u[e + 1], xi = mono_xi;
+    past the last node the Z-disc itself (u = 0) is node e + 1. This is the ONE
+    place monomer positions are made — the crossbridge force and work paths, the
+    radial path, the binding search and the overlap metrics all call it — and
+    compute_xb_forces_vectorized scatters with the same two weights, so the
+    thin rows of the residual stay the exact gradient of the energy.
+
+    DISPLACEMENTS ARE INTERPOLATED, NEVER ABSOLUTE POSITIONS. mono_offsets is
+    each monomer's own helix rest offset, so a monomer at rest sits exactly
+    there, and no ~1000 nm float32 value is ever blended (see POSITIONS ARE
+    STORED AS DISPLACEMENTS FROM REST above). Where a monomer coincides with a
+    node, xi is exactly 0 and this is bit-for-bit that node's position.
 
     Args:
-        z_line: current Z-line position (nm).
+        u_thin: (n_thin, n_nodes) node displacements from rest
+        z_line: current Z-line position (nm). Resolve drivers before calling.
 
     Returns:
-        (n_thin, n_sites) absolute axial positions, nm from the M-line.
+        (n_thin, n_mono) absolute axial positions, nm from the M-line.
     """
-    return z_line - topology.binding_offsets + state.thin.displacement
+    u_z = jnp.concatenate([u_thin, jnp.zeros((u_thin.shape[0], 1), u_thin.dtype)], axis=1)
+    e = topology.mono_node
+    xi = topology.mono_xi
+    u_mono = ((1.0 - xi) * jnp.take_along_axis(u_z, e, axis=1)
+              + xi * jnp.take_along_axis(u_z, e + 1, axis=1))
+    return z_line - topology.mono_offsets + u_mono
+
+
+def thin_segment_k(constants: DynamicParams, topology: 'SarcTopology'):
+    """Stiffness (pN/nm) of one thin backbone segment: thin_EA / thin_node_spacing.
+
+    The one place the material rigidity becomes a spring constant. All node
+    segments share the same rest length, so one value serves every segment and
+    one thin factorization serves every filament in the preconditioner.
+    """
+    return constants.thin_EA / topology.thin_node_spacing
 
 
 class Drivers(NamedTuple):
@@ -203,7 +232,6 @@ class KineticsTrace(NamedTuple):
     Fields:
         state: post-thin_transitions, pre-thick_transitions State
         drivers: the Drivers the kinetics ran at (pre-solve lattice spacing)
-        xb_subpop: the (mode, constants_k, extra) tuple, or None
         torn: (n_thick, n_crowns, n_xb_per_crown) bool, heads tropomyosin tore
             off this step. Not recoverable from the before/after states — a torn
             head lands where an ordinary one does — so it is carried, not
@@ -217,7 +245,6 @@ class KineticsTrace(NamedTuple):
     """
     state: 'State'
     drivers: Drivers
-    xb_subpop: object
     torn: jnp.ndarray
     xb_bins: object
 
@@ -261,13 +288,13 @@ class PreconditionerParams(NamedTuple):
         lower_thick: (n_crowns-1,) sub-diagonal for thick filament type
         diag_thick: (n_crowns,) main diagonal for thick filament type
         upper_thick: (n_crowns-1,) super-diagonal for thick filament type
-        lower_thin: (n_sites-1,) sub-diagonal for thin filament type
-        diag_thin: (n_sites,) main diagonal for thin filament type
-        upper_thin: (n_sites-1,) super-diagonal for thin filament type
+        lower_thin: (n_nodes-1,) sub-diagonal for thin filament type
+        diag_thin: (n_nodes,) main diagonal for thin filament type
+        upper_thin: (n_nodes-1,) super-diagonal for thin filament type
         n_thick: Number of thick filaments
         n_crowns: Number of crowns per thick filament
         n_thin: Number of thin filaments
-        n_sites: Number of binding sites per thin filament
+        n_nodes: Number of mechanical nodes per thin filament
     """
     lower_thick: jnp.ndarray
     diag_thick: jnp.ndarray
@@ -278,7 +305,7 @@ class PreconditionerParams(NamedTuple):
     n_thick: int
     n_crowns: int
     n_thin: int
-    n_sites: int
+    n_nodes: int
 
 
 
@@ -312,7 +339,6 @@ def realize_state(
     n_thick = topology.n_thick
     n_crowns = topology.n_crowns
     n_thin = topology.n_thin
-    n_sites = topology.n_sites
     n_xb_per_crown = topology.n_xb_per_crown
 
     # =========================================================================
@@ -338,13 +364,13 @@ def realize_state(
 
     # =========================================================================
     # THIN FILAMENT STATE (no k — that's in Constants)
-    # Structural arrays (tm_chains, connectivity, face_to_sites) are in Topology.
+    # Structural arrays (tm_chains, connectivity, face_to_monomers) are in Topology.
     # =========================================================================
-    # Likewise: binding_rests is the diff of binding_offsets, so zero here is
+    # Likewise: node_rests is the diff of node_offsets, so zero here is
     # the exact force-free thin backbone, independent of where the Z-line is.
-    thin_displacement = jnp.zeros((n_thin, n_sites), dtype=jnp.float32)
-    tm_states = jnp.zeros((n_thin, n_sites), dtype=jnp.int8)
-    bound_to = jnp.full((n_thin, n_sites), -1, dtype=jnp.int32)
+    thin_displacement = jnp.zeros((n_thin, topology.n_nodes), dtype=jnp.float32)
+    tm_states = jnp.zeros((n_thin, topology.n_tm), dtype=jnp.int8)
+    bound_to = jnp.full((n_thin, topology.n_cand), -1, dtype=jnp.int32)
 
     thin_state = ThinState(
         displacement=thin_displacement,
@@ -370,7 +396,7 @@ def realize_state(
 # =============================================================================
 
 def build_preconditioner_params(
-    n_thick: int, n_crowns: int, n_thin: int, n_sites: int,
+    n_thick: int, n_crowns: int, n_thin: int, n_nodes: int,
     thick_k: float, thin_k: float
 ) -> PreconditionerParams:
     """Build preconditioner parameters from topology and spring constants.
@@ -384,7 +410,7 @@ def build_preconditioner_params(
         n_thick: Number of thick filaments
         n_crowns: Number of crowns per thick filament
         n_thin: Number of thin filaments
-        n_sites: Number of binding sites per thin filament
+        n_nodes: Number of mechanical nodes per thin filament
         thick_k: Thick filament spring constant (pN/nm)
         thin_k: Thin filament spring constant (pN/nm)
 
@@ -399,11 +425,11 @@ def build_preconditioner_params(
     upper_thick = jnp.full((n_crowns - 1,), thick_k)
 
     # Single thin filament tridiagonal: diag=-k (first boundary), -2k (rest)
-    diag_thin = jnp.full((n_sites,), -2.0 * thin_k)
-    diag_thin = diag_thin.at[0].set(-1.0 * thin_k)  # First site boundary
+    diag_thin = jnp.full((n_nodes,), -2.0 * thin_k)
+    diag_thin = diag_thin.at[0].set(-1.0 * thin_k)  # First node boundary
 
-    lower_thin = jnp.full((n_sites - 1,), thin_k)
-    upper_thin = jnp.full((n_sites - 1,), thin_k)
+    lower_thin = jnp.full((n_nodes - 1,), thin_k)
+    upper_thin = jnp.full((n_nodes - 1,), thin_k)
 
     return PreconditionerParams(
         lower_thick=lower_thick,
@@ -415,7 +441,7 @@ def build_preconditioner_params(
         n_thick=n_thick,
         n_crowns=n_crowns,
         n_thin=n_thin,
-        n_sites=n_sites
+        n_nodes=n_nodes
     )
 
 

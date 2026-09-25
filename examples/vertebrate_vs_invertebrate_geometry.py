@@ -44,10 +44,10 @@ MAJORITY of crossbridge slots — see the structural summary the script prints.
    that the filament is longer. Force per BOUND crossbridge is the more
    geometry-specific readout, and both are reported.
 
-6. The thin filament's per-segment stiffness is a leaky invariant across these
-   presets: the wider IFM acceptance window creates more, shorter spring
-   segments, leaving the IFM thin filament ~19% more compliant per unit length
-   at equal `thin_k`. See the `thin_k` notes in core/params.py.
+6. Thin-filament stiffness is `thin_EA` per unit length on an even node grid
+   (StaticParams.thin_node_spacing), so the wider IFM acceptance window adds
+   binding candidates without touching the mechanics. Both geometries share one
+   thin_EA; a measured invertebrate value is not yet on disk (core/params.py).
 
 Run:
     python examples/vertebrate_vs_invertebrate_geometry.py
@@ -133,7 +133,7 @@ def describe(name, topo, dynamic):
     print(f"  crowns per filament  {topo.n_crowns}   x {topo.n_xb_per_crown} heads")
     print(f"  crossbridge slots    {topo.total_xbs}")
     print(f"    with a real target {n_valid}  ({100.0 * n_valid / topo.total_xbs:.1f}%)")
-    print(f"  binding sites/thin   {topo.n_sites}")
+    print(f"  binding cand./thin   {topo.n_cand}")
     print(f"  thick filament tip   {tip:.0f} nm from M-line")
     print(f"  titin at rest near   z = {tip + float(dynamic.titin_rest):.0f} nm")
     return n_valid

@@ -102,7 +102,7 @@ class Subpopulation:
         mode: 'mean_field' | 'random' | 'c_zone'.
         xb_mask: (total_xbs,) INT labels 0..K-1, or None (generated at run() for
                  'random', unused for 'mean_field').
-        tm_mask: (n_sites_total,) INT labels, or None.
+        tm_mask: (n_thin * n_tm,) INT labels, one per tropomyosin unit, or None.
         seed: base seed for run()-time random mask generation.
     """
 
@@ -170,14 +170,16 @@ class Subpopulation:
 
     @classmethod
     def c_zone(cls, topology, c_zone_min_nm: float = C_ZONE_MIN_NM,
-               c_zone_max_nm: float = C_ZONE_MAX_NM, **scales) -> "Subpopulation":
+               c_zone_max_nm: float = C_ZONE_MAX_NM, z_line: float = None,
+               **scales) -> "Subpopulation":
         """Deterministic C-zone band: crossbridges on crowns whose axial offset
         falls in [c_zone_min_nm, c_zone_max_nm] (nm from M-line) are assigned to
-        the mutant population. If any tm_* scales are given, thin binding sites in
-        the same axial band are also labelled. Can be passed as a list to sweep
-        band position/severity across sims."""
+        the mutant population. If any tm_* scales are given, tropomyosin units
+        whose representative monomer sits in the same band at rest are also
+        labelled — which depends on where the Z-line is, so z_line (nm) is then
+        required. Can be passed as a list to sweep band position/severity."""
         _validate_scales(scales)
-        xb_mask, tm_mask = _c_zone_masks(topology, c_zone_min_nm, c_zone_max_nm, scales)
+        xb_mask, tm_mask = _c_zone_masks(topology, c_zone_min_nm, c_zone_max_nm, z_line, scales)
         frac = float(np.mean(np.asarray(xb_mask)))  # empirical mutant fraction
         return cls(
             scales=[{}, dict(scales)],
@@ -197,10 +199,10 @@ def _scale_one(constants: DynamicParams, scale: Dict[str, float]) -> DynamicPara
     })
 
 
-def _c_zone_masks(topology, lo_nm: float, hi_nm: float, scales: Dict[str, float]):
-    """Build per-XB and per-site INT-label masks for a C-zone band.
+def _c_zone_masks(topology, lo_nm: float, hi_nm: float, z_line, scales: Dict[str, float]):
+    """Build per-XB and per-tropomyosin-unit INT-label masks for a C-zone band.
 
-    XB label = 1 where the crown axial offset is in [lo, hi]. TM sites are
+    XB label = 1 where the crown axial offset is in [lo, hi]. TM units are
     labelled by the same axial band only when tm_* scales are present (otherwise
     all WT, so the TM path is untouched).
     """
@@ -218,11 +220,18 @@ def _c_zone_masks(topology, lo_nm: float, hi_nm: float, scales: Dict[str, float]
 
     has_tm = any(f.startswith("tm_") for f in scales)
     if has_tm:
-        # Thin binding-site axial rest positions (same frame metrics_fn uses).
-        site_pos = np.cumsum(np.asarray(topology.binding_rests), axis=1)  # (n_thin, n_sites)
-        tm_mask = ((site_pos >= lo_nm) & (site_pos <= hi_nm)).astype(np.int32).reshape(-1)
+        if z_line is None:
+            raise ValueError("Subpopulation.c_zone with tm_* scales needs z_line: a "
+                             "thin filament's distance from the M-line depends on it")
+        # Each unit at the rest position of its representative monomer, nm from
+        # the M-line — the frame crown_offsets above and the overlap metrics use,
+        # so the TM band and the XB band are the same axial interval.
+        rep_offsets = np.take_along_axis(np.asarray(topology.mono_offsets),
+                                         np.asarray(topology.tm_rep_mono), axis=1)
+        unit_pos = z_line - rep_offsets                                     # (n_thin, n_tm)
+        tm_mask = ((unit_pos >= lo_nm) & (unit_pos <= hi_nm)).astype(np.int32).reshape(-1)
     else:
-        tm_mask = np.zeros(topology.n_thin * topology.n_sites, dtype=np.int32)
+        tm_mask = np.zeros(topology.n_thin * topology.n_tm, dtype=np.int32)
 
     return jnp.asarray(xb_mask, jnp.int32), jnp.asarray(tm_mask, jnp.int32)
 
@@ -238,16 +247,16 @@ def generate_random_masks_batch(seed: int, p_mut_b: jnp.ndarray, topology, total
 
     Returns:
         xb_mask_b: (total_batch, total_xbs) INT labels
-        tm_mask_b: (total_batch, n_sites_total) INT labels
+        tm_mask_b: (total_batch, n_thin * n_tm) INT labels
     """
     sim_keys = jax.random.split(jax.random.PRNGKey(int(seed)), total_batch)
     total_xbs = topology.n_thick * topology.n_crowns * topology.n_xb_per_crown
-    n_sites_total = topology.n_thin * topology.n_sites
+    n_tm_total = topology.n_thin * topology.n_tm
 
     def _mk(key, p_mut):
         kx, kt = jax.random.split(key)
         xb = (jax.random.uniform(kx, (total_xbs,)) < p_mut).astype(jnp.int32)
-        tm = (jax.random.uniform(kt, (n_sites_total,)) < p_mut).astype(jnp.int32)
+        tm = (jax.random.uniform(kt, (n_tm_total,)) < p_mut).astype(jnp.int32)
         return xb, tm
 
     return jax.vmap(_mk)(sim_keys, p_mut_b)

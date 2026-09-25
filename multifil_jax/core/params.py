@@ -213,7 +213,7 @@ import jax.numpy as jnp
 import numpy as np
 import warnings
 from dataclasses import dataclass, asdict
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 # Sum of the thick and thin filament radii (nm): 8 + 5, Brenner 1996.
 #
@@ -233,8 +233,16 @@ from typing import Dict, Any, List, Tuple
 # this to become a parameter rather than a constant.
 FILAMENT_RADII_SUM = 13.0
 
-# Static fields that affect array shapes (changing these triggers recompilation)
-STATIC_FIELDS = frozenset({'n_crowns', 'n_polymers_per_thin', 'solver_max_iter', 'actin_geometry', 'n_newton_steps', 'n_cg_steps', 'n_xb_bins', 'xb_bin_lo', 'xb_bin_hi', 'thick_bare_zone', 'thick_crown_spacing', 'actin_half_pitch', 'mono_per_poly', 'polymer_base_turns', 'target_zone_wiggle', 'n_xb_per_crown'})
+
+def poisson_spacing(d0, z0, z, nu):
+    """Surface gap at Z-line z, scaled from gap d0 at z0 with Poisson ratio nu.
+
+    Scales the centre-to-centre spacing d + FILAMENT_RADII_SUM and takes the
+    radii back off (see above). nu = 0.5 is isovolumic. The ONE place this
+    formula is written: the Poisson LS mode and the dynamic-LS reference
+    spacing both call it.
+    """
+    return (d0 + FILAMENT_RADII_SUM) * (z0 / z) ** nu - FILAMENT_RADII_SUM
 
 # Single source of truth: every DynamicParams field with its skeletal default.
 # Citations and confidence tiers ([M]/[I]/[G]/[F], see module docstring) live
@@ -274,42 +282,41 @@ _DYNAMIC_DEFAULTS = {
     # per unit length, and the longer filament is correctly more compliant overall.
     'thick_k': 7500.0,  # [I] pN/nm per segment (whole-filament ≈ 144 pN/nm)
 
-    # Thin filament — per-segment spring constant (between adjacent binding-site nodes)
-    # Whole-filament axial stiffness = thin_k / n_segments. At the vertebrate
-    # defaults there are 90 binding-site nodes per thin filament + a z-line anchor
-    # → 90 segments over ~1077 nm. The node count is NOT a constant of the model:
-    # it follows from actin_half_pitch, mono_per_poly and target_zone_wiggle.
+    # Thin filament — axial rigidity EA (pN), a material property of the filament.
+    # The backbone is a chain of springs between mechanical nodes an even
+    # StaticParams.thin_node_spacing apart, each segment of stiffness
+    # thin_EA / thin_node_spacing (core.state.thin_segment_k), so whole-filament
+    # stiffness is thin_EA / length. Because the value is per unit length, no
+    # discretization choice — node spacing, or how many monomers are binding
+    # candidates — changes the filament's mechanics, and every preset shares it.
     #
     # Brunello et al. 2014 J Physiol 592:3881:
     #     specific compliance c_A = 14.3 nm·MPa⁻¹·µm⁻¹, half-sarc thin length l_A = 0.975 µm.
     #     BOTH VERIFIED verbatim 2026-08-19: "sarcomere length 2.15 μm, lA = 0.975 μm,
     #     lM = 0.800 μm, ζ = 0.700 μm, cA = 14.3 ± 1.9 nm MPa⁻¹ μm⁻¹". Frog, intact fibres.
     #     Per-thin area A_A = A_M / 2 = 877 nm² (1:2 thick:thin stoichiometry, vertebrate).
-    #     k_whole = A_A / (c_A · l_A) = 877 / (14.3 × 0.975) = 63 pN/nm.
+    #     k_whole = A_A / (c_A · l_A) = 877 / (14.3 × 0.975) = 63 pN/nm,
+    #     i.e. EA = k_whole · l_A = 1 / c_A · A_A ≈ 61,300 pN.
     #   (Note: do NOT use an overlap-corrected C_A of 6.9 — the string "6.9" does
     #    not appear anywhere in Brunello 2014, so it must not be attributed to that
     #    paper; the caution itself still stands — it removes the
     #    non-overlap segment from the load path; our uniform model spring of length l_A
     #    represents the whole filament, so use c × L without the correction.)
-    # Mijailovich et al. 2021 Table 1: AE_a = 65 nN, l_a = 1.1 µm → k_whole = 59 pN/nm.
-    # Lit consensus ≈ 60 pN/nm whole-filament (Brunello and Mij agree).
-    # Conversion: thin_k = k_whole × n_segments = 60 × 90 = 5400 → round to 5500.
-    # Thin is ~2× more compliant per length than thick (consistent with smaller cross-
-    # section: actin double helix ~7 nm Ø vs myosin backbone ~15 nm Ø).
-    #
-    # KNOWN LIMITATION — per-segment stiffness is a leaky invariant on the thin
-    # filament. Unlike crown spacing (a physical ~15 nm in every species), thin
-    # segment length is an artifact of which monomers the angular acceptance window
-    # (target_zone_wiggle) admits as binding sites. Widen that window and segments
-    # get shorter, so the same thin_k silently yields a more compliant filament per
-    # unit length. Comparing the vertebrate defaults against the invertebrate
-    # presets: segment length 11.97 nm vs 9.73 nm, giving axial rigidity
-    # (thin_k × L) of 65,800 pN vs 53,500 pN — the insect thin filament ends up
-    # ~19% more compliant per unit length purely from a binding-geometry choice.
-    # The equivalent thick-filament comparison agrees to ~1%, as it should.
-    # If you change target_zone_wiggle, or compare mechanics across presets that
-    # differ in it, rescale thin_k to hold thin_k × segment_length fixed.
-    'thin_k': 5500.0,   # [I] pN/nm per segment (whole-filament ≈ 61 pN/nm)
+    # Mijailovich et al. 2021 Table 1 (MUSICO, rat trabeculae model): the cell
+    #     "Thin-filament elastic modulus | AEa | 65 nN" — an EA directly, 65,000 pN.
+    # Default 66,000 pN is the previous vertebrate value re-expressed, not a new
+    # choice: 5500 pN/nm per segment over the 90 segments of the 1080 nm filament
+    # is 61.1 pN/nm whole, × 1080 nm = 66,000 pN. Vertebrate stiffness per unit
+    # length is therefore unchanged (whole-filament too: 66,000 / 12 nm = 5500
+    # pN/nm per node segment over 90 segments, and the cardiac 1008 nm filament
+    # has 84 of them, as it had 84 sites). The insect filament, ~1570 nm long,
+    # comes out at ≈ 42 pN/nm whole. Thin is ~2× more compliant per length than
+    # thick (consistent with smaller cross-section: actin double helix ~7 nm Ø vs
+    # myosin backbone ~15 nm Ø).
+    # INSECT PRESETS SHARE THIS VALUE. [UNSOURCED] invertebrate thin filaments are
+    # thought to be substantially stiffer than vertebrate; value to be replaced
+    # when a citable measurement is on disk.
+    'thin_EA': 66000.0,   # [I] pN (vertebrate whole filament ≈ 61 pN/nm)
 
     # --------------------------------------------------------------------------
     # CROSSBRIDGE SPRINGS — the two-spring myosin head
@@ -1149,10 +1156,20 @@ class StaticParams:
             deciding which monomers count as binding sites for a given face.
             Because the helix is periodic, monomers fall into a few discrete
             azimuthal classes, so this window controls the site COUNT in
-            discrete jumps rather than continuously. Widening it adds sites,
-            which shortens the thin filament's spring segments and therefore
-            changes its effective stiffness — see the thin_k note in
-            _DYNAMIC_DEFAULTS before changing it.
+            discrete jumps rather than continuously. It selects binding
+            candidates only: the thin backbone's mechanical nodes are a separate
+            even grid (thin_node_spacing), so it has no mechanical side effect.
+
+    THIN FILAMENT MECHANICS
+        thin_node_spacing: Rest spacing (nm) of the thin backbone's mechanical
+            nodes. A resolution choice, not a measured quantity — the rigidity
+            is DynamicParams.thin_EA per unit length — but it sets n_nodes, an
+            array shape, so it lives here.
+        tm_monomers_per_unit: Actin monomers one tropomyosin unit covers on its
+            strand. None (default) = one unit per binding candidate, the
+            original wiring; an integer (7 in the literature below) decouples
+            the regulatory units from the binding candidates. Sets n_tm, an
+            array shape.
 
     CROWN-FACE GEOMETRY
         n_xb_per_crown: Crossbridges per crown, one per myosin MOLECULE, each
@@ -1218,7 +1235,7 @@ class StaticParams:
     # geometrically wrong sublattice under this formula, not merely uncalibrated.
     # Lethocerus: 1 (default, no superlattice). Drosophila: 3 (Squire 2006).
     n_superlattice_classes: int = 1
-    # Thin-filament actin helix geometry, consumed by _calculate_binding_site_offsets.
+    # Thin-filament actin helix geometry, consumed by sarc_geometry._build_thin_layers.
     # Vertebrate defaults reproduce the prior hardcoded constants bit-for-bit.
     # (IFM values: actin_half_pitch=38.7, mono_per_poly=28, polymer_base_turns=13.)
     actin_half_pitch: float = 36.0     # nm — long-pitch half-repeat (polymer_base_length = 2×)
@@ -1227,6 +1244,27 @@ class StaticParams:
     # Angular half-width (rad) of the target-zone acceptance window. Default is the
     # exact float32 round-trip of the prior `rev/24`, so vertebrate stays byte-identical.
     target_zone_wiggle: float = float(np.float32(2 * np.pi) / np.float32(24))
+    # Rest spacing (nm) of the thin filament's mechanical nodes — an even grid
+    # from the Z-disc, shared by all thin filaments and every preset. Monomers
+    # move with the linear interpolation of the two nodes around them; each
+    # segment's stiffness is DynamicParams.thin_EA / thin_node_spacing.
+    thin_node_spacing: float = 12.0
+    # Monomers per tropomyosin unit — the regulatory switch of the thin filament.
+    # None: one unit per binding candidate, wired exactly as before the thin
+    # filament was split into layers. An integer: units are consecutive runs of
+    # that many monomers along each strand, counted from the Z-disc end.
+    #   Mijailovich et al. 2012 Eur Biophys J 41:1015, p. 1017: "the Tm molecule
+    #   is a coiled coil of about 40 nm in length, covers seven monomers on one
+    #   strand of the actin double helix, and is associated with one Tn molecule."
+    #   Squire et al. 2006 J Mol Biol 361:823, p. 825 (insect flight muscle):
+    #   "along each strand one troponin/tropomyosin assembly interacts with
+    #   successive groups of seven actin monomers."
+    # Counting from the Z-disc end, and starting both strands at their own
+    # Z-disc-most monomer (so the strands' units are one monomer rise apart), is
+    # UNSOURCED for vertebrate thin filaments; the insect stagger is drawn, not
+    # stated, in Squire 2006 Fig. 7a. Neighbouring units couple along their own
+    # strand only; any coupling across strands is not modelled.
+    tm_monomers_per_unit: Optional[int] = None
     # Crown-face geometry (thick-filament crown -> thin-filament face assignment).
     # Consumed by SarcTopology's _compute_flat_index_maps_fixed_width. Vertebrate
     # defaults (n=3, rotation=60) give a byte-identical total_xbs to the prior
@@ -1368,17 +1406,12 @@ class DynamicParams:
             _, dynamic, *_ = get_skeletal_params()
             modified = dynamic.copy(xb_r01_coeff=400.0, tm_k_01=60000.0)
         """
-        # Validate keys before constructing (Python-level, not traced)
-        invalid = set(updates.keys()) - set(DYNAMIC_FIELDS)
-        if invalid:
-            raise ValueError(f"Unknown parameter: {sorted(invalid)}. Valid: {list(DYNAMIC_FIELDS)}")
-        # Build kwargs from current values, overriding with updates
-        # No float() conversion — preserves JAX tracers inside JIT
-        kwargs = {name: updates.get(name, getattr(self, name)) for name in DYNAMIC_FIELDS}
-        return DynamicParams(**kwargs)
+        # No float() conversion — preserves JAX tracers inside JIT. An unknown
+        # name is __init__'s TypeError, the one validation path.
+        return DynamicParams(**{**{n: getattr(self, n) for n in DYNAMIC_FIELDS}, **updates})
 
     def __repr__(self) -> str:
-        return f"DynamicParams(thick_k={float(self.thick_k):.1f}, thin_k={float(self.thin_k):.1f}, ...)"
+        return f"DynamicParams(thick_k={float(self.thick_k):.1f}, thin_EA={float(self.thin_EA):.1f}, ...)"
 
 
 def get_skeletal_params() -> Tuple[StaticParams, DynamicParams, float, float]:
@@ -1430,9 +1463,9 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams, float, float]:
     throughout. Burgoyne et al. 2008 Cardiovasc Res 77:707, Table 1, measured
     rat papillary thin filaments (Z-disc centre to pointed end, electron
     tomography) at 1.04 +/- 0.03 um (131 filaments), mouse 1.03 +/- 0.03. Whole
-    pseudo-repeats bracket that mean: 14 is ~1 SD short, 15 is ~1.3 SD long. thin_k is per SEGMENT, so the
-    shorter filament keeps the same stiffness per unit length and is stiffer
-    overall. At the cardiac operating point the thin filament still passes the
+    pseudo-repeats bracket that mean: 14 is ~1 SD short, 15 is ~1.3 SD long. thin_EA is per unit
+    length, so the shorter filament keeps the same stiffness per unit length and
+    is stiffer overall. At the cardiac operating point the thin filament still passes the
     M-line (by 108 nm at z_line 900), so thin_thin_overlap_screening acts here. Cardiac
     myosin (beta-MHC) cycles several times more slowly than fast skeletal
     myosin, cardiac troponin C releases calcium faster, and cardiac titin is
@@ -1675,11 +1708,13 @@ def get_lethocerus_params() -> Tuple[StaticParams, DynamicParams, float, float]:
     structural match; the angle itself is inferred and carries no independent
     measurement.
 
-    Because the same window also sets how many mechanical nodes the thin filament
-    has, widening it to 26 deg makes the insect thin filament ~19% more compliant
-    per unit length than the vertebrate one at equal thin_k. See the thin_k entry
-    in _DYNAMIC_DEFAULTS — a binding-geometry decision has a mechanical side
-    effect here, and comparisons across presets should account for it.
+    The window selects binding candidates only. The thin filament's mechanical
+    nodes are a separate even grid (StaticParams.thin_node_spacing) with one
+    rigidity per unit length (DynamicParams.thin_EA), so widening it to 26 deg
+    changes no mechanics and the insect and vertebrate thin filaments are equally
+    stiff per unit length. [UNSOURCED] invertebrate thin filaments are thought to
+    be substantially stiffer than vertebrate; the shared thin_EA is to be replaced
+    when a citable measurement is on disk.
 
     FILAMENT LENGTHS. n_crowns, n_polymers_per_thin and the z_line you choose are
     one coupled setting, not three independent knobs. Insect flight muscle

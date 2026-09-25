@@ -122,165 +122,98 @@ class SarcTopology:
 
     REGISTERED JAX PYTREE: Arrays are "children" (traced), integers are "aux_data" (static).
 
-    This class consolidates topology and template into a single unit with
-    flattened index maps optimized for GPU parallelization.
+    THE THIN FILAMENT IS THREE LAYERS ON ONE MONOMER LIST
+    -----------------------------------------------------
+    Every actin monomer is kept. Three independent layers index them:
 
-    Attributes (Structural Integers - aux_data, static):
-        n_thick: Number of thick filaments
-        n_crowns: Number of crowns per thick filament
-        n_thin: Number of thin filaments
-        n_sites: Maximum binding sites per thin filament
-        n_titin: Number of titin connections
-        n_xb_per_crown: Number of crossbridges per crown (3 vertebrate default, 4 IFM)
-        n_faces_per_thin: Number of faces per thin filament (3 vertebrate, 2 invertebrate)
-        max_sites_per_face: Maximum binding sites per thin face
-        total_xbs: Total number of crossbridges (n_thick * n_crowns * n_xb_per_crown)
+      mechanical nodes    the unknowns of the thin backbone; thin.displacement is
+                          per node. A monomer's displacement is interpolated
+                          linearly between the node at or M-line-side of it
+                          (mono_node) and the next one toward the Z-disc, with
+                          weight mono_xi on the latter; the Z-disc is a fixed
+                          node past the last one. core.state.monomer_axial is
+                          the one place that does it.
+      binding candidates  the monomers a head may bind (face_to_monomers,
+                          xb_to_mono_indices). xb_bound_to and xb_nearest_bs
+                          hold MONOMER indices; thin.bound_to is stored per
+                          CANDIDATE (cand_mono / mono_cand translate).
+      tropomyosin units   the regulatory switches; thin.tm_states is per unit.
+                          mono_tm names the unit covering each monomer, so the
+                          gate a head reads is tm_states[thin, mono_tm[thin, m]].
 
-    Attributes (Flattened Index Maps - children, traced):
-        xb_to_thin_id: (total_xbs,) - Global XB -> thin filament ID
-        xb_to_thin_face: (total_xbs,) - Global XB -> thin face index
-        xb_to_site_indices: (total_xbs, max_sites_per_face) - FIXED-WIDTH search array
+    Offsets are rest distances from the Z-disc, so node index 0 is the pointed
+    (M-line) end and offsets DECREASE with index.
+
+    Attributes (aux_data, static):
+        n_thick, n_crowns, n_thin, n_titin, n_xb_per_crown, n_faces_per_thin,
+        total_xbs, n_xb_bins
+        n_mono: monomers per thin filament
+        n_cand: binding candidates per thin filament (union of its faces)
+        n_nodes: mechanical nodes per thin filament
+        n_tm: tropomyosin units per thin filament
+        max_mono_per_face: width of the fixed-width candidate lists
+        thin_node_spacing: rest spacing of the thin mechanical nodes (nm)
+
+    Attributes (children, traced):
+        xb_to_thin_id, xb_to_thin_face: (total_xbs,) target thin and face
+        xb_to_mono_indices: (total_xbs, max_mono_per_face) candidate monomers
         xb_valid: (total_xbs,) bool - False where the XB has no real geometric
             thin-filament partner this crown (continuous-formula miss, or a
             genuinely unconnected thick face); always True for the legacy path
             and for vertebrate defaults. Kinetics must gate binding on this.
-
-    Attributes (Connectivity Arrays - children, traced):
         thick_to_thin: (n_thick, 6, 2) - [thick, face, (thin_idx, thin_face)]
         thin_to_thick: (n_thin, n_faces_per_thin, 2) - [thin, face, (thick_idx, thick_face)]
-        face_to_sites: (n_thin, n_faces_per_thin, max_sites_per_face) - face to site mapping
-        n_sites_per_face: (n_thin, n_faces_per_thin) - count of sites per face
-        titin_connections: (n_titin, 4) - titin connectivity
-
-    Attributes (Structural Arrays - children, traced):
+        face_to_monomers: (n_thin, n_faces_per_thin, max_mono_per_face), -1 padded
+        n_mono_per_face: (n_thin, n_faces_per_thin)
+        cand_mono: (n_thin, n_cand) int32 monomer index of each candidate, ascending
+        mono_cand: (n_thin, n_mono) int32 candidate index of each monomer, -1 if none
+        titin_connections: (n_titin, 4)
         crown_offsets: (n_thick, n_crowns) - axial offset for each crown from
-            M-line, per thick filament (superlattice-aware; identical across
-            filaments unless n_superlattice_classes > 1)
-        crown_rests: (n_thick, n_crowns) - rest spacing for each crown, per
-            thick filament
-        binding_offsets: (n_thin, n_sites) - z_line - site_position offsets
-        binding_rests: (n_thin, n_sites) - rest spacing between binding sites
-        tm_chains: (n_thin, n_sites) - TM chain assignment (0 or 1)
-        tm_prev_neighbor: (n_thin, n_sites) int32 - nearest same-chain predecessor
-            site index (self-referencing at chain endpoints or padding)
-        tm_next_neighbor: (n_thin, n_sites) int32 - nearest same-chain successor
-            site index (self-referencing at chain endpoints or padding)
+            M-line, per thick filament (superlattice-aware)
+        crown_rests: (n_thick, n_crowns) - rest spacing for each crown
+        mono_offsets: (n_thin, n_mono) rest distance of each monomer from the Z-disc
+        mono_angle: (n_thin, n_mono) monomer azimuth (rad)
+        mono_strand: (n_thin, n_mono) long-pitch strand, monomer index % 2
+        mono_node: (n_thin, n_mono) int32 bracketing node on the M-line side
+        mono_xi: (n_thin, n_mono) float32 in [0, 1], weight of node mono_node + 1
+        mono_tm: (n_thin, n_mono) int32 tropomyosin unit covering the monomer
+        node_offsets: (n_thin, n_nodes) rest distance of each node from the Z-disc
+        node_rests: (n_thin, n_nodes) rest length of each node's Z-side segment
+        tm_chains: (n_thin, n_tm) strand of each unit
+        tm_prev_neighbor, tm_next_neighbor: (n_thin, n_tm) int32 adjacent
+            same-strand unit (self-referencing at strand ends)
+        tm_rep_mono: (n_thin, n_tm) int32 the monomer that stands for the
+            unit's axial position in position-based metrics and masks
         thick_starts: (n_thick,) - crown level start offset (1..n_xb_per_crown)
         thin_starts: (n_thin,) - helical twist start offset (0-25)
-        eye_4: (4, 4) - identity matrix for TM matrix exponential
-        eye_6: (6, 6) - identity matrix for XB matrix exponential
+        eye_4, eye_6: identities for the TM / XB matrix exponentials
+        xb_bin_edges, xb_bin_centers: crossbridge strain bins
     """
 
-    __slots__ = (
-        # Structural integers (aux_data)
-        'n_thick', 'n_crowns', 'n_thin', 'n_sites', 'n_titin',
-        'n_xb_per_crown', 'n_faces_per_thin', 'max_sites_per_face',
-        'total_xbs',
-        # Flattened index maps (children)
-        'xb_to_thin_id', 'xb_to_thin_face', 'xb_to_site_indices', 'xb_valid',
-        # Connectivity arrays (children)
-        'thick_to_thin', 'thin_to_thick', 'face_to_sites', 'n_sites_per_face',
-        'titin_connections',
-        # Structural arrays (children)
-        'crown_offsets', 'crown_rests', 'binding_offsets', 'binding_rests',
-        'tm_chains', 'thick_starts', 'thin_starts',
-        'eye_4', 'eye_6',
-        # XB binning arrays (children)
-        'n_xb_bins',         # int — number of bins (= n_xb_bins from StaticParams)
-        'xb_bin_edges',      # (n_xb_bins+1,) float32 — bin boundaries
-        'xb_bin_centers',    # (n_xb_bins,)   float32 — bin midpoints
-        # Topological TM same-chain neighbors (children, appended at end)
-        'tm_prev_neighbor', 'tm_next_neighbor',
+    _AUX = (
+        'n_thick', 'n_crowns', 'n_thin', 'n_mono', 'n_cand', 'n_nodes', 'n_tm', 'n_titin',
+        'n_xb_per_crown', 'n_faces_per_thin', 'max_mono_per_face', 'total_xbs',
+        'n_xb_bins', 'thin_node_spacing', 'tm_max_heads',
     )
+    _CHILDREN = (
+        'xb_to_thin_id', 'xb_to_thin_face', 'xb_to_mono_indices', 'xb_valid',
+        'thick_to_thin', 'thin_to_thick', 'face_to_monomers', 'n_mono_per_face',
+        'cand_mono', 'mono_cand',
+        'titin_connections',
+        'crown_offsets', 'crown_rests', 'thick_starts', 'thin_starts',
+        'mono_offsets', 'mono_angle', 'mono_strand', 'mono_node', 'mono_xi', 'mono_tm',
+        'node_offsets', 'node_rests',
+        'tm_chains', 'tm_prev_neighbor', 'tm_next_neighbor', 'tm_rep_mono',
+        'eye_4', 'eye_6', 'xb_bin_edges', 'xb_bin_centers',
+    )
+    __slots__ = _AUX + _CHILDREN
 
-    def __init__(
-        self,
-        # === STRUCTURAL INTEGERS (aux_data - not traced) ===
-        n_thick: int,
-        n_crowns: int,
-        n_thin: int,
-        n_sites: int,
-        n_titin: int,
-        n_xb_per_crown: int,
-        n_faces_per_thin: int,
-        max_sites_per_face: int,
-        total_xbs: int,
-
-        # === FLATTENED INDEX MAPS (children - traced) ===
-        xb_to_thin_id: jnp.ndarray,        # (total_xbs,)
-        xb_to_thin_face: jnp.ndarray,      # (total_xbs,)
-        xb_to_site_indices: jnp.ndarray,   # (total_xbs, max_sites_per_face)
-        xb_valid: jnp.ndarray,             # (total_xbs,) bool
-
-        # === CONNECTIVITY ARRAYS (children - traced) ===
-        thick_to_thin: jnp.ndarray,        # (n_thick, 6, 2)
-        thin_to_thick: jnp.ndarray,        # (n_thin, n_faces_per_thin, 2)
-        face_to_sites: jnp.ndarray,        # (n_thin, n_faces_per_thin, max_sites_per_face)
-        n_sites_per_face: jnp.ndarray,     # (n_thin, n_faces_per_thin)
-        titin_connections: jnp.ndarray,    # (n_titin, 4)
-
-        # === STRUCTURAL ARRAYS (children - traced) ===
-        crown_offsets: jnp.ndarray,        # (n_thick, n_crowns)
-        crown_rests: jnp.ndarray,          # (n_thick, n_crowns)
-        binding_offsets: jnp.ndarray,      # (n_thin, n_sites)
-        binding_rests: jnp.ndarray,        # (n_thin, n_sites)
-        tm_chains: jnp.ndarray,            # (n_thin, n_sites)
-        thick_starts: jnp.ndarray,         # (n_thick,)
-        thin_starts: jnp.ndarray,          # (n_thin,)
-
-        # === STRUCTURAL CONSTANTS (children - traced) ===
-        eye_4: jnp.ndarray,                # (4, 4)
-        eye_6: jnp.ndarray,                # (6, 6)
-
-        # === XB BINNING (children - traced) ===
-        n_xb_bins: int,
-        xb_bin_edges: jnp.ndarray,         # (n_xb_bins+1,) float32
-        xb_bin_centers: jnp.ndarray,       # (n_xb_bins,)   float32
-
-        # === TOPOLOGICAL TM SAME-CHAIN NEIGHBORS (children - traced) ===
-        tm_prev_neighbor: jnp.ndarray,     # (n_thin, n_sites) int32
-        tm_next_neighbor: jnp.ndarray,     # (n_thin, n_sites) int32
-    ):
-        """Initialize SarcTopology with structural dimensions and pre-allocated arrays."""
-        # Store integers
-        self.n_thick = n_thick
-        self.n_crowns = n_crowns
-        self.n_thin = n_thin
-        self.n_sites = n_sites
-        self.n_titin = n_titin
-        self.n_xb_per_crown = n_xb_per_crown
-        self.n_faces_per_thin = n_faces_per_thin
-        self.max_sites_per_face = max_sites_per_face
-        self.total_xbs = total_xbs
-
-        # Store flattened index maps
-        self.xb_to_thin_id = xb_to_thin_id
-        self.xb_to_thin_face = xb_to_thin_face
-        self.xb_to_site_indices = xb_to_site_indices
-        self.xb_valid = xb_valid
-
-        # Store connectivity arrays
-        self.thick_to_thin = thick_to_thin
-        self.thin_to_thick = thin_to_thick
-        self.face_to_sites = face_to_sites
-        self.n_sites_per_face = n_sites_per_face
-        self.titin_connections = titin_connections
-
-        # Store structural arrays
-        self.crown_offsets = crown_offsets
-        self.crown_rests = crown_rests
-        self.binding_offsets = binding_offsets
-        self.binding_rests = binding_rests
-        self.tm_chains = tm_chains
-        self.thick_starts = thick_starts
-        self.thin_starts = thin_starts
-        self.eye_4 = eye_4
-        self.eye_6 = eye_6
-        self.n_xb_bins = n_xb_bins
-        self.xb_bin_edges = xb_bin_edges
-        self.xb_bin_centers = xb_bin_centers
-        self.tm_prev_neighbor = tm_prev_neighbor
-        self.tm_next_neighbor = tm_next_neighbor
+    def __init__(self, **fields):
+        """Every name in __slots__, by keyword. Integers in _AUX, arrays in _CHILDREN."""
+        assert set(fields) == set(self.__slots__), \
+            f"SarcTopology fields: -{set(self.__slots__) - set(fields)} +{set(fields) - set(self.__slots__)}"
+        for name, value in fields.items():
+            setattr(self, name, value)
 
     def valid_xb_targets(self) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """Crossbridge connectivity with placeholder entries removed.
@@ -322,66 +255,13 @@ class SarcTopology:
 
     def tree_flatten(self) -> Tuple[Tuple[jnp.ndarray, ...], Tuple[int, ...]]:
         """Flatten for JAX: arrays are children, integers are aux_data."""
-        children = (
-            # Flattened index maps
-            self.xb_to_thin_id, self.xb_to_thin_face, self.xb_to_site_indices, self.xb_valid,
-            # Connectivity arrays
-            self.thick_to_thin, self.thin_to_thick, self.face_to_sites,
-            self.n_sites_per_face, self.titin_connections,
-            # Structural arrays
-            self.crown_offsets, self.crown_rests, self.binding_offsets,
-            self.binding_rests, self.tm_chains, self.thick_starts, self.thin_starts,
-            self.eye_4, self.eye_6,
-            self.xb_bin_edges, self.xb_bin_centers,
-            self.tm_prev_neighbor, self.tm_next_neighbor,
-        )
-        aux_data = (
-            self.n_thick, self.n_crowns, self.n_thin, self.n_sites,
-            self.n_titin, self.n_xb_per_crown,
-            self.n_faces_per_thin, self.max_sites_per_face, self.total_xbs,
-            self.n_xb_bins,
-        )
-        return children, aux_data
+        return (tuple(getattr(self, n) for n in self._CHILDREN),
+                tuple(getattr(self, n) for n in self._AUX))
 
     @classmethod
     def tree_unflatten(cls, aux_data: Tuple[int, ...], children: Tuple[jnp.ndarray, ...]) -> 'SarcTopology':
         """Reconstruct SarcTopology from flattened representation."""
-        return cls(
-            # Integers from aux_data
-            n_thick=aux_data[0],
-            n_crowns=aux_data[1],
-            n_thin=aux_data[2],
-            n_sites=aux_data[3],
-            n_titin=aux_data[4],
-            n_xb_per_crown=aux_data[5],
-            n_faces_per_thin=aux_data[6],
-            max_sites_per_face=aux_data[7],
-            total_xbs=aux_data[8],
-            n_xb_bins=aux_data[9],
-            # Arrays from children
-            xb_to_thin_id=children[0],
-            xb_to_thin_face=children[1],
-            xb_to_site_indices=children[2],
-            xb_valid=children[3],
-            thick_to_thin=children[4],
-            thin_to_thick=children[5],
-            face_to_sites=children[6],
-            n_sites_per_face=children[7],
-            titin_connections=children[8],
-            crown_offsets=children[9],
-            crown_rests=children[10],
-            binding_offsets=children[11],
-            binding_rests=children[12],
-            tm_chains=children[13],
-            thick_starts=children[14],
-            thin_starts=children[15],
-            eye_4=children[16],
-            eye_6=children[17],
-            xb_bin_edges=children[18],
-            xb_bin_centers=children[19],
-            tm_prev_neighbor=children[20],
-            tm_next_neighbor=children[21],
-        )
+        return cls(**dict(zip(cls._AUX, aux_data)), **dict(zip(cls._CHILDREN, children)))
 
     @classmethod
     def create(
@@ -547,59 +427,23 @@ class SarcTopology:
             n_crowns, bare_zone_arr, static_params.thick_crown_spacing
         )
 
-        # 5. Calculate binding site offsets
-        (binding_offsets_list, binding_rests_list, face_to_sites_list,
-         n_sites_per_face_list, tm_chains_list, max_sites,
-         tm_prev_neighbor_list, tm_next_neighbor_list) = _calculate_binding_site_offsets(
-            thin_orientations, thin_starts_arr, n_thin, n_polymers_per_thin, n_faces_per_thin,
+        # 5. The thin filament: every monomer, and the three layers built on it
+        thin = _build_thin_layers(
+            thin_orientations, thin_starts_arr, n_thin, n_polymers_per_thin,
             static_params.actin_half_pitch, static_params.mono_per_poly,
             static_params.polymer_base_turns, static_params.target_zone_wiggle,
+            static_params.thin_node_spacing, static_params.tm_monomers_per_unit,
             thin_class=thin_class_arr,
         )
 
-        # Pad to uniform arrays
-        binding_offsets_arr = np.zeros((n_thin, max_sites), dtype=np.float32)
-        binding_rests_arr = np.full((n_thin, max_sites), 2.77, dtype=np.float32)
-        tm_chains_arr = np.zeros((n_thin, max_sites), dtype=np.int32)
-        # Row-local self-index default: padding slots self-reference (harmless via
-        # the self-exclusion check) rather than defaulting to 0, which would
-        # silently fake a same-chain link to real site 0.
-        tm_prev_neighbor_arr = np.tile(np.arange(max_sites, dtype=np.int32), (n_thin, 1))
-        tm_next_neighbor_arr = np.tile(np.arange(max_sites, dtype=np.int32), (n_thin, 1))
-        for i in range(n_thin):
-            n = len(binding_offsets_list[i])
-            binding_offsets_arr[i, :n] = binding_offsets_list[i]
-            binding_rests_arr[i, :n] = binding_rests_list[i]
-            tm_chains_arr[i, :n] = tm_chains_list[i]
-            tm_prev_neighbor_arr[i, :n] = tm_prev_neighbor_list[i]
-            tm_next_neighbor_arr[i, :n] = tm_next_neighbor_list[i]
-
-        # Find max sites per face
-        max_sites_per_face = max(
-            len(sites) for thin_faces in face_to_sites_list for sites in thin_faces
-        ) if face_to_sites_list else 0
-
-        # Pad face_to_sites
-        face_to_sites_arr = np.full((n_thin, n_faces_per_thin, max_sites_per_face), -1, dtype=np.int32)
-        n_sites_per_face_arr = np.zeros((n_thin, n_faces_per_thin), dtype=np.int32)
-        for i in range(n_thin):
-            for j in range(len(face_to_sites_list[i])):
-                sites = face_to_sites_list[i][j]
-                face_to_sites_arr[i, j, :len(sites)] = sites
-                n_sites_per_face_arr[i, j] = len(sites)
-
         # 6. Compute FIXED-WIDTH flattened index maps
         total_xbs = n_thick * n_crowns * static_params.n_xb_per_crown
-        xb_to_thin_id, xb_to_thin_face, xb_to_site_indices, xb_valid = _compute_flat_index_maps_fixed_width(
-            thick_to_thin_arr, face_to_sites_arr, n_sites_per_face_arr,
-            thick_starts_arr, n_thick, n_crowns, max_sites_per_face,
+        xb_to_thin_id, xb_to_thin_face, xb_to_mono_indices, xb_valid = _compute_flat_index_maps_fixed_width(
+            thick_to_thin_arr, thin['face_to_monomers'], thin['n_mono_per_face'],
+            thick_starts_arr, n_thick, n_crowns,
             static_params.n_xb_per_crown, static_params.crown_rotation_deg,
             static_params.crown_face_wiggle_deg, static_params.legacy_crown_geometry,
         )
-
-        # Pre-allocate structural constants
-        eye_4 = np.eye(4, dtype=np.float32)
-        eye_6 = np.eye(6, dtype=np.float32)
 
         # XB bin edges and centers (baked in at topology creation time)
         bin_edges = jnp.linspace(
@@ -611,44 +455,37 @@ class SarcTopology:
         bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
 
         return cls(
-            # Structural integers
             n_thick=n_thick,
             n_crowns=n_crowns,
             n_thin=n_thin,
-            n_sites=max_sites,
+            n_mono=thin['mono_offsets'].shape[1],
+            n_cand=thin['cand_mono'].shape[1],
+            n_nodes=thin['node_offsets'].shape[1],
+            n_tm=thin['tm_chains'].shape[1],
+            tm_max_heads=_max_candidates_per_unit(thin['cand_mono'], thin['mono_tm'], thin['tm_chains'].shape[1]),
             n_titin=n_titin,
             n_xb_per_crown=static_params.n_xb_per_crown,
             n_faces_per_thin=n_faces_per_thin,
-            max_sites_per_face=max_sites_per_face,
+            max_mono_per_face=thin['face_to_monomers'].shape[2],
             total_xbs=total_xbs,
             n_xb_bins=static_params.n_xb_bins,
-            # Flattened index maps
+            thin_node_spacing=static_params.thin_node_spacing,
             xb_to_thin_id=jnp.asarray(xb_to_thin_id),
             xb_to_thin_face=jnp.asarray(xb_to_thin_face),
-            xb_to_site_indices=jnp.asarray(xb_to_site_indices),
+            xb_to_mono_indices=jnp.asarray(xb_to_mono_indices),
             xb_valid=jnp.asarray(xb_valid),
-            # Connectivity arrays
             thick_to_thin=jnp.asarray(thick_to_thin_arr),
             thin_to_thick=jnp.asarray(thin_to_thick_arr),
-            face_to_sites=jnp.asarray(face_to_sites_arr),
-            n_sites_per_face=jnp.asarray(n_sites_per_face_arr),
             titin_connections=jnp.asarray(titin_arr),
-            # Structural arrays
             crown_offsets=jnp.asarray(crown_offsets),
             crown_rests=jnp.asarray(crown_rests),
-            binding_offsets=jnp.asarray(binding_offsets_arr),
-            binding_rests=jnp.asarray(binding_rests_arr),
-            tm_chains=jnp.asarray(tm_chains_arr),
-            tm_prev_neighbor=jnp.asarray(tm_prev_neighbor_arr),
-            tm_next_neighbor=jnp.asarray(tm_next_neighbor_arr),
             thick_starts=jnp.asarray(thick_starts_arr),
             thin_starts=jnp.asarray(thin_starts_arr),
-            # Structural constants
-            eye_4=jnp.asarray(eye_4),
-            eye_6=jnp.asarray(eye_6),
-            # XB binning
+            eye_4=jnp.eye(4, dtype=jnp.float32),
+            eye_6=jnp.eye(6, dtype=jnp.float32),
             xb_bin_edges=bin_edges,
             xb_bin_centers=bin_centers,
+            **{name: jnp.asarray(arr) for name, arr in thin.items()},
         )
 
     def visualize(self, filename: str = None):
@@ -685,11 +522,11 @@ class SarcTopology:
 
         print(f"\nStructure:")
         print(f"  Crowns per thick: {self.n_crowns}")
-        print(f"  Sites per thin: {self.n_sites}")
+        print(f"  Monomers / nodes / Tm units per thin: {self.n_mono} / {self.n_nodes} / {self.n_tm}")
         print(f"  Faces per thin: {self.n_faces_per_thin}")
         print(f"  Total crossbridges: {self.total_xbs}")
         print(f"  Total titin: {self.n_titin}")
-        print(f"  Max sites per face: {self.max_sites_per_face}")
+        print(f"  Candidate monomers per face: {self.max_mono_per_face}")
 
         if filename:
             with open(filename, 'w') as f:
@@ -719,7 +556,7 @@ class SarcTopology:
         return (
             f"SarcTopology("
             f"n_thick={self.n_thick}, n_crowns={self.n_crowns}, "
-            f"n_thin={self.n_thin}, n_sites={self.n_sites}, "
+            f"n_thin={self.n_thin}, n_mono={self.n_mono}, n_nodes={self.n_nodes}, n_tm={self.n_tm}, "
             f"total_xbs={self.total_xbs}, n_titin={self.n_titin})"
         )
 
@@ -1198,31 +1035,50 @@ def _calculate_crown_offsets(
     return offsets, rests
 
 
-def _calculate_binding_site_offsets(
+def _build_thin_layers(
     thin_face_orientations: List[Tuple[int, ...]],
     thin_starts: np.ndarray,
     n_thin: int,
     n_polymers_per_thin: int,
-    n_faces_per_thin: int,
     actin_half_pitch: float,
     mono_per_poly: int,
     polymer_base_turns: float,
     target_zone_wiggle: float,
+    thin_node_spacing: float,
+    tm_monomers_per_unit: Optional[int],
     thin_class: np.ndarray = None,
-) -> Tuple[List[np.ndarray], List[np.ndarray], List[List[np.ndarray]], List[List[int]], List[np.ndarray], int, List[np.ndarray], List[np.ndarray]]:
-    """Calculate binding site offsets for each thin filament.
+) -> Dict[str, np.ndarray]:
+    """Every actin monomer of every thin filament, and the three layers on them.
 
-    Helix geometry (actin_half_pitch/mono_per_poly/polymer_base_turns) and the
-    target-zone acceptance window (target_zone_wiggle) come from StaticParams.
-    Vertebrate defaults (36.0 / 26 / 12.0 / rev-24) reproduce the prior hardcodes.
+    MONOMERS. mono_per_poly * n_polymers_per_thin per filament, on a 1-start
+    genetic helix: monomer m sits (n_mono - m) * rise from the Z-disc at azimuth
+    (m + start + 1) * pitch, and alternates between the two long-pitch strands
+    (m % 2). Helix geometry (actin_half_pitch/mono_per_poly/polymer_base_turns)
+    and the acceptance window (target_zone_wiggle) come from StaticParams.
+
+    CANDIDATES. A monomer is a binding candidate for a face when its azimuth is
+    within target_zone_wiggle of the face direction.
+
+    NODES. An even grid thin_node_spacing apart from the Z-disc, the same for
+    every thin filament; node 0 is the pointed end. Every monomer is placed on
+    it by linear interpolation (_interpolate_monomers).
+
+    TROPOMYOSIN UNITS. With tm_monomers_per_unit None, one unit per binding
+    candidate (no monomer may then belong to two faces). With an integer,
+    consecutive runs of that many monomers on each strand (_tropomyosin_units).
+    Either way the adjacent units on the same strand are Ising neighbours, a head
+    bound to any monomer of a unit locks it by one factor (1 + xb_tm_K2), and a
+    unit that leaves the open state releases every head on its monomers.
 
     thin_class: (n_thin,) int32 in {0,1,2}, the Squire 3-fold registration class
     per thin filament (None → all class 0). Each class shifts that filament's
-    binding-site grid by Squire's measured inter-filament screw:
+    monomer grid by Squire's measured inter-filament screw:
       angular: start += class · round(mono_per_poly/3)  (≈ 60°/120° rotation)
       axial:   grid  += class · (actin_half_pitch/3)    (12.9/25.8 nm, +Z; see
                the sign/handedness rationale in the body)
     At class 0 both shifts vanish, so vertebrate/cardiac is byte-identical.
+
+    Returns a dict keyed by SarcTopology field name (NumPy arrays).
     """
     if thin_class is None:
         thin_class = np.zeros(n_thin, dtype=np.int32)
@@ -1260,111 +1116,192 @@ def _calculate_binding_site_offsets(
     pitch = polymer_base_turns * rev / mono_per_poly
     rise = polymer_base_length / mono_per_poly
 
-    total_monomers = mono_per_poly * n_polymers_per_thin
-    monomer_offsets = (total_monomers - np.arange(total_monomers, dtype=np.float32)) * rise
+    n_mono = mono_per_poly * n_polymers_per_thin
+    monomer_offsets = (n_mono - np.arange(n_mono, dtype=np.float32)) * rise
+    wiggle = np.float32(target_zone_wiggle)
 
-    all_orientation_vectors = np.array([
-        (0.866, -0.5), (0, -1.0), (-0.866, -0.5),
-        (-0.866, 0.5), (0, 1.0), (0.866, 0.5)
-    ], dtype=np.float32)
-
-    offsets_list = []
-    rests_list = []
-    all_face_to_sites = []
-    all_n_sites_per_face = []
-    all_tm_chains = []
-    all_tm_prev_neighbor = []
-    all_tm_next_neighbor = []
-
+    # ------------------------------------------------------------------ monomers
+    mono_offsets = np.empty((n_thin, n_mono), dtype=np.float32)
+    mono_angle = np.empty((n_thin, n_mono), dtype=np.float32)
+    faces = []   # per thin: one ascending monomer-index array per face
     for thin_idx in range(n_thin):
-        active_faces = list(thin_face_orientations[thin_idx])
         cls = int(thin_class[thin_idx])
         start = thin_starts[thin_idx] + cls * angular_step
         # This thin's axially-shifted monomer grid (Squire screw translation per
-        # class, +Z toward the Z-line — see the sign rationale above). The base
-        # monomer_offsets stays the shared grid; only this copy is shifted.
-        monomer_offsets_this = monomer_offsets + cls * axial_step
-
-        monomer_angles = np.array([
+        # class, +Z toward the Z-line — see the sign rationale above).
+        mono_offsets[thin_idx] = monomer_offsets + cls * axial_step
+        mono_angle[thin_idx] = np.array([
             ((m + start + 1) % mono_per_poly) * pitch % rev
-            for m in range(total_monomers)
+            for m in range(n_mono)
         ], dtype=np.float32)
 
-        orientation_vectors = all_orientation_vectors[active_faces]
+        # ------------------------------------------------------------ candidates
+        orientation_vectors = ORIENTATION_VECTORS[list(thin_face_orientations[thin_idx])]
         face_angles = np.arctan2(orientation_vectors[:, 1], orientation_vectors[:, 0])
         face_angles = np.where(face_angles < 0, face_angles + rev, face_angles)
+        faces.append([np.where(np.abs(mono_angle[thin_idx] - fa) < wiggle)[0]
+                      for fa in face_angles])
+    mono_strand = np.tile(np.arange(n_mono, dtype=np.int32) % 2, (n_thin, 1))
 
-        wiggle = np.float32(target_zone_wiggle)
-        mono_in_faces = []
+    n_faces = len(faces[0])
+    max_mono_per_face = max(len(f) for thin_faces in faces for f in thin_faces)
+    face_to_monomers = np.full((n_thin, n_faces, max_mono_per_face), -1, dtype=np.int32)
+    n_mono_per_face = np.zeros((n_thin, n_faces), dtype=np.int32)
+    for thin_idx, thin_faces in enumerate(faces):
+        for face_idx, mono in enumerate(thin_faces):
+            face_to_monomers[thin_idx, face_idx, :len(mono)] = mono
+            n_mono_per_face[thin_idx, face_idx] = len(mono)
 
-        for face_angle in face_angles:
-            angle_diff = np.abs(monomer_angles - face_angle)
-            within_wiggle = angle_diff < wiggle
-            face_matches = np.where(within_wiggle)[0]
-            mono_in_faces.append(face_matches)
+    # ------------------------------------------------------------------ candidates, per thin
+    # The union of a thin filament's face lists, ascending. thin.bound_to is
+    # stored per candidate (only a candidate can ever be bound), so the
+    # per-step binding bookkeeping scales with the candidates, not with every
+    # monomer. mono_cand inverts it, -1 for a monomer no face admits.
+    cand_mono = [np.unique(np.concatenate(thin_faces)) for thin_faces in faces]
+    assert len({len(c) for c in cand_mono}) == 1, "thin filaments differ in candidate count"
+    cand_mono = np.stack(cand_mono).astype(np.int32)                  # (n_thin, n_cand)
+    mono_cand = np.full((n_thin, n_mono), -1, dtype=np.int32)
+    np.put_along_axis(mono_cand, cand_mono,
+                      np.tile(np.arange(cand_mono.shape[1], dtype=np.int32), (n_thin, 1)), axis=1)
 
-        offsets_by_face = [monomer_offsets_this[mono_ind] for mono_ind in mono_in_faces]
+    # ------------------------------------------------------------------ nodes
+    # An even grid from the Z-disc, the same for every thin filament, so one
+    # thin factorization serves the whole lattice. Node j sits
+    # thin_node_spacing * (n_nodes - j) from the Z-disc, and the grid reaches
+    # the longest filament's last monomer; a node beyond a shorter filament's
+    # last monomer is an unloaded free end.
+    spacing = np.float32(thin_node_spacing)
+    n_nodes = int(np.ceil(float(mono_offsets.max()) / float(spacing)))
+    node_offsets = np.tile(spacing * (n_nodes - np.arange(n_nodes, dtype=np.float32)), (n_thin, 1))
+    node_rests = np.full((n_thin, n_nodes), spacing, dtype=np.float32)
+    mono_node, mono_xi = _interpolate_monomers(mono_offsets, node_offsets)
 
-        if len(offsets_by_face) > 0 and any(len(f) > 0 for f in offsets_by_face):
-            offsets_flat = np.sort(np.hstack(offsets_by_face))[::-1]
-        else:
-            offsets_flat = monomer_offsets_this[::-1]
+    # ------------------------------------------------------------------ tropomyosin units
+    if tm_monomers_per_unit is None:
+        # One unit per binding candidate, on the candidate's strand; every other
+        # monomer maps to the nearest unit on its own strand (never read by the
+        # kinetics, since only candidates can be bound).
+        assert all(sum(len(f) for f in thin_faces) == cand_mono.shape[1] for thin_faces in faces), \
+            "a monomer is a candidate for two faces"
+        tm_rep_mono = cand_mono
+        tm_chains = tm_rep_mono % 2
+        mono_tm = _nearest_same_strand_unit(mono_offsets, mono_strand, tm_rep_mono, tm_chains)
+    else:
+        mono_tm, tm_chains, tm_rep_mono = _tropomyosin_units(
+            mono_offsets, mono_strand, tm_monomers_per_unit)
+    tm_prev_neighbor, tm_next_neighbor = _same_strand_neighbours(tm_chains)
 
-        tm_chain_this_thin = []
-        for offset in offsets_flat:
-            mono_idx_matches = np.where(np.abs(monomer_offsets_this - offset) < 1e-6)[0]
-            if len(mono_idx_matches) > 0:
-                mono_index = mono_idx_matches[0]
-            else:
-                mono_index = 0
-            tm_chain_this_thin.append(mono_index % 2)
+    return dict(
+        mono_offsets=mono_offsets, mono_angle=mono_angle, mono_strand=mono_strand,
+        mono_node=mono_node, mono_xi=mono_xi, mono_tm=mono_tm,
+        face_to_monomers=face_to_monomers, n_mono_per_face=n_mono_per_face,
+        cand_mono=cand_mono, mono_cand=mono_cand,
+        node_offsets=node_offsets, node_rests=node_rests,
+        tm_chains=tm_chains, tm_prev_neighbor=tm_prev_neighbor,
+        tm_next_neighbor=tm_next_neighbor, tm_rep_mono=tm_rep_mono,
+    )
 
-        # Topological same-chain neighbors: each site's nearest predecessor/successor
-        # within its own chain's own axial ordering (offsets_flat is already axially
-        # sorted, and tm_chain_this_thin was built by iterating it in order, so the
-        # indices where chain==c are already that chain's axial ordering). Chain
-        # endpoints self-reference (no real neighbor on that side) rather than using
-        # -1, since NumPy silently wraps -1 to the last element on gather.
-        n_sites_this_thin = len(offsets_flat)
-        chain_arr = np.array(tm_chain_this_thin, dtype=np.int32)
-        prev_neighbor = np.arange(n_sites_this_thin, dtype=np.int32)
-        next_neighbor = np.arange(n_sites_this_thin, dtype=np.int32)
+
+def _max_candidates_per_unit(cand_mono: np.ndarray, mono_tm: np.ndarray, n_tm: int) -> int:
+    """The most binding candidates any tropomyosin unit covers = the most heads that can be bound
+    on one unit at once (a candidate holds at most one head). Sets how many lock levels
+    (1 + xb_tm_K2)^n the tropomyosin generator needs; static, so it is an aux field."""
+    counts = np.zeros((cand_mono.shape[0], n_tm), dtype=np.int64)
+    for t in range(cand_mono.shape[0]):
+        m = cand_mono[t][cand_mono[t] >= 0]
+        np.add.at(counts[t], mono_tm[t, m], 1)
+    return int(counts.max())
+
+
+def _interpolate_monomers(mono_offsets: np.ndarray, node_offsets: np.ndarray):
+    """Where each monomer sits on the node grid: (mono_node, mono_xi).
+
+    A monomer between node e and node e+1 (toward the Z-disc; index n_nodes is
+    the Z-disc anchor at offset 0) takes the displacement
+    (1 - xi) * u[e] + xi * u[e+1]. Computed in float64 from the rest offsets, so
+    a monomer that coincides with a node gets xi = 0 exactly. A monomer on the
+    M-line side of node 0 clamps to (0, 0) and follows node 0 rigidly.
+    """
+    n_thin, n_mono = mono_offsets.shape
+    n_nodes = node_offsets.shape[1]
+    grid = np.concatenate([node_offsets.astype(np.float64), np.zeros((n_thin, 1))], axis=1)
+    off = mono_offsets.astype(np.float64)
+    mono_node = np.empty((n_thin, n_mono), dtype=np.int32)
+    mono_xi = np.empty((n_thin, n_mono), dtype=np.float32)
+    for t in range(n_thin):
+        e = np.clip(np.searchsorted(-grid[t], -off[t], side='right') - 1, 0, n_nodes - 1)
+        xi = (grid[t, e] - off[t]) / (grid[t, e] - grid[t, e + 1])
+        mono_node[t] = e
+        mono_xi[t] = np.clip(xi, 0.0, 1.0)
+    return mono_node, mono_xi
+
+
+def _same_strand_neighbours(tm_chains: np.ndarray):
+    """Adjacent unit on the same strand, in index order, for every unit.
+
+    Units must be indexed in axial order within each strand. Strand ends
+    self-reference rather than using -1, since a -1 index silently wraps to the
+    last element on gather.
+    """
+    n_thin, n_tm = tm_chains.shape
+    prev_neighbor = np.tile(np.arange(n_tm, dtype=np.int32), (n_thin, 1))
+    next_neighbor = prev_neighbor.copy()
+    for t in range(n_thin):
         for c in (0, 1):
-            chain_site_indices = np.where(chain_arr == c)[0]
-            for k in range(1, len(chain_site_indices)):
-                prev_neighbor[chain_site_indices[k]] = chain_site_indices[k - 1]
-            for k in range(len(chain_site_indices) - 1):
-                next_neighbor[chain_site_indices[k]] = chain_site_indices[k + 1]
+            idx = np.where(tm_chains[t] == c)[0]
+            prev_neighbor[t, idx[1:]] = idx[:-1]
+            next_neighbor[t, idx[:-1]] = idx[1:]
+    return prev_neighbor, next_neighbor
 
-        node_index_by_face = []
-        for face_offsets in offsets_by_face:
-            site_indices = []
-            for offset in face_offsets:
-                idx = np.where(np.abs(offsets_flat - offset) < 1e-6)[0]
-                if len(idx) > 0:
-                    site_indices.append(idx[0])
-            node_index_by_face.append(np.array(site_indices, dtype=np.int32))
 
-        if len(offsets_flat) > 1:
-            rests = offsets_flat[:-1] - offsets_flat[1:]
-            rests = np.append(rests, offsets_flat[-1])
-        else:
-            rests = np.array([offsets_flat[0] if len(offsets_flat) > 0 else rise], dtype=np.float32)
+def _nearest_same_strand_unit(mono_offsets, mono_strand, tm_rep_mono, tm_chains):
+    """(n_thin, n_mono) index of the unit on each monomer's strand whose
+    representative monomer is axially nearest to it."""
+    n_thin, n_mono = mono_offsets.shape
+    rep_off = np.take_along_axis(mono_offsets, tm_rep_mono, axis=1).astype(np.float64)
+    mono_tm = np.empty((n_thin, n_mono), dtype=np.int32)
+    for t in range(n_thin):
+        for c in (0, 1):
+            units = np.where(tm_chains[t] == c)[0]
+            mono = np.where(mono_strand[t] == c)[0]
+            d = np.abs(mono_offsets[t][mono][:, None].astype(np.float64) - rep_off[t][units][None, :])
+            mono_tm[t, mono] = units[np.argmin(d, axis=1)]
+    return mono_tm
 
-        n_sites_this_face = [len(sites) for sites in node_index_by_face]
 
-        offsets_list.append(offsets_flat.astype(np.float32))
-        rests_list.append(rests.astype(np.float32))
-        all_face_to_sites.append(node_index_by_face)
-        all_n_sites_per_face.append(n_sites_this_face)
-        all_tm_chains.append(chain_arr)
-        all_tm_prev_neighbor.append(prev_neighbor)
-        all_tm_next_neighbor.append(next_neighbor)
+def _tropomyosin_units(mono_offsets: np.ndarray, mono_strand: np.ndarray, per_unit: int):
+    """Partition every strand's monomers into tropomyosin units.
 
-    max_sites = max(len(offsets) for offsets in offsets_list)
+    A unit is per_unit consecutive monomers on one strand, counted from the
+    monomer nearest the Z-disc; a strand whose length is not a multiple of
+    per_unit ends in one short unit at the pointed end. Units are indexed strand
+    by strand, and within a strand from the pointed end toward the Z-disc — the
+    same direction as the node index, and the axial order
+    _same_strand_neighbours relies on.
 
-    return (offsets_list, rests_list, all_face_to_sites, all_n_sites_per_face, all_tm_chains, max_sites,
-            all_tm_prev_neighbor, all_tm_next_neighbor)
+    Returns:
+        mono_tm: (n_thin, n_mono) int32 unit covering each monomer
+        tm_chains: (n_thin, n_tm) int32 strand of each unit
+        tm_rep_mono: (n_thin, n_tm) int32 the unit's fourth monomer from its
+            Z-disc end (its last, for a unit shorter than that)
+    """
+    n_thin, n_mono = mono_offsets.shape
+    assert n_mono % 2 == 0, "the two strands must hold equal monomer counts"
+    per_strand = -(-(n_mono // 2) // per_unit)
+    mono_tm = np.empty((n_thin, n_mono), dtype=np.int32)
+    tm_rep_mono = np.empty((n_thin, 2 * per_strand), dtype=np.int32)
+    tm_chains = np.tile(np.repeat(np.arange(2, dtype=np.int32), per_strand), (n_thin, 1))
+    for t in range(n_thin):
+        for c in (0, 1):
+            mono = np.where(mono_strand[t] == c)[0]
+            mono = mono[np.argsort(mono_offsets[t, mono], kind='stable')]   # Z-disc end first
+            group = np.arange(len(mono)) // per_unit
+            unit = c * per_strand + (per_strand - 1 - group)
+            mono_tm[t, mono] = unit
+            for g in range(per_strand):
+                members = mono[group == g]
+                tm_rep_mono[t, c * per_strand + per_strand - 1 - g] = members[min(3, len(members) - 1)]
+    return mono_tm, tm_chains, tm_rep_mono
 
 
 # =============================================================================
@@ -1376,12 +1313,11 @@ _LEGACY_FACE_PATTERN = np.array([[0, 2, 4], [1, 3, 5], [0, 2, 4]])  # Level 1, 2
 
 def _compute_flat_index_maps_fixed_width(
     thick_to_thin: np.ndarray,
-    face_to_sites: np.ndarray,
-    n_sites_per_face: np.ndarray,
+    face_to_monomers: np.ndarray,
+    n_mono_per_face: np.ndarray,
     thick_starts: np.ndarray,
     n_thick: int,
     n_crowns: int,
-    max_sites_per_face: int,
     n_xb_per_crown: int,
     crown_rotation_deg: float,
     crown_face_wiggle_deg: float,
@@ -1389,7 +1325,7 @@ def _compute_flat_index_maps_fixed_width(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Convert nested Thick->Face->Thin to flat XB->Thin maps with fixed-width arrays.
 
-    KEY OPTIMIZATION: xb_to_site_indices has shape (total_xbs, max_sites_per_face)
+    KEY OPTIMIZATION: xb_to_mono_indices has shape (total_xbs, max_mono_per_face)
     which is CONSTANT across all XBs. This enables:
     - Single unified jnp.take Gather operation
     - No dynamic-size slicing per XB
@@ -1426,8 +1362,8 @@ def _compute_flat_index_maps_fixed_width(
     Returns:
         xb_to_thin_id: (total_xbs,) - Target thin filament for each XB
         xb_to_thin_face: (total_xbs,) - Target thin face for each XB
-        xb_to_site_indices: (total_xbs, max_sites_per_face) - FIXED-WIDTH site indices
-            Padded with neutral value (first valid site) for GPU parallelization
+        xb_to_mono_indices: (total_xbs, max_mono_per_face) - FIXED-WIDTH candidate monomers
+            Padded with neutral value (first candidate) for GPU parallelization
         xb_valid: (total_xbs,) bool - False where the XB has no real geometric
             thin-filament partner this crown (face didn't match, or the thick
             filament genuinely has no neighbor there). Always True for the
@@ -1435,10 +1371,11 @@ def _compute_flat_index_maps_fixed_width(
             binding rate on this — it is NOT enforced here.
     """
     total_xbs = n_thick * n_crowns * n_xb_per_crown
+    max_mono_per_face = face_to_monomers.shape[2]
 
     xb_to_thin_id = np.zeros(total_xbs, dtype=np.int32)
     xb_to_thin_face = np.zeros(total_xbs, dtype=np.int32)
-    xb_to_site_indices = np.zeros((total_xbs, max_sites_per_face), dtype=np.int32)
+    xb_to_mono_indices = np.zeros((total_xbs, max_mono_per_face), dtype=np.int32)
     xb_valid = np.ones(total_xbs, dtype=bool)
 
     for xb_idx in range(total_xbs):
@@ -1482,21 +1419,21 @@ def _compute_flat_index_maps_fixed_width(
         xb_to_thin_face[xb_idx] = thin_face
 
         # FIXED-WIDTH: Copy all site indices, pad with first site for unused slots
-        n_valid = n_sites_per_face[thin_idx, thin_face]
-        site_indices = face_to_sites[thin_idx, thin_face, :]
+        n_valid = n_mono_per_face[thin_idx, thin_face]
+        mono_indices = face_to_monomers[thin_idx, thin_face, :]
 
-        # Get first valid site for padding (or 0 if no valid sites)
-        first_valid = site_indices[0] if n_valid > 0 else 0
+        # Get first candidate for padding (or 0 if no valid sites)
+        first_valid = mono_indices[0] if n_valid > 0 else 0
 
-        # Pad invalid slots with first valid site (neutral for distance calculation)
+        # Pad invalid slots with first candidate (neutral for distance calculation)
         padded_indices = np.where(
-            np.arange(max_sites_per_face) < n_valid,
-            site_indices,
+            np.arange(max_mono_per_face) < n_valid,
+            mono_indices,
             first_valid
         )
-        xb_to_site_indices[xb_idx] = padded_indices
+        xb_to_mono_indices[xb_idx] = padded_indices
 
-    return xb_to_thin_id, xb_to_thin_face, xb_to_site_indices, xb_valid
+    return xb_to_thin_id, xb_to_thin_face, xb_to_mono_indices, xb_valid
 
 
 # =============================================================================
@@ -1518,7 +1455,7 @@ if __name__ == "__main__":
     print(f"  thick_to_thin shape: {geometry.thick_to_thin.shape}")
     print(f"  thin_to_thick shape: {geometry.thin_to_thick.shape}")
     print(f"  xb_to_thin_id shape: {geometry.xb_to_thin_id.shape}")
-    print(f"  xb_to_site_indices shape: {geometry.xb_to_site_indices.shape}")
+    print(f"  xb_to_mono_indices shape: {geometry.xb_to_mono_indices.shape}")
 
     # Test 2: PyTree roundtrip
     print("\nTest 2: PyTree flatten/unflatten")

@@ -93,7 +93,7 @@ def kinetics_step(state: 'State',
         (state_after_kinetics, new_rng_key, trace)
 
         trace is a KineticsTrace: the MID state (after thin_transitions, before
-        thick_transitions), the drivers it ran at, the subpopulation tuple,
+        thick_transitions), the drivers it ran at, the binned generator
         and the closure-tear mask. Everything a metric
         needs to describe the step that actually happened, gathered once here
         rather than re-derived — see core/state.KineticsTrace.
@@ -131,8 +131,7 @@ def kinetics_step(state: 'State',
     # and `bins` together are exactly the step thick_transitions is about to
     # take. A metric that describes that step has to read these, or it describes
     # a step that never happened.
-    trace = KineticsTrace(state=state, drivers=drivers,
-                          xb_subpop=xb_subpop, torn=torn, xb_bins=bins)
+    trace = KineticsTrace(state=state, drivers=drivers, torn=torn, xb_bins=bins)
 
     # Step 4: Thick filament transitions
     rng_key, thick_key = jax.random.split(rng_key)
@@ -193,7 +192,7 @@ def timestep(state: 'State',
         n_iters: Newton iterations taken, useful for spotting configurations
             where the solve is struggling.
         trace: KineticsTrace for this step — the mid state, the pre-solve
-            drivers, the subpopulation tuple and the closure-tear mask. Feed it straight to compute_all_metrics. Within-step only;
+            drivers, the binned generator and the closure-tear mask. Feed it straight to compute_all_metrics. Within-step only;
             never carry it through a scan. See kinetics_step.
         solver_residual_norm: max(|F| / tol_vec), dimensionless. <= 1 means
             converged, in BOTH lattice-spacing modes.

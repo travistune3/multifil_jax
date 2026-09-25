@@ -93,7 +93,7 @@ topo_vert = jax.device_put(topo_vert)
 
 # Create parameter sweep values
 thick_sweep = [float(dynamic.thick_k) * (i * 0.5) for i in range(1, 20)]
-thin_sweep = [float(dynamic.thin_k) * (i * 0.5) for i in range(1, 20)]
+thin_sweep = [float(dynamic.thin_EA) * (i * 0.5) for i in range(1, 20)]
 titin_sweep = [float(dynamic.titin_b) * (i * 0.5) for i in range(1, 20)]
 
 print("Compiling + executing sweep...")
@@ -107,7 +107,7 @@ results_vertebrate = run(
     dt=1.0,
     dynamic_params={
         'thick_k': thick_sweep,
-        'thin_k': thin_sweep,
+        'thin_EA': thin_sweep,
         'titin_b': titin_sweep,
     },
     replicates=1,

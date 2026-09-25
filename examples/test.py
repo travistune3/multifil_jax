@@ -93,7 +93,7 @@ topo = jax.device_put(topo)
 
 # Stiffnesses
 # thick_sweep = [float(dynamic.thick_k) * (i * 0.5) for i in range(1, 10)]
-# thin_sweep = [float(dynamic.thin_k) * (i * 0.5) for i in range(1, 10)]
+# thin_sweep = [float(dynamic.thin_EA) * (i * 0.5) for i in range(1, 10)]
 # titin_sweep = [float(dynamic.titin_b) * (i * 0.5) for i in range(1, 10)]
 # xb_c_k_strong_sweep = [float(dynamic.xb_c_k_strong) * (i * 0.5) for i in range(1, 10)]
 # xb_g_k_strong_sweep = [float(dynamic.xb_g_k_strong) * (i * 0.5) for i in range(1, 10)]
@@ -122,7 +122,7 @@ results = run(
         # 'xb_r40': xb_r51_sweep,
         # 'xb_srx_ca50': xb_srx_b_sweep,
         # 'thick_k': thick_sweep,
-        # 'thin_k': thin_sweep,
+        # 'thin_EA': thin_sweep,
         # 'titin_b': titin_sweep,
         # 'xb_c_k_strong': xb_c_k_strong_sweep,
         # 'xb_g_k_strong': xb_g_k_strong_sweep,
@@ -216,11 +216,11 @@ topo_4x4 = SarcTopology.create(nrows=4,
 topo_4x4 = jax.device_put(topo_4x4)
 
 thick_sweep = [float(dynamic.thick_k) * (i * 0.25) for i in range(1, 16)]
-thin_sweep = [float(dynamic.thin_k) * (i * 0.25) for i in range(1, 16)]
+thin_sweep = [float(dynamic.thin_EA) * (i * 0.25) for i in range(1, 16)]
 
 print(f"15x15 sweep = {len(thick_sweep) * len(thin_sweep)} runs")
 # result = run(topo_4x4, pCa=4, z_line=1100, lattice_spacing=14,
-#              duration_ms=1000, dynamic_params={'thick_k': thick_sweep, 'thin_k': thin_sweep})
+#              duration_ms=1000, dynamic_params={'thick_k': thick_sweep, 'thin_EA': thin_sweep})
 
 
 #%%
