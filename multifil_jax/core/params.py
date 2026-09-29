@@ -1466,7 +1466,7 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams, float, float]:
     pseudo-repeats bracket that mean: 14 is ~1 SD short, 15 is ~1.3 SD long. thin_EA is per unit
     length, so the shorter filament keeps the same stiffness per unit length and
     is stiffer overall. At the cardiac operating point the thin filament still passes the
-    M-line (by 108 nm at z_line 900), so thin_thin_overlap_screening acts here. Cardiac
+    M-line (by 58 nm at z0 = 950), so thin_thin_overlap_screening acts here. Cardiac
     myosin (beta-MHC) cycles several times more slowly than fast skeletal
     myosin, cardiac troponin C releases calcium faster, and cardiac titin is
     the shorter, stiffer N2B isoform.
@@ -1481,10 +1481,40 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams, float, float]:
     gate, not from the tropomyosin coupling.
 
     OPERATING POINT: cardiac sarcomeres work short, 900-1100 nm z-line
-    (SL 1.8-2.2 µm):
+    (SL 1.8-2.2 µm). z0 = 950 (SL 1.9 µm) is the point d0 was set for:
 
         static, dynamic, z0, d0 = get_cardiac_params()
-        result = run(topo, pCa=4.5, z_line=950.0, lattice_spacing=d0)   # SL ~1.9 µm
+        result = run(topo, pCa=4.5, z_line=z0, lattice_spacing=d0)
+
+    CROSSBRIDGE GEOMETRY — an INTACT lattice, set as one consistent group (the
+    spacing, the rests and the springs are not independent; change them together):
+      d0 = 10.3 nm   [G] surface-to-surface gap of intact cardiac muscle at SL 1.9 µm,
+          range ~9.7-11.7. The skeletal 14.0 is a SKINNED lattice (d10 ~40.5 nm),
+          which swells on skinning; Linari 2007 restore the pre-skinning spacing
+          with dextran. No measured cardiac d10 is in hand, so this is an estimate.
+          Conversion d = (2/3)*d10 - 13 (Brenner 1996 Eq. 2, radii 8 + 5).
+      Rest heights: every polar rest is the zero-force point, d_rest =
+          g_rest*sin(c_rest). Strong and tight_1 heads sit at 11.27 nm = Xu 1993
+          Table 3 MgADP d10 36.4 nm (skinned rabbit psoas, 170 mM) through the
+          conversion above. The weak head sits at 11.20 nm: Brenner 1996's weak
+          12.0 nm at 80 mM, lowered 0.8 nm (their rigor 13.0 at 80 mM vs Xu's
+          rigor d10 37.8 -> 12.2 at 170 mM). The axial offsets are the skeletal
+          ones scaled by 0.7289 so the stroke stays 5.84 nm; the second step
+          (tight_1 -> strong) is then 1.20 nm without being targeted.
+      Strong springs: g_k 2.2578 pN/nm, c_k 18.0634 pN·nm/rad (skeletal 5 / 40
+          scaled together, which leaves every rest unmoved) give an axial TANGENT
+          stiffness of 1.50 pN/nm at 5.02 pN. Linari 2007 define e as the
+          stiffness of one attached head, measured as a tangent on the isometric
+          plateau; their derived per-head values span 1.21-1.72 pN/nm, and 5.02 pN
+          is their Table 5 isometric force per head at 13.5 C (rabbit psoas).
+      target_zone_wiggle = 26 deg [I]: the skeletal 15 deg offers one monomer per
+          36 nm crossover per face, so heads bind far from their weak optimum.
+          Steffen 2001 measure an angular half-width of 31 deg in vitro ("which
+          accommodates three monomers"); 26 deg takes most of that widening and
+          matches the Lethocerus preset.
+      Weak springs 4x skeletal [G]: with the wider window, stiffer weak springs stop
+          heads binding behind the weak zero-force point without losing the
+          attached fraction; at 15 deg the same stiffening costs attachment.
 
     UNVERIFIED: the shared default tm_J_M = 2.70 was calibrated against a cardiac
     force-pCa target, but that calibration is not confirmed — see the tm_J_M
@@ -1609,9 +1639,25 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams, float, float]:
                                   #     2026-08-19). 8 is interpolated, not sourced.
         'titin_rest': 140.0,      # exponent offset; value from a slack length
                                   # measured at SL 1.85 µm (z=925 → L≈138 nm)
+        # Crossbridge geometry for an INTACT lattice at d0 = 10.3 (see CROSSBRIDGE
+        # GEOMETRY above). Each rest keeps the skeletal axial offset
+        # x_rest = g_rest*cos(c_rest), scaled by 0.7289 so the stroke stays 5.84 nm,
+        # and moves only the height d_rest = g_rest*sin(c_rest).
+        'xb_g_rest_weak': 17.5808,       # [I] d_rest 11.20 nm, x_rest 13.53
+        'xb_c_rest_weak': 0.6906753,
+        'xb_g_rest_tight_1': 14.1077,    # [M] d_rest 11.27 nm (Xu 1993 MgADP), x_rest 8.49
+        'xb_c_rest_tight_1': 0.9253923,
+        'xb_g_rest_strong': 13.3433,     # [M] d_rest 11.27 nm, shared with tight_1, x_rest 7.14
+        'xb_c_rest_strong': 1.0058527,
+        'xb_g_k_tight_1': 2.2578,        # [I] tangent axial stiffness 1.50 pN/nm at 5.02 pN
+        'xb_c_k_tight_1': 18.0634,       #     (Linari 2007), both springs scaled together
+        'xb_g_k_strong': 2.2578,
+        'xb_c_k_strong': 18.0634,
+        'xb_g_k_weak': 1.6,              # [G] 4x skeletal: with the 26 deg window, removes
+        'xb_c_k_weak': 32.0,             #     binding behind the weak zero-force point
     }
-    return (StaticParams(n_polymers_per_thin=14), DynamicParams(**cardiac_overrides),
-            900.0, 14.0)
+    return (StaticParams(n_polymers_per_thin=14, target_zone_wiggle=float(np.radians(26.0))),
+            DynamicParams(**cardiac_overrides), 950.0, 10.3)
 
 
 def get_lethocerus_params() -> Tuple[StaticParams, DynamicParams, float, float]:

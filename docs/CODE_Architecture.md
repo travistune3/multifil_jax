@@ -154,12 +154,12 @@ result = run(topo, pCa=4.5, **drv, K_lat=5.0, nu=0.5, duration_ms=500)
 ### Species presets
 
 `core/params.py` ships four `(StaticParams, DynamicParams, z0, d0)` factories
-(z0 = natural z_line, d0 = lattice spacing, both nm; all four currently 900 / 14):
+(z0 = natural z_line, d0 = lattice spacing, both nm; cardiac 950 / 10.3, the others 900 / 14):
 
 | Factory | Geometry | Notes |
 |---------|----------|-------|
 | `get_skeletal_params()` | vertebrate | fast-twitch skeletal, ~26 °C — the defaults |
-| `get_cardiac_params()` | vertebrate | cardiac rate/titin overrides |
+| `get_cardiac_params()` | vertebrate | cardiac rate/titin overrides; intact-lattice XB geometry (d0 10.3, 26° window, own rests and springs), thin 1008 nm |
 | `get_lethocerus_params()` | invertebrate | IFM: 1:3 lattice, 4 XB/crown, `n_crowns=100` |
 | `get_drosophila_params()` | invertebrate | Lethocerus + `n_superlattice_classes=3` |
 
