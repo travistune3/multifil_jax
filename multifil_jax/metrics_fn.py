@@ -314,6 +314,14 @@ def compute_all_metrics(
     # metric reads the mid state.
     new_xb = new_state.thick.xb_states
     mid_xb = trace.state.thick.xb_states
+    
+    """Used for checking SRX->DRX rate"""
+    srx_start = mid_xb == 5
+    srx_recruited = jnp.sum(srx_start & (new_xb == 0)).astype(jnp.float32)
+    srx_expected = jnp.sum(jnp.where(srx_start, trace.lda.release_probability, 0.0))
+    n_srx_start = jnp.sum(srx_start)
+    mean_p_srx = jnp.where(n_srx_start > 0, srx_expected / jnp.maximum(n_srx_start, 1), 0.0)
+    
     new_tm = new_state.thin.tm_states
 
     z_line = drivers.z_line
@@ -538,6 +546,16 @@ def compute_all_metrics(
     return MetricsDict({
         # Driver / protocol values
         'axial_force': force,
+        # Updated 09/30 LDA recruitment
+        'lda_enabled': constants.lda_enabled,
+        'lda_crown_strain_mean': jnp.mean(trace.lda.crown_strain),
+        'lda_source_mean': jnp.mean(trace.lda.source_signal),
+        'lda_neighbor_mean': jnp.mean(trace.lda.neighbor_signal),
+        'srx_count_before_transition': n_srx_start,
+        'srx_release_probability_mean': mean_p_srx,
+        'srx_recruited': srx_recruited,
+        'srx_recruitment_expected': srx_expected,
+        
         'solver_residual': solver_residual,
         # Raw max|F| above, in pN, kept unchanged. The two below are what make
         # it readable: `solver_tolerance` gives it a physical scale, and

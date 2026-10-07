@@ -1111,6 +1111,12 @@ _DYNAMIC_DEFAULTS = {
                                # 0.14-0.22 pN). Scale-free, so it means the same
                                # thing across a 1000x stiffness sweep — which an
                                # absolute pN target does not
+    
+    # Mechanical recruitment: illustrative, uncalibrated defaults.
+    'lda_enabled': 0.0,             # exactly 0 (off) or 1 (on)
+    'lda_strain_half': 1.0e-3,      # dimensionless strain
+    'lda_p_max': 0.10,              
+    'lda_dt_ref_ms': 1.0,           
 }
 
 # Field order for tree_flatten/unflatten (Python 3.7+ preserves dict order)

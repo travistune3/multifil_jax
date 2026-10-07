@@ -247,6 +247,7 @@ class KineticsTrace(NamedTuple):
     drivers: Drivers
     torn: jnp.ndarray
     xb_bins: object
+    lda: object     # LDA Signals used for this step; not carried across time
 
 
 class MetricsDict(dict):

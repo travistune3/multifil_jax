@@ -70,6 +70,7 @@ Tanner BCW, Regnier M, Daniel TL (2012), "Filament compliance influences
 import jax
 import jax.numpy as jnp
 import jax.scipy as jsp
+from multifil_jax.kernels.lda import apply_srx_probability
 from typing import Tuple, Dict, NamedTuple, Optional, Union, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -1223,7 +1224,7 @@ def xb_rate_matrix(xb_distances: jnp.ndarray,
     r04 = xb_rate_04(r04_rate) * ones
 
     # 5 SRX <-> 0 DRX : thick-filament regulation; r50 is the Ca-dependent one
-    r50 = xb_rate_50(ca_concentration, srx_k0, srx_kmax, srx_b, srx_ca50) * ones
+    r50 = jnp.zeros_like(ones)  # Close Calciuam activaed SRX -> DRX
     r05 = xb_rate_05(r05_rate) * ones
 
     # Diagonal rates: row sums must be zero for valid rate matrices
@@ -1671,8 +1672,12 @@ def thick_transitions(state: 'State',
                      bins: XBBins,
                      topology: 'SarcTopology',
                      rng_key: jax.random.PRNGKey,
-                     random_values: Optional[jnp.ndarray] = None):
-    """Advance every crossbridge one timestep, and update what it is bound to.
+                     random_values: Optional[jnp.ndarray] = None,
+                     *,
+                     srx_release_probability):
+    """Advance every crossbridge one timestep, and update what it is bound to. 
+
+    ***Removed Calcium activation for SRX->DRX
 
     Two things happen here, and the second is easy to overlook: heads sample new
     states from their transition probability matrices, AND the binding
@@ -1717,6 +1722,7 @@ def thick_transitions(state: 'State',
 
     # Get probability vectors — index directly into P_all using current state
     prob_vectors = jax.vmap(lambda P, s: P[s])(P_all, current_states)  # (n_xb_total, 6)
+    prob_vectors = apply_srx_probability(prob_vectors, current_states, srx_release_probability)
 
     # Get permissiveness and binding info (needed for binding logic below)
     xb_nearest_bs = state.thick.xb_nearest_bs

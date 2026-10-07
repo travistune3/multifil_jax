@@ -89,6 +89,7 @@ from multifil_jax.kernels.forces import axial_force_at_mline
 from multifil_jax.timestep import timestep
 from multifil_jax.metrics_fn import compute_all_metrics
 from multifil_jax.core.subpopulation import Subpopulation, generate_random_masks_batch
+from multifil_jax.kernels.lda import validate_lda_params
 
 
 # =============================================================================
@@ -622,6 +623,11 @@ def _run_sim_kernel(
         # Start relaxed: every head drawn from its own resting distribution. The
         # draw has its own stream, folded off the sim's key, so the scan's key
         # is untouched.
+
+        # Keep the structural initial state from realize_state (all DRX).
+        # The caller must prepend a low-Ca equilibration phase to the SAME run.
+        # Do not call xb_rest_states: its Q no longer contains mechanical release.
+        # This is a numerical starting state, not the measurement initial state.
         state = xb_rest_states(state, constants, topology, z_trace[0], ls_trace[0],
                                jax.random.fold_in(b.rng_keys, 0), xb_subpop)
 
@@ -975,6 +981,13 @@ def run(
         return jnp.full(total_batch, float(getattr(base_dynamic, name)))
 
     batched_params = DynamicParams(**{name: _param(name) for name in DYNAMIC_FIELDS})
+    validate_lda_params(batched_params)
+    if not np.isfinite(dt) or dt <= 0:
+        raise ValueError("dt must be finite and positive")
+    rest_positions = np.asarray(topology.crown_offsets)
+    if (not np.all(np.isfinite(rest_positions))
+            or np.any(np.diff(rest_positions, axis=-1) <= 0)):
+        raise ValueError("Crown reference positions must be finite and increasing")
 
     # Subpopulation resolution → two static args + per-sim batched arrays.
     subpop_mode, scaled_field_names, subpop_arrays = _resolve_subpopulation(

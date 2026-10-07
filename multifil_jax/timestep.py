@@ -54,6 +54,7 @@ from multifil_jax.kernels.transitions import (thin_transitions, thick_transition
                                               xb_binned_generator)
 from multifil_jax.kernels.solver import solve_equilibrium
 from multifil_jax.core.state import Drivers, KineticsTrace
+from multifil_jax.kernels.lda import mechanical_srx_signals
 
 if TYPE_CHECKING:
     from multifil_jax.core.sarc_geometry import SarcTopology
@@ -105,6 +106,9 @@ def kinetics_step(state: 'State',
         THE TRACE IS A WITHIN-STEP VALUE. It holds a whole State, so it must
         never be put in a scan carry or a scan output.
     """
+    # Mechanical recruitment reads the force-balanced state carried in.
+    lda = mechanical_srx_signals(state, topology, constants, dt)
+
     # Step 1: Update nearest binding sites using topology
     state = update_nearest_neighbors(state, topology, drivers.z_line,
                                      drivers.lattice_spacing)
@@ -131,11 +135,11 @@ def kinetics_step(state: 'State',
     # and `bins` together are exactly the step thick_transitions is about to
     # take. A metric that describes that step has to read these, or it describes
     # a step that never happened.
-    trace = KineticsTrace(state=state, drivers=drivers, torn=torn, xb_bins=bins)
+    trace = KineticsTrace(state=state, drivers=drivers, torn=torn, xb_bins=bins, lda=lda)
 
     # Step 4: Thick filament transitions
     rng_key, thick_key = jax.random.split(rng_key)
-    state = thick_transitions(state, bins, topology, thick_key)
+    state = thick_transitions(state, bins, topology, thick_key, srx_release_probability=lda.release_probability,)
 
     return state, rng_key, trace
 
