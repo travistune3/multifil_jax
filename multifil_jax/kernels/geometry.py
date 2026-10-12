@@ -224,13 +224,11 @@ def update_nearest_neighbors(
     # Flatten thick base positions (each crown has n_xb_per_crown XBs)
     xb_base_positions = jnp.repeat(thick_pos, n_xb_per_crown, axis=1).reshape(-1)
 
-    # The myosin head reaches ~13 nm axially from its crown, so the SEARCH is
-    # done from the reaching head position. The distance recorded below is
-    # measured from the crown base instead — see the module docstring.
-    # [G] 13.0 nm is an unsourced structural estimate of S1 reach, consistent
-    # with the head's rest length but not independently calibrated. It is also
-    # used, by reference, to bound the overlap zone in metrics_fn.py.
-    xb_head_positions = xb_base_positions + 13.0
+    # The SEARCH is done from the reaching head position (StaticParams.xb_head_reach
+    # past its crown; the overlap-zone metrics use the same value). The distance
+    # recorded below is measured from the crown base instead — see the module
+    # docstring.
+    xb_head_positions = xb_base_positions + topology.static.xb_head_reach
 
     # Pre-gather n_mono_per_face for each XB
     n_mono_per_face_flat = topology.n_mono_per_face[
@@ -282,15 +280,15 @@ update_nearest_neighbors_with_geometry = update_nearest_neighbors
 if __name__ == "__main__":
     import numpy as np
     from multifil_jax.core.sarc_geometry import SarcTopology
-    from multifil_jax.core.params import get_skeletal_params
+    from multifil_jax.core.params import get_params
 
     print("Testing geometry module...")
     print("="*60)
 
     # Create test state using SarcTopology
-    static_params, dynamic_params, *_ = get_skeletal_params()
+    static_params, dynamic_params, *_ = get_params('skeletal')
     np.random.seed(42)
-    geometry = SarcTopology.create(nrows=2, ncols=2, static_params=static_params, dynamic_params=dynamic_params)
+    geometry = SarcTopology.create(2, 2, static_params)
 
     print(f"\nSarcTopology created: {geometry}")
     print(f"  total_xbs: {geometry.total_xbs}")

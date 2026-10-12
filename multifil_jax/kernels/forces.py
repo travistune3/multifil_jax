@@ -88,7 +88,7 @@ def compute_thick_passive_forces_single(
     titin_a: float,
     titin_b: float,
     titin_rest: float,
-    n_titin: int = 6
+    n_titin: int,
 ) -> jnp.ndarray:
     """Net axial force on each crown of one thick filament: backbone + titin.
 
@@ -124,9 +124,8 @@ def compute_thick_passive_forces_single(
             titin's diagonal
         titin_a, titin_b, titin_rest: Exponential spring parameters,
             F = titin_a * exp(titin_b * (L - titin_rest))
-        n_titin: Titin molecules per thick filament. 6 matches the vertebrate
-            sixfold arrangement; unverified for the 1:3 insect lattice, where it
-            scales total passive force directly.
+        n_titin: Titin molecules per thick filament
+            (StaticParams.n_titin_per_thick); scales passive force linearly.
 
     Returns:
         forces: (n_crowns,) net axial force on each crown (pN)
@@ -170,6 +169,7 @@ def compute_thick_passive_forces_vectorized(
     z_line: float,
     lattice_spacing: float,
     constants: 'DynamicParams',
+    n_titin: int,
 ) -> jnp.ndarray:
     """Vectorized thick filament passive forces for all thick filaments.
 
@@ -179,6 +179,7 @@ def compute_thick_passive_forces_vectorized(
         z_line: Z-line position
         lattice_spacing: Lattice spacing
         constants: DynamicParams carrying thick_k and titin_a/b/rest
+        n_titin: Titin molecules per thick filament (StaticParams.n_titin_per_thick)
 
     Returns:
         forces: (n_thick, n_crowns) net force on each crown
@@ -191,7 +192,7 @@ def compute_thick_passive_forces_vectorized(
         titin_a=constants.titin_a,
         titin_b=constants.titin_b,
         titin_rest=constants.titin_rest,
-        n_titin=_N_TITIN_PER_THICK,
+        n_titin=n_titin,
     )
     return jax.vmap(compute_fn)(u_thick, offsets_thick)
 
@@ -288,8 +289,8 @@ def xb_springs_for_state(xb_states_flat, params):
 
     THREE configurations, not two: state 1 Loose (*_weak), state 2 Tight_1
     (*_tight_1) and state 3 Tight_2 (*_strong). Tight_1 gained its own rest
-    configuration with the split stroke (S129) — see the _DYNAMIC_DEFAULTS
-    block on xb_c_rest_tight_1. A plain three-way select, no interpolation:
+    configuration with the split stroke (the xb_*_tight_1 rows of
+    core/param_table.py). A plain three-way select, no interpolation:
     there is no fraction to forget.
 
     Detached heads (states 0, 4, 5) fall through to the weak block. Nothing
@@ -391,7 +392,7 @@ def compute_xb_forces_vectorized(
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Axial force every attached crossbridge exerts on its crown and its site.
 
-    Each attached head is a two-spring element (see core/params.py for the
+    Each attached head is a two-spring element (see core/param_table.py for the
     geometry and where the rest configurations come from). Given the head's
     current offset x to its bound site and the lattice spacing d, its length and
     angle are r = sqrt(x^2 + d^2) and theta = atan2(d, x), and the axial force
@@ -714,7 +715,8 @@ def compute_forces_vectorized(
     """
     # 1. Thick filament passive forces (with titin)
     forces_thick = compute_thick_passive_forces_vectorized(
-        u_thick, topology.crown_offsets, z_line, lattice_spacing, constants)
+        u_thick, topology.crown_offsets, z_line, lattice_spacing, constants,
+        topology.static.n_titin_per_thick)
 
     # 2. Thin filament passive forces
     forces_thin = compute_thin_passive_forces(u_thin, thin_segment_k(constants, topology))
@@ -783,18 +785,6 @@ def axial_force_at_mline(state: 'State', constants: 'DynamicParams', topology: '
 # RADIAL FORCE FUNCTIONS (for dynamic lattice spacing solver)
 # ============================================================================
 
-# Titin molecules per thick filament, read by BOTH the axial path
-# (compute_thick_passive_forces_vectorized) and the radial path below. The two
-# paths describe the same physical tethers resolved along different axes; one
-# constant keeps the axial and radial magnitudes mutually consistent.
-#
-# 6 matches the vertebrate sixfold arrangement of titin around each thick
-# filament. It is unverified for the 1:3 invertebrate lattice — no source giving
-# a per-thick-filament connecting-filament count for insect flight muscle was
-# located — and it scales passive force linearly, so it matters.
-_N_TITIN_PER_THICK = 6
-
-
 def _xb_radial_force_total(
     xb_states: jnp.ndarray,
     xb_bound_to: jnp.ndarray,
@@ -861,6 +851,7 @@ def _titin_radial_force_total(
     z_line: float,
     lattice_spacing: float,
     constants: 'DynamicParams',
+    n_titin: int,
 ) -> float:
     """Total titin radial force from all thick filaments.
 
@@ -872,6 +863,8 @@ def _titin_radial_force_total(
         z_line: Z-line position (nm)
         lattice_spacing: Current lattice spacing d (nm)
         constants: DynamicParams carrying titin_a/b/rest
+        n_titin: Titin molecules per thick filament, the same count the axial
+            path uses (StaticParams.n_titin_per_thick)
 
     Returns:
         Scalar total radial titin force (pN). Positive = outward (increasing d).
@@ -886,7 +879,7 @@ def _titin_radial_force_total(
     titin_force = jnp.maximum(constants.titin_a * jnp.exp(exp_arg), 0.0)
 
     sin_angle = lattice_spacing / titin_length_safe
-    titin_radial_per_thick = _N_TITIN_PER_THICK * titin_force * sin_angle
+    titin_radial_per_thick = n_titin * titin_force * sin_angle
 
     return jnp.sum(titin_radial_per_thick)
 

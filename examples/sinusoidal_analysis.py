@@ -1,10 +1,9 @@
 """
 Kawai-Brandt Sinusoidal Analysis
 
-User generates sine wave traces and passes them to Protocol.
-Core library is signal-agnostic - it just runs whatever traces you give it.
-
-This script runs a Nyquist frequency sweep to characterize the complex
+The script builds sinusoidal z_line traces and passes them to run() as a list
+(one sweep axis); run() is signal-agnostic and simulates whatever traces it is
+given. This script runs a Nyquist frequency sweep to characterize the complex
 stiffness of the simulated half-sarcomere model.
 
 Reference: Kawai & Brandt, 1980, J. Muscle Research and Cell Motility
@@ -15,20 +14,15 @@ Usage:
 
 
 import os
+
 import numpy as np
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 
-# Persistent XLA compilation cache — survives process restarts.
-# Shared with tm_rate_sweep.py when both use the same batch/n_steps/dt.
-_JAX_CACHE = os.path.expanduser("~/.cache/jax_compile_cache")
-jax.config.update("jax_compilation_cache_dir", _JAX_CACHE)
-jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
-
 from multifil_jax.simulation import run
 from multifil_jax.core.sarc_geometry import SarcTopology
-from multifil_jax.core.params import get_skeletal_params, StaticParams
+from multifil_jax.core.params import get_params
 
 # ============================================================================
 # USER CONFIGURATION - Edit these values
@@ -364,16 +358,11 @@ if __name__ == "__main__":
     print("Step 2: Executing grid via run()")
     print("-" * 60)
 
-    static, dynamic, z0, d0 = get_skeletal_params()
-    topo = SarcTopology.create(
-        nrows=NROWS,
-        ncols=NCOLS,
-        static_params=static,
-        dynamic_params=dynamic,
-    )
+    static, dynamic, z0, d0 = get_params('skeletal')
+    topo = SarcTopology.create(NROWS, NCOLS, static)
 
     result = run(
-        topo,
+        topo, dynamic,
         z_line=z_traces,          # List of arrays -> sweep axis
         pCa=PCA,                  # Scalar -> broadcast
         lattice_spacing=LATTICE_SPACING,

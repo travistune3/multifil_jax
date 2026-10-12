@@ -72,12 +72,6 @@ import numpy as np
 
 from multifil_jax.core.params import DynamicParams, DYNAMIC_FIELDS
 
-# Default cardiac C-zone axial band (nm from the M-line). cMyBP-C decorates the
-# central stripes of the thick filament; crowns whose axial offset falls in this
-# range are assigned to the mutant/modified population. Adjustable per-call.
-C_ZONE_MIN_NM = 350.0
-C_ZONE_MAX_NM = 650.0
-
 
 def _validate_scales(scales: Dict[str, float]) -> Dict[str, float]:
     """Reject unknown field names early (before any device work)."""
@@ -169,11 +163,12 @@ class Subpopulation:
         )
 
     @classmethod
-    def c_zone(cls, topology, c_zone_min_nm: float = C_ZONE_MIN_NM,
-               c_zone_max_nm: float = C_ZONE_MAX_NM, z_line: float = None,
+    def c_zone(cls, topology, *, c_zone_min_nm: float, c_zone_max_nm: float,
+               z_line: float = None,
                **scales) -> "Subpopulation":
         """Deterministic C-zone band: crossbridges on crowns whose axial offset
-        falls in [c_zone_min_nm, c_zone_max_nm] (nm from M-line) are assigned to
+        falls in [c_zone_min_nm, c_zone_max_nm] (nm from M-line; the class's
+        cMyBP-C band is StaticParams.c_zone_lo / c_zone_hi) are assigned to
         the mutant population. If any tm_* scales are given, tropomyosin units
         whose representative monomer sits in the same band at rest are also
         labelled — which depends on where the Z-line is, so z_line (nm) is then

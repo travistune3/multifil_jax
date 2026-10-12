@@ -20,27 +20,28 @@ sweeping hundreds of conditions little more expensive than one.
 
 QUICK START
 -----------
-    from multifil_jax import SarcTopology, run
-    from multifil_jax.core.params import get_skeletal_params
+    from multifil_jax import SarcTopology, run, get_params
 
-    static, dynamic, z0, d0 = get_skeletal_params()
-    topo = SarcTopology.create(nrows=2, ncols=2,
-                               static_params=static, dynamic_params=dynamic)
+    static, dynamic, z0, d0 = get_params('skeletal')
+    topo = SarcTopology.create(2, 2, static)
 
-    result = run(topo, pCa=4.5, z_line=1100.0, lattice_spacing=d0, duration_ms=1000,
-                 dynamic_params=dynamic, static_params=static)
+    result = run(topo, dynamic, pCa=4.5, z_line=1100.0, lattice_spacing=d0,
+                 dt=1.0, duration_ms=1000)
     print(result.summary())
 
-Pass a list instead of a scalar to sweep it — the axes are Cartesian-producted
-and run in parallel:
+Pass a list instead of a scalar to sweep it — every list is a sweep axis, the
+axes are crossed and run in parallel. Parameter fields sweep the same way:
 
-    result = run(topo, pCa=[9.0, 6.0, 5.5, 4.5], z_line=z0, lattice_spacing=d0,
-                 replicates=5)
+    result = run(topo, dynamic, pCa=[9.0, 6.0, 5.5, 4.5], z_line=z0,
+                 lattice_spacing=d0, dt=1.0, duration_ms=1000,
+                 thick_k=[5000.0, 7500.0], replicates=5)
 
 WHERE THINGS LIVE
 -----------------
-    core/params.py        every physical parameter, with citations and an
-                          explicit confidence tier; four species presets
+    core/param_table.py   every parameter: nominal, range and confidence tier
+                          per muscle class (skeletal, cardiac_beta,
+                          cardiac_alpha, insect)
+    core/params.py        get_params(cls), the containers, draw/sample_params
     core/sarc_geometry.py the filament lattice and all structural index maps
     core/state.py         what changes each timestep, and nothing else
     kernels/              the physics: rate laws, forces, transitions, solver
@@ -51,12 +52,12 @@ A NOTE ON PARAMETERS
 --------------------
 Muscle models are underdetermined. Several parameters here have no direct
 measurement, and some that do have measurements spanning an order of magnitude.
-Every value in core/params.py is therefore tagged [M] measured, [I] inferred,
+Every row of core/param_table.py is therefore tagged [M] measured, [I] inferred,
 [G] guess, or [F] fitted. Check the tag before treating a number as evidence.
 """
 
 # Version info
-__version__ = '3.0.0'  # Major version bump for API refactor
+__version__ = '3.0.0'
 
 # Hardware detection and persistent XLA compilation cache (must run early)
 from multifil_jax.utils.hardware import detect_hardware
@@ -66,7 +67,7 @@ from multifil_jax.timestep import timestep
 from multifil_jax.metrics_fn import compute_all_metrics
 from multifil_jax.core.state import realize_state, get_ca_concentration
 from multifil_jax.core.sarc_geometry import SarcTopology
-from multifil_jax.core.params import get_skeletal_params, get_cardiac_params
+from multifil_jax.core.params import get_params, draw, sample_params
 from multifil_jax.kernels.forces import axial_force_at_mline
 
 # Top-level simulation API
@@ -93,8 +94,9 @@ __all__ = [
     'SarcTopology',
     'realize_state',
     'get_ca_concentration',
-    'get_skeletal_params',
-    'get_cardiac_params',
+    'get_params',
+    'draw',
+    'sample_params',
 
     # Helper functions
     'count_transitions',

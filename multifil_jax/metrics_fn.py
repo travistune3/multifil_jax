@@ -203,15 +203,13 @@ def compute_overlap_tm_fractions(
     tracking a single configuration over time.
 
     OVERLAP ZONE DEFINITION. A site counts if it satisfies all of:
-      - at or beyond `crown_offsets.min() - 13.0` (the M-line end of the crown
+      - at or beyond `crown_offsets.min() - reach` (the M-line end of the crown
         span, extended by the myosin head's reach)
-      - at or before `crown_offsets.max() + 13.0` (the tip end, same reach)
+      - at or before `crown_offsets.max() + reach` (the tip end, same reach)
       - strictly past the M-line, absolute position > 0
 
-    The 13.0 nm is the same head reach used in kernels/geometry.py when
-    searching for binding partners. The two must agree: if this bound were more
-    generous than the search, the denominator would include sites no head can
-    actually reach.
+    `reach` is StaticParams.xb_head_reach, the same value the binding search in
+    kernels/geometry.py uses, so the denominator holds only sites a head can reach.
 
     Note the bounds are computed from `crown_offsets`, which is per-filament, so
     they automatically follow a myosin superlattice that shifts different
@@ -233,8 +231,9 @@ def compute_overlap_tm_fractions(
         monomer_axial(state.thin.displacement, topology, z_line),
         topology.tm_rep_mono, axis=1)
 
-    near_bound = topology.crown_offsets.min() - 13.0
-    far_bound = topology.crown_offsets.max() + 13.0
+    reach = topology.static.xb_head_reach
+    near_bound = topology.crown_offsets.min() - reach
+    far_bound = topology.crown_offsets.max() + reach
 
     in_reach = (thin_pos >= near_bound) & (thin_pos <= far_bound)
     visible = thin_pos > 0.0

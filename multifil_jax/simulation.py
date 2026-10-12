@@ -35,8 +35,9 @@ candidate lists uniformly, instead of a special case for each.
 
 Result arrays come back shaped (sweep_1, ..., sweep_N, replicates, time). Sweep
 axes appear in a FIXED order — z_line, pCa, lattice_spacing, K_lat, nu, then
-dynamic_params fields, then subpopulation — NOT the order the caller passed
-them. Select with .sel(name=value) rather than by axis position.
+the params candidates, then parameter-field lists (in keyword order), then
+subpopulation — NOT the order the caller passed them. Select with
+.sel(name=value) rather than by axis position.
 
 BATCH BUCKETING
 ---------------
@@ -58,16 +59,17 @@ the SHAPE of a subpopulation configuration — though not its values.
 Usage:
     from multifil_jax.simulation import run
     from multifil_jax.core.sarc_geometry import SarcTopology
-    from multifil_jax.core.params import get_skeletal_params
+    from multifil_jax.core.params import get_params
 
-    static, dynamic, z0, d0 = get_skeletal_params()
-    topo = SarcTopology.create(nrows=2, ncols=2, static_params=static,
-                               dynamic_params=dynamic)
+    static, dynamic, z0, d0 = get_params('skeletal')
+    topo = SarcTopology.create(2, 2, static)
 
-    result = run(topo, pCa=4.5, z_line=z0, lattice_spacing=d0, duration_ms=1000,
-                 dynamic_params=dynamic, static_params=static)
+    result = run(topo, dynamic, pCa=4.5, z_line=z0, lattice_spacing=d0,
+                 dt=1.0, duration_ms=1000)
     print(result.summary())
 """
+
+import numbers
 
 import jax
 import jax.numpy as jnp
@@ -76,8 +78,7 @@ from functools import partial
 from typing import Dict, Tuple, List, Optional, Union, NamedTuple
 
 from multifil_jax.core.params import (
-    StaticParams, DynamicParams, get_skeletal_params, DYNAMIC_FIELDS,
-    poisson_spacing
+    DynamicParams, DYNAMIC_FIELDS, STATIC_FIELDS, poisson_spacing
 )
 from multifil_jax.core.state import realize_state, State, Drivers, MetricsDict, build_preconditioner_params, thin_segment_k
 from multifil_jax.kernels.solver import build_prefactored_preconditioner
@@ -143,8 +144,8 @@ class SimulationResult:
         z_line: jnp.ndarray,
         pCa: jnp.ndarray,
         lattice_spacing: jnp.ndarray,
-        metadata: Optional[Dict] = None,
-        dt: float = 1.0,
+        metadata: Optional[Dict],
+        dt: float,
         name: str = "",
         axis_names: List[str] = None,
         coords: Dict[str, List] = None,
@@ -638,7 +639,8 @@ def _run_sim_kernel(
 
             if is_dynamic_ls:
                 drivers = Drivers(pCa=pCa_val, z_line=z_val, lattice_spacing=current_ls)
-                d_ref = poisson_spacing(ls_val, l0, z_val, nu_val)
+                d_ref = poisson_spacing(ls_val, l0, z_val, nu_val,
+                                        topology.static.filament_radii_sum)
             else:
                 drivers = Drivers(pCa=pCa_val, z_line=z_val, lattice_spacing=ls_val)
                 d_ref = None
@@ -690,141 +692,127 @@ def _run_sim_kernel(
 # TOP-LEVEL run() API
 # =============================================================================
 
+def _is_scalar(v) -> bool:
+    return isinstance(v, numbers.Real) or (
+        isinstance(v, (np.ndarray, np.generic, jax.Array)) and np.ndim(v) == 0)
+
+
+def _classify_fields(fields, plist):
+    """Field keywords -> ({name: scalar override}, [(name, values) sweep axes]). Raises."""
+    overrides, axes = {}, []
+    for name, v in fields.items():
+        if name in STATIC_FIELDS:
+            raise TypeError(f"run() got static field {name!r}: change it with "
+                            f"static.replace(...) and rebuild the topology")
+        if name not in DYNAMIC_FIELDS:
+            raise TypeError(f"run() got an unexpected keyword argument {name!r}")
+        if isinstance(v, list):
+            if not v:
+                raise ValueError(f"{name} sweep list is empty")
+            if not all(_is_scalar(x) for x in v):
+                raise ValueError(f"{name}: every sweep value must be a scalar")
+            axes.append((name, [float(x) for x in v]))
+        elif _is_scalar(v):
+            overrides[name] = float(v)
+        else:
+            raise ValueError(f"{name}: got {type(v).__name__}; a parameter sweep is a list "
+                             f"(an array would be a time course)")
+        if len(plist) > 1 and len({np.asarray(getattr(p, name)).tobytes() for p in plist}) > 1:
+            raise ValueError(f"{name} given as a keyword, but the params list already "
+                             f"varies it across candidates")
+    return overrides, axes
+
+
 def run(
     topology: SarcTopology,
+    params: Union[DynamicParams, List[DynamicParams]],
     *,
     pCa: Union[float, List[float], jnp.ndarray],
     z_line: Union[float, List[float], jnp.ndarray],
     lattice_spacing: Union[float, List[float], jnp.ndarray],
-    duration_ms: float = 1000.0,
-    dt: float = 1.0,
+    dt: float,
+    duration_ms: float,
     K_lat: Union[float, List[float], None] = None,
     nu: Union[float, List[float]] = 0.0,
-    dynamic_params: Union[DynamicParams, Dict[str, Union[float, List[float]]]] = None,
-    static_params: 'StaticParams' = None,
     replicates: int = 1,
     rng_seed: int = 0,
     unroll: int = 1,
     minibatch_size: Optional[int] = "auto",
     verbose: bool = False,
     subpopulation=None,
+    **fields,
 ) -> SimulationResult:
-    """Run a muscle simulation with the given topology.
+    """Run a batch of half-sarcomere simulations.
 
-    This is the primary API. Accepts a pre-constructed SarcTopology
-    (topology defines structural configuration; changing it requires
-    recompilation). All other parameters are sweepable without recompile.
-
-    Batch padding: sweep sizes are rounded up to the nearest bucket
-    (1, 2, 4, ..., 16384), so a 225-run sweep and a 256-run sweep
-    share the same compiled kernel.
-
-    Everything after `topology` is keyword-only. The three drivers (pCa, z_line,
-    lattice_spacing) are REQUIRED and have no defaults: they are not physics
-    constants and do not live in DynamicParams. Each preset returns its natural
-    z_line and lattice_spacing as z0, d0 — pass those when you have no other
-    operating point in mind.
+    Every LIST argument is a sweep axis, and every sweep axis is crossed with
+    every other (Cartesian product). The only pairing is inside one
+    DynamicParams. Every input is validated before anything compiles; a missing
+    or malformed one raises.
 
     Args:
-        topology: Pre-constructed SarcTopology (from SarcTopology.create())
-        pCa: Calcium as -log10([Ca]) -- float, list (sweep), or array (trace)
-        z_line: Z-line position (nm) -- float, list (sweep), or array (trace)
-        lattice_spacing: Lattice spacing (nm) -- float, list, or array. In
-            dynamic LS mode (K_lat set) it is the reference d0 and initial guess.
-        duration_ms: Simulation duration in milliseconds
-        dt: Timestep in milliseconds
-        K_lat: Lattice stiffness per thick filament (pN/nm). None = fixed LS.
-               Float or list (sweep). Internally scaled by n_thick.
-        nu: Poisson exponent. Applied to the CENTRE-TO-CENTRE spacing, since
-            the filament radii are fixed while the lattice closes:
-                d(z) = (d0 + FILAMENT_RADII_SUM)*(z0/z)^nu - FILAMENT_RADII_SUM
-            with d the thick-to-thin SURFACE gap. Float or list (sweep).
-            If K_lat is None and nu>0, pre-computes Poisson LS trace.
-        dynamic_params: DynamicParams, dict of overrides/sweeps, or list of DynamicParams.
-                        A list creates a 'candidates' sweep axis (one element per candidate),
-                        Cartesian-producted with other sweep axes. Useful for batching CMA-ES
-                        population evaluations: run(topo, z_line=traces, dynamic_params=[dp0..dpN])
-                        gives result shape (N, n_freq, replicates, time).
-
-                        CAUTION — WHICH BASELINE THE UNSWEPT FIELDS COME FROM.
-                        None and the DICT form both build on a bare, SKELETAL
-                        DynamicParams(). They do NOT inherit the preset the
-                        topology was built with: SarcTopology.create() consumes
-                        dynamic_params for geometry and does not retain it, so
-                        run() has no way to recover a cardiac or IFM preset from
-                        the topology. Passing dynamic_params={'tm_J_M': [...]}
-                        against a cardiac topology therefore sweeps tm_J_M with
-                        SKELETAL kinetics everywhere else, silently. To sweep one
-                        field of a non-skeletal preset, use the candidate-LIST
-                        form instead:
-                            run(topo, pCa=..., z_line=z0, lattice_spacing=d0,
-                                dynamic_params=[dynamic.copy(tm_J_M=v)
-                                                for v in values])
-                        (This has already invalidated one cardiac calibration.)
-        replicates: Number of statistical replicates per sweep point
-        rng_seed: Base random seed
-        unroll: Scan unrolling factor
-        minibatch_size: Chunk size for splitting the padded batch across multiple
-            _run_sim_kernel calls. "auto" (default) applies _MINIBATCH_HEURISTIC
-            based on padded batch size. None disables chunking. An explicit int
-            overrides the heuristic; snapped down to the nearest power-of-2 bucket.
-            Primary use: bounding peak GPU VRAM on memory-constrained GPUs (e.g.
-            8 GB RTX 4060). Rule of thumb: peak VRAM (GB) ≈
-            minibatch_size × n_steps × 45 × 4 bytes × 2 / 1e9. For a 4060 at
-            1000 steps, minibatch_size=4096 uses ~3 GB; 8192 uses ~6 GB.
-        verbose: Print progress info
-        subpopulation: Optional Subpopulation (or list of them) modelling a
-            fraction of XB motors / TM units with scaled kinetics. mean_field
-            blends the K population rate matrices (Q_eff = Σ f_k Q_k); random /
-            c_zone assign per-XB / per-site integer labels and select per unit.
-            A list is a sweep axis (mutually exclusive with a dynamic_params
-            candidate list), supported for all three modes — mean_field,
-            random, and c_zone. A swept 'random' list must share one seed
-            across every entry (severity/fraction may still vary).
-            subpopulation=None leaves every path unchanged.
+        topology: from SarcTopology.create(nrows, ncols, static). Its
+            StaticParams (topology.static) supplies the structure and the
+            solver caps.
+        params: one DynamicParams (from get_params), or a non-empty list of them
+            — a 'candidates' axis; the fields that differ between candidates are
+            recorded in result.metadata['candidates']. Every field of a passed
+            DynamicParams must be a scalar.
+        pCa, z_line, lattice_spacing: drivers, required. Scalar = constant,
+            list = sweep axis, 1-D array of length n_steps = time course. In
+            dynamic LS mode lattice_spacing is the reference d0 and initial guess.
+        dt: timestep (ms). duration_ms: run length (ms). Both required.
+        K_lat: lattice stiffness per thick filament (pN/nm), scalar or list.
+            None = fixed (or Poisson) lattice spacing. Scaled by n_thick inside.
+        nu: Poisson exponent on the centre-to-centre spacing (see
+            core.params.poisson_spacing), scalar or list. With K_lat None and
+            nu > 0 the spacing follows z_line.
+        replicates: independent stochastic repeats per grid point.
+        rng_seed: base seed. unroll: scan unroll factor.
+        minibatch_size: "auto", None (no chunking) or an int, snapped down to a
+            power-of-two bucket. Bounds peak device memory.
+        verbose: print progress.
+        subpopulation: a Subpopulation or a list of them (a candidate-style axis,
+            exclusive with a params list); None = one population.
+        **fields: any DynamicParams field. Scalar = override on every params,
+            list = sweep axis. An array, a tuple, an unknown name, a static
+            field, or a field the params list already varies -> error.
 
     Returns:
-        SimulationResult with shape (sweep_1, ..., replicates, time)
+        SimulationResult with shape (sweep_1, ..., replicates, time).
 
     Example:
-        from multifil_jax.core.sarc_geometry import SarcTopology
-        from multifil_jax.core.params import get_skeletal_params, StaticParams
-
-        static, dynamic, z0, d0 = get_skeletal_params()
-        topo = SarcTopology.create(nrows=2, ncols=2, static_params=static, dynamic_params=dynamic)
-
-        result = run(topo, pCa=4.5, z_line=z0, lattice_spacing=d0, duration_ms=100)
-        print(result.summary())
+        static, dynamic, z0, d0 = get_params('cardiac_beta')
+        topo = SarcTopology.create(4, 4, static)
+        result = run(topo, dynamic, pCa=[6.0, 4.5], z_line=z0, lattice_spacing=d0,
+                     dt=1.0, duration_ms=500, xb_r34_coeff=[0.05, 0.065, 0.08])
+        # result.axial_force.shape == (2, 3, 1, 500)
     """
+    if not isinstance(topology, SarcTopology):
+        raise TypeError("topology must come from SarcTopology.create(nrows, ncols, static)")
+    plist = params if isinstance(params, list) else [params]
+    if not plist:
+        raise ValueError("params list is empty")
+    for p in plist:
+        if not isinstance(p, DynamicParams):
+            raise TypeError(f"params must be DynamicParams or a list of them, got {type(p).__name__}")
+        for name in DYNAMIC_FIELDS:
+            if np.ndim(getattr(p, name)) != 0:
+                raise ValueError(f"params.{name} is not a scalar; sweep it with "
+                                 f"run(..., {name}=[...]) instead")
+    overrides, field_axes = _classify_fields(fields, plist)
+    if overrides:
+        plist = [p.copy(**overrides) for p in plist]
+
+    static = topology.static
     n_steps = int(duration_ms / dt)
     topology = jax.device_put(topology)
-
-    if static_params is None:
-        from multifil_jax.core.params import StaticParams as _StaticParams
-        static_params = _StaticParams()
-
-    # =========================================================================
-    # Build batched kernel inputs via integer row-number lookup.
-    #
-    # Every sweepable input keeps a small "variant table" of its possible values.
-    # The sweep grid is a Cartesian product of plain integer row-numbers (one axis
-    # per swept input); each simulation looks up its row in every table. This one
-    # idea unifies scalars, time-traces, list-of-trace sweeps, K_lat/nu sweeps,
-    # DynamicParams field sweeps, and candidate lists.
-    # =========================================================================
-
-    # Base DynamicParams supplies scalar values for un-swept fields; dict/list
-    # forms carry their own per-field overrides below.
-    if dynamic_params is None or isinstance(dynamic_params, (dict, list)):
-        base_dynamic = DynamicParams()
-    elif isinstance(dynamic_params, DynamicParams):
-        base_dynamic = dynamic_params
-    else:
-        raise ValueError(
-            f"dynamic_params must be DynamicParams, dict, or list, got {type(dynamic_params)}"
-        )
-
     is_dynamic_ls = K_lat is not None
+
+    # =========================================================================
+    # Every sweepable input keeps a small table of its possible values; the
+    # sweep grid is a Cartesian product of integer row numbers (one axis per
+    # swept input) and each simulation looks up its row in every table.
+    # =========================================================================
 
     def _as_trace(v):
         """Normalize one waveform variant to a length-n_steps trace."""
@@ -834,11 +822,10 @@ def run(
     sweep_axes = []        # (name, coords) in Cartesian-product / axis order
     waveform_tables = {}   # name -> (n_variants, n_steps)
     wf_sweeps = set()      # waveform names that are sweep axes
-    param_tables = {}      # DYNAMIC_FIELDS name -> (n_variants,) lookup table
+    param_tables = {}      # field name -> (n_variants,) lookup table
     param_axis = {}        # field name -> axis name to index it with
 
-    # 1. Waveform inputs (z_line, pCa, lattice_spacing) — one table each.
-    #    Each must be finite everywhere: there is no fallback value behind them.
+    # 1. Drivers (z_line, pCa, lattice_spacing) — one table each, finite everywhere.
     for name, value in [('z_line', z_line), ('pCa', pCa), ('lattice_spacing', lattice_spacing)]:
         elems = value if isinstance(value, list) else [value]
         if not all(np.all(np.isfinite(np.asarray(v, dtype=float))) for v in elems):
@@ -849,8 +836,7 @@ def run(
             waveform_tables[name] = jnp.asarray(np.stack([_as_trace(v) for v in value]))
             is_trace_sweep = any(
                 not isinstance(v, (int, float)) and np.asarray(v).ndim == 1
-                and len(np.asarray(v)) == n_steps for v in value
-            )
+                and len(np.asarray(v)) == n_steps for v in value)
             coords = ([np.asarray(waveform_tables[name][i]) for i in range(len(value))]
                       if is_trace_sweep else list(value))
             sweep_axes.append((name, coords))
@@ -859,50 +845,32 @@ def run(
             arr = np.asarray(value)
             if arr.ndim > 0 and arr.shape[0] != n_steps:
                 raise ValueError(f"{name} array length {arr.shape[0]} != n_steps {n_steps}")
-            waveform_tables[name] = jnp.asarray(_as_trace(value))[None, :]  # (1, n_steps)
+            waveform_tables[name] = jnp.asarray(_as_trace(value))[None, :]
 
     # 2. K_lat / nu — per-sim scalars (never traces).
-    if isinstance(K_lat, list):
-        sweep_axes.append(('K_lat', list(K_lat)))
-    if isinstance(nu, list):
-        sweep_axes.append(('nu', list(nu)))
+    for name, v in (('K_lat', K_lat), ('nu', nu)):
+        if isinstance(v, list):
+            if not v:
+                raise ValueError(f"{name} sweep list is empty")
+            sweep_axes.append((name, list(v)))
 
-    # 3. DynamicParams sweeps / overrides — one (n_variants,) table per swept field.
-    if isinstance(dynamic_params, list):
-        if not dynamic_params:
-            raise ValueError("dynamic_params candidate list is empty")
-        sweep_axes.append(('candidates', list(range(len(dynamic_params)))))
+    # 3. Params: the candidates axis, then one axis per field list.
+    if isinstance(params, list):
+        sweep_axes.append(('candidates', list(range(len(plist)))))
         for name in DYNAMIC_FIELDS:
             param_tables[name] = jnp.stack(
-                [jnp.asarray(getattr(dp, name), jnp.float32) for dp in dynamic_params]
-            )
+                [jnp.asarray(getattr(p, name), jnp.float32) for p in plist])
             param_axis[name] = 'candidates'
-    elif isinstance(dynamic_params, dict):
-        for pname, pval in dynamic_params.items():
-            if pname not in DYNAMIC_FIELDS:
-                raise ValueError(
-                    f"Unknown dynamic_params field '{pname}'. Valid: {list(DYNAMIC_FIELDS)}"
-                )
-            if isinstance(pval, list):
-                sweep_axes.append((pname, list(pval)))
-                param_tables[pname] = jnp.asarray(pval, jnp.float32)
-                param_axis[pname] = pname
-    elif isinstance(dynamic_params, DynamicParams):
-        for name in DYNAMIC_FIELDS:
-            arr = jnp.asarray(getattr(dynamic_params, name))
-            if arr.ndim > 0 and arr.shape[0] > 1:
-                sweep_axes.append((name, list(arr.tolist())))
-                param_tables[name] = arr.astype(jnp.float32)
-                param_axis[name] = name
+    for name, values in field_axes:
+        sweep_axes.append((name, values))
+        param_tables[name] = jnp.asarray(values, jnp.float32)
+        param_axis[name] = name
 
-    # 4. Subpopulation list = a candidate-style sweep axis. At most one
-    #    candidate-style axis is allowed (each element is a whole config).
+    # 4. Subpopulation list = a candidate-style axis; at most one of those.
     if isinstance(subpopulation, list):
-        if isinstance(dynamic_params, list):
-            raise ValueError(
-                "Cannot sweep a dynamic_params list and a subpopulation list "
-                "simultaneously (both are candidate-style axes)."
-            )
+        if isinstance(params, list):
+            raise ValueError("Cannot sweep a params list and a subpopulation list "
+                             "simultaneously (both are candidate-style axes).")
         if not subpopulation:
             raise ValueError("subpopulation list is empty")
         sweep_axes.append(('subpopulation', list(range(len(subpopulation)))))
@@ -964,17 +932,19 @@ def run(
                       else float(nu) != 0.0)
     if not is_dynamic_ls and not ls_is_trace and has_nonzero_nu:
         ls_batched = poisson_spacing(ls_batched[:, 0:1], z_batched[:, 0:1],
-                                     z_batched, nu_batched[:, None])
+                                     z_batched, nu_batched[:, None],
+                                     static.filament_radii_sum)
 
-    # Batched DynamicParams — one lookup per field.
+    # Batched DynamicParams — one lookup per field; unswept fields from params.
+    base = plist[0]
+
     def _param(name):
         if name in param_axis:
             return param_tables[name][flat_idx[param_axis[name]]]
-        if isinstance(dynamic_params, dict) and name in dynamic_params:
-            return jnp.full(total_batch, float(dynamic_params[name]))
-        return jnp.full(total_batch, float(getattr(base_dynamic, name)))
+        return jnp.full(total_batch, float(getattr(base, name)))
 
-    batched_params = DynamicParams(**{name: _param(name) for name in DYNAMIC_FIELDS})
+    batched_params = DynamicParams(muscle_class=None,
+                                   **{name: _param(name) for name in DYNAMIC_FIELDS})
 
     # Subpopulation resolution → two static args + per-sim batched arrays.
     subpop_mode, scaled_field_names, subpop_arrays = _resolve_subpopulation(
@@ -998,10 +968,8 @@ def run(
         print(f"Running simulation kernel (batch={total_batch}, padded={padded_batch})...")
 
     resolved_minibatch = _auto_minibatch_size(padded_batch) if minibatch_size == "auto" else minibatch_size
-    # Snap to largest BATCH_BUCKETS value that (a) is <= resolved_minibatch and
-    # (b) divides padded_batch evenly. Since padded_batch is always a power of 2,
-    # any power-of-2 bucket <= padded_batch divides it. This prevents a non-bucket
-    # minibatch_size from producing a shorter last chunk and triggering a JIT recompile.
+    # Snap to the largest bucket <= resolved_minibatch that divides padded_batch
+    # (any power-of-2 bucket does), so the last chunk never triggers a recompile.
     if resolved_minibatch is not None and resolved_minibatch not in BATCH_BUCKETS:
         valid = [b for b in BATCH_BUCKETS if b <= resolved_minibatch and b <= padded_batch]
         resolved_minibatch = max(valid) if valid else None
@@ -1011,8 +979,8 @@ def run(
         dt=dt,
         unroll=unroll,
         is_dynamic_ls=is_dynamic_ls,
-        n_cg_steps=static_params.n_cg_steps,
-        n_newton_steps=static_params.n_newton_steps,
+        n_cg_steps=static.n_cg_steps,
+        n_newton_steps=static.n_newton_steps,
         subpop_mode=subpop_mode,
         scaled_field_names=scaled_field_names,
     )
@@ -1030,17 +998,13 @@ def run(
             **kernel_kwargs,
         )
 
-    # ONE CHUNK: unchanged, and stays on the device. The overwhelming majority
-    # of runs land here, and a host round-trip would tax all of them to fix a
-    # problem only the chunked path has.
+    # ONE CHUNK stays on the device. MANY CHUNKS accumulate on the host, into a
+    # buffer allocated once (appending and concatenating would peak at twice
+    # the final size).
     chunk_maxima = None
     if len(starts) == 1:
         batched_metrics = _run_chunk(starts[0])
     else:
-        # MANY CHUNKS: accumulate on the HOST, into a buffer allocated ONCE.
-        # Preallocation is the whole trick. Appending to a list and calling
-        # np.concatenate at the end would peak at twice the final size, which
-        # is the exact bug this replaces, moved one level down.
         batched_metrics = None
         chunk_maxima = {k: -float('inf') for k in ('solver_residual',
                                                    'solver_residual_norm')}
@@ -1050,9 +1014,7 @@ def run(
                 batched_metrics = MetricsDict({
                     k: np.empty((padded_batch,) + v.shape[1:], dtype=v.dtype)
                     for k, v in chunk.items()})
-            # The convergence maxima are taken PER CHUNK, on the device, while
-            # the chunk is still there. Reducing the assembled host array later
-            # would drag every byte back across the bus.
+            # Convergence maxima are reduced per chunk, on the device.
             for k in chunk_maxima:
                 chunk_maxima[k] = max(chunk_maxima[k], float(jnp.max(chunk[k])))
             for k, v in chunk.items():
@@ -1067,13 +1029,9 @@ def run(
         (dict(batched_metrics), (batch.z, batch.pCa, batch.ls)))
     reshaped_metrics = MetricsDict(reshaped_metrics)
 
-    # Post-run solver convergence check. The test is the NORMALIZED residual,
-    # which is <= 1 exactly when the solve converged — in both LS modes, and at
-    # any stiffness. The old absolute-pN threshold was a third copy of the
-    # float32 coordinate floor and moved with thick_k rather than with the
-    # physics; see kernels/solver._convergence_tolerance.
+    # Convergence check on the NORMALIZED residual: <= 1 exactly when the solve
+    # converged, in both LS modes and at any stiffness.
     if chunk_maxima is not None:
-        # Already reduced per chunk, on the device, during accumulation.
         max_residual = chunk_maxima['solver_residual']
         max_norm = chunk_maxima['solver_residual_norm']
     else:
@@ -1096,12 +1054,16 @@ def run(
     topology_config = {name: getattr(topology, name) for name in topology._AUX}
     if is_dynamic_ls:
         topology_config['K_lat'] = K_lat
-        topology_config['K_lat_eff'] = float(K_lat * topology.n_thick) if not isinstance(K_lat, list) else [float(k * topology.n_thick) for k in K_lat]
+        topology_config['K_lat_eff'] = (float(K_lat * topology.n_thick) if not isinstance(K_lat, list)
+                                        else [float(k * topology.n_thick) for k in K_lat])
         topology_config['nu'] = nu
 
-    # grid_shape / axis_names are first-class SimulationResult fields and K_lat /
-    # nu live in topology_config; metadata keeps only what nothing else stores.
     metadata = {'master_seed': rng_seed}
+    if isinstance(params, list):
+        # The values behind each candidate index, for the fields that differ.
+        metadata['candidates'] = {
+            name: [float(getattr(p, name)) for p in plist] for name in DYNAMIC_FIELDS
+            if len({np.asarray(getattr(p, name)).tobytes() for p in plist}) > 1}
 
     return SimulationResult(
         metrics=reshaped_metrics,
@@ -1116,4 +1078,3 @@ def run(
         coords=coords,
         topology_config=topology_config,
     )
-

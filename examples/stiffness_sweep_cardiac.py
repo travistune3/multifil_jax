@@ -6,14 +6,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 import jax
 
-from multifil_jax.core.params import get_cardiac_params
+from multifil_jax.core.params import get_params
 from multifil_jax.core.sarc_geometry import SarcTopology
 from multifil_jax.simulation import run
 
 # ── Topology ─────────────────────────────────────────────────────────────────
-static, dynamic, z0, d0 = get_cardiac_params()
-topo = SarcTopology.create(nrows=4, ncols=4, static_params=static, dynamic_params=dynamic)
-topo = jax.device_put(topo)
+static, dynamic, z0, d0 = get_params('cardiac_beta')
+topo = SarcTopology.create(4, 4, static)
 
 # ── Sweep definition ──────────────────────────────────────────────────────────
 thick_sweep = [float(dynamic.thick_k) * f for f in np.linspace(0.25, 3.0, 12)]
@@ -25,18 +24,16 @@ print(f"Sweep: {len(thick_sweep)} thick × {len(thin_sweep)} thin = {len(thick_s
 print("Compiling + running...")
 t0 = time.time()
 results = run(
-    topo,
+    topo, dynamic,
     pCa=4.5,
     z_line=1000.0, lattice_spacing=d0,
     duration_ms=1000,
     dt=1.0,
     replicates=3,
-    dynamic_params={
-        'thick_k': thick_sweep,
-        'thin_EA': thin_sweep,
-    },
+    thick_k=thick_sweep,
+    thin_EA=thin_sweep,
 )
-results.metrics['axial_force'].block_until_ready()
+jax.block_until_ready(results.metrics["axial_force"])
 print(f"Done in {time.time()-t0:.1f}s")
 
 # ── Extract metric ─────────────────────────────────────────────────────────────

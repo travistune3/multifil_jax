@@ -587,7 +587,7 @@ def _compute_unique_tm_Q_matrices(ca_concentration: float,
     holding two heads by ~(1 + K2). That is a statement about an EQUILIBRIUM RATIO, and this is the
     form that reproduces it at any dt — steady-state open/closed becomes
     k_23/(k_32/(1+K2)) = K_T(1+K2) exactly. See the xb_tm_K2 block in
-    core/params.py for the measured values.
+    core/param_table.py for the measured values.
 
     IT USED TO BE APPLIED AFTER THE MATRIX EXPONENTIAL, by dividing the sampled
     row's total exit PROBABILITY by (1 + K2). That equals this only to first
@@ -747,7 +747,7 @@ def thin_transitions(state: 'State',
     _compute_unique_tm_Q_matrices for the derivation, for what the previous
     post-hoc probability form got wrong (a nominal K2 = 79 ran as ~174 at
     dt = 1 ms), and for why the K2 = jnp.inf hard lock is still exact. The
-    xb_tm_K2 block in core/params.py has the measured values and why some lock
+    xb_tm_K2 block in core/param_table.py has the measured values and why some lock
     is necessary.
 
     "Whether a site is locked changes every timestep while the rate matrices do
@@ -992,7 +992,7 @@ def thin_transitions(state: 'State',
     # >>> THIS IS A DYNAMICS CHANGE, NOT ONLY ACCOUNTING. A head in Free_2 must
     #     wait for xb_rate_40 before it can rebind, and xb_r40 = 0.1 /ms is a
     #     ~10 ms dwell — so `n_xb_free_2` rises and relaxation slows relative to
-    #     landing in DRX. params.py flags xb_r40 [G]: unsourced, inherited.
+    #     landing in DRX. The table tags xb_r40 [G]: unsourced, inherited.
     torn_dest = jnp.where((xb_flat == 2) | (xb_flat == 3), jnp.int8(4), jnp.int8(0))
     new_xb_states = jnp.where(hit, torn_dest, xb_flat).reshape(xb_shape)
     # Clear bound_to on BOTH sides. If the site kept its record it would stay

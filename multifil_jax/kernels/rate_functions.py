@@ -57,10 +57,10 @@ because it used to be a structural fact and is now a control path. When the
 identical, the whole rest-position change happens on 1 -> 2, and 2 -> 3 moves
 nothing, does no work and changes no force — a purely chemical step. That was
 the model until 2026-09-01 and it is still exactly what the six control values
-in core/params.py reproduce.
+in core/param_table.py reproduce.
 
 At the shipped defaults the *_tight_1 rest positions differ (see the split
-stroke block in core/params.py), so 2 -> 3 carries part of the lever swing:
+stroke block in core/param_table.py), so 2 -> 3 carries part of the lever swing:
 the axial rest projection g_rest*cos(c_rest) is 13.5516 / 6.6021 / 4.7604 nm
 for Loose / Tight_1 / Tight_2, i.e. 6.949 nm on 1 -> 2 and 1.842 nm — 21.0% of
 the 8.791 nm total — on 2 -> 3. Note the projection is NOT linear in the
@@ -311,7 +311,7 @@ def tm_rate_01(ca_conc, k_01_base, mod):
     return k_01_base * ca_conc * mod
 
 
-def tm_rate_10(k_01_base, Keq_01, mod=1.0):
+def tm_rate_10(k_01_base, Keq_01, mod):
     """Rate 1->0: calcium dissociates from troponin C.
 
     Fixed by detailed balance rather than being an independent parameter:
@@ -360,7 +360,7 @@ def tm_rate_12(k_12_base, mod):
     return k_12_base * mod
 
 
-def tm_rate_21(k_12_base, Keq_12, mod=1.0):
+def tm_rate_21(k_12_base, Keq_12, mod):
     """Rate 2->1: tropomyosin rolls back to the blocking position.
 
     Detailed balance: k_21 = k_12_base / Keq_12.
@@ -400,7 +400,7 @@ def tm_rate_23(k_23_base, mod):
     return k_23_base * mod
 
 
-def tm_rate_32(k_23_base, Keq_23, mod=1.0):
+def tm_rate_32(k_23_base, Keq_23, mod):
     """Rate 3->2: tropomyosin closes again.
 
     Detailed balance against tm_rate_23. Note Keq_23 < 1 at rest, so the closed
@@ -863,7 +863,7 @@ def xb_rate_34(A34, f_strong, delta34, k_t):
     caption, d = -0.89 +/- 0.12 nm at 0 mM added Pi, progressing to +0.34 nm at
     30 mM Pi — so the slip result quoted from that paper's abstract is its
     high-Pi arm, not a contradiction. Provenance and both isoforms:
-    core/params.py, xb_delta_34.
+    core/param_table.py, xb_delta_34.
 
     THE SLIP SIGN'S STATED JUSTIFICATION IS FALSIFIED, not merely unsourced. It
     was that a catch bond "contradicts the fast unloaded shortening velocities".

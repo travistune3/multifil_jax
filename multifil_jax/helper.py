@@ -267,10 +267,7 @@ def validate_forces_numerical(state: 'State', constants: 'DynamicParams',
                  + jnp.clip(xb_bound_flat, 0, n_mono - 1))
     rows = jnp.arange(n_thin)[:, None]
 
-    # Titin molecules per thick filament. Must track forces._N_TITIN_PER_THICK;
-    # written out here so this check stays independent of the kernel. If the two ever
-    # diverge, this check fails at the tip crowns, which is the intended alarm.
-    n_titin_per_thick = 6
+    n_titin_per_thick = topology.static.n_titin_per_thick
     titin_a_over_b = constants.titin_a / constants.titin_b
 
     def compute_total_energy(u_flat):

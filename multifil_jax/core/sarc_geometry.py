@@ -53,11 +53,10 @@ dimensions.
 Usage
 -----
 >>> from multifil_jax.core.sarc_geometry import SarcTopology
->>> from multifil_jax.core.params import get_skeletal_params
+>>> from multifil_jax.core.params import get_params
 >>>
->>> static, dynamic, z0, d0 = get_skeletal_params()
->>> topo = SarcTopology.create(nrows=2, ncols=2, static_params=static,
-...                            dynamic_params=dynamic)
+>>> static, dynamic, z0, d0 = get_params('skeletal')
+>>> topo = SarcTopology.create(2, 2, static)
 >>> topo = jax.device_put(topo)   # move to GPU once, reuse for every run
 
 
@@ -74,7 +73,7 @@ import numpy as np
 from typing import Tuple, Dict, List, Optional
 from dataclasses import dataclass
 
-from .params import StaticParams, DynamicParams
+from .params import StaticParams
 
 
 # =============================================================================
@@ -153,14 +152,15 @@ class SarcTopology:
         n_tm: tropomyosin units per thin filament
         max_mono_per_face: width of the fixed-width candidate lists
         thin_node_spacing: rest spacing of the thin mechanical nodes (nm)
+        static: the StaticParams the topology was built from (frozen, hashable)
 
     Attributes (children, traced):
         xb_to_thin_id, xb_to_thin_face: (total_xbs,) target thin and face
         xb_to_mono_indices: (total_xbs, max_mono_per_face) candidate monomers
         xb_valid: (total_xbs,) bool - False where the XB has no real geometric
             thin-filament partner this crown (continuous-formula miss, or a
-            genuinely unconnected thick face); always True for the legacy path
-            and for vertebrate defaults. Kinetics must gate binding on this.
+            genuinely unconnected thick face); always True for the vertebrate
+            lattice. Kinetics must gate binding on this.
         thick_to_thin: (n_thick, 6, 2) - [thick, face, (thin_idx, thin_face)]
         thin_to_thick: (n_thin, n_faces_per_thin, 2) - [thin, face, (thick_idx, thick_face)]
         face_to_monomers: (n_thin, n_faces_per_thin, max_mono_per_face), -1 padded
@@ -193,7 +193,7 @@ class SarcTopology:
     _AUX = (
         'n_thick', 'n_crowns', 'n_thin', 'n_mono', 'n_cand', 'n_nodes', 'n_tm', 'n_titin',
         'n_xb_per_crown', 'n_faces_per_thin', 'max_mono_per_face', 'total_xbs',
-        'n_xb_bins', 'thin_node_spacing', 'tm_max_heads',
+        'n_xb_bins', 'thin_node_spacing', 'tm_max_heads', 'static',
     )
     _CHILDREN = (
         'xb_to_thin_id', 'xb_to_thin_face', 'xb_to_mono_indices', 'xb_valid',
@@ -268,10 +268,9 @@ class SarcTopology:
         cls,
         nrows: int,
         ncols: int,
-        static_params: StaticParams,
-        dynamic_params: DynamicParams,
+        static: StaticParams,
+        *,
         periodic: bool = True,
-        lattice_spacing: float = 14.0,
         thin_starts: List[int] = None,
         thick_starts: List[int] = None,
     ) -> 'SarcTopology':
@@ -288,22 +287,24 @@ class SarcTopology:
         Args:
             nrows: Number of thick filament rows
             ncols: Number of thick filament columns
-            static_params: StaticParams with structural configuration
-            dynamic_params: DynamicParams with physical parameters
+            static: StaticParams (from get_params). The topology keeps it as
+                `topology.static`: everything downstream reads structure and
+                solver caps from this one object.
             periodic: Whether to use periodic boundary conditions
-            lattice_spacing: Lattice spacing in nm (for adaptive binning)
             thin_starts: Optional list of helical twist start offsets (0-25).
                 Omit (None) for the default deterministic unbiased spread; pass a
                 list of length n_thin to override (must match n_thin or ValueError).
             thick_starts: Optional list of crown level start offsets
-                (1..static_params.n_xb_per_crown).
+                (1..static.n_xb_per_crown).
                 Omit (None) for the default deterministic unbiased spread; pass a
                 list of length n_thick to override (must match n_thick or ValueError).
 
         Returns:
             SarcTopology ready for device_put
         """
-        # Extract parameters
+        if not isinstance(static, StaticParams):
+            raise TypeError(f"static must be StaticParams, got {type(static).__name__}")
+        static_params = static
         n_crowns = static_params.n_crowns
         n_polymers_per_thin = static_params.n_polymers_per_thin
         actin_geometry = static_params.actin_geometry
@@ -312,7 +313,8 @@ class SarcTopology:
         n_faces_per_thin = 3 if actin_geometry == "vertebrate" else 2
 
         # 1. Generate hexagonal thick positions
-        thick_positions, box_x, box_y = _generate_hexagonal_thick_positions(nrows, ncols)
+        # Unit lattice: connectivity is scale-free; the spacing is a run() driver.
+        thick_positions, box_x, box_y = _generate_hexagonal_thick_positions(nrows, ncols, 1.0)
         n_thick = len(thick_positions)
 
         # thick_starts: default deterministic unbiased spread, else validated override
@@ -380,7 +382,7 @@ class SarcTopology:
         # thick_to_thin completeness check: under periodic boundaries every thick
         # face must reach a real thin filament (a genuinely missing spatial
         # neighbor here is a malformed lattice, e.g. invertebrate geometry at
-        # odd nrows — independent of n_xb_per_crown/legacy_crown_geometry).
+        # odd nrows — independent of n_xb_per_crown).
         # Non-periodic lattices legitimately have unconnected boundary faces,
         # so this check only applies when periodic=True.
         if periodic:
@@ -442,7 +444,7 @@ class SarcTopology:
             thick_to_thin_arr, thin['face_to_monomers'], thin['n_mono_per_face'],
             thick_starts_arr, n_thick, n_crowns,
             static_params.n_xb_per_crown, static_params.crown_rotation_deg,
-            static_params.crown_face_wiggle_deg, static_params.legacy_crown_geometry,
+            static_params.crown_face_wiggle_deg,
         )
 
         # XB bin edges and centers (baked in at topology creation time)
@@ -470,6 +472,7 @@ class SarcTopology:
             total_xbs=total_xbs,
             n_xb_bins=static_params.n_xb_bins,
             thin_node_spacing=static_params.thin_node_spacing,
+            static=static_params,
             xb_to_thin_id=jnp.asarray(xb_to_thin_id),
             xb_to_thin_face=jnp.asarray(xb_to_thin_face),
             xb_to_mono_indices=jnp.asarray(xb_to_mono_indices),
@@ -569,7 +572,7 @@ class SarcTopology:
 def _generate_hexagonal_thick_positions(
     n_rows: int,
     n_cols: int,
-    lattice_spacing: float = 1.0
+    lattice_spacing: float,
 ) -> Tuple[np.ndarray, float, float]:
     """Generate thick filament positions on hexagonal grid."""
     lattice_spacing = np.float32(lattice_spacing)
@@ -855,14 +858,12 @@ def _compute_connectivity(
     thin_face_orientations: List[Tuple[int, ...]],
     box_x: float,
     box_y: float,
-    periodic: bool = True,
-    n_faces_per_thin: int = 3,
-    thick_thin_distance: float = None,
-    thin_thick_pairs: List[Tuple[int, int]] = None
+    periodic: bool,
+    n_faces_per_thin: int,
+    thick_thin_distance: float,
+    thin_thick_pairs: Optional[List[Tuple[int, int]]],
 ) -> Tuple[List[List[Optional[Tuple[int, int]]]], List[List[Optional[Tuple[int, int]]]]]:
-    """Compute thick-thin connectivity."""
-    if thick_thin_distance is None:
-        thick_thin_distance = THICK_THIN_DISTANCE
+    """Compute thick-thin connectivity. thin_thick_pairs: invertebrate only, else None."""
 
     n_thick = len(thick_positions)
     n_thin = len(thin_positions)
@@ -1308,9 +1309,6 @@ def _tropomyosin_units(mono_offsets: np.ndarray, mono_strand: np.ndarray, per_un
 # FLATTENED INDEX MAP COMPUTATION
 # =============================================================================
 
-_LEGACY_FACE_PATTERN = np.array([[0, 2, 4], [1, 3, 5], [0, 2, 4]])  # Level 1, 2, 3
-
-
 def _compute_flat_index_maps_fixed_width(
     thick_to_thin: np.ndarray,
     face_to_monomers: np.ndarray,
@@ -1321,7 +1319,6 @@ def _compute_flat_index_maps_fixed_width(
     n_xb_per_crown: int,
     crown_rotation_deg: float,
     crown_face_wiggle_deg: float,
-    legacy_crown_geometry: bool,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Convert nested Thick->Face->Thin to flat XB->Thin maps with fixed-width arrays.
 
@@ -1349,10 +1346,6 @@ def _compute_flat_index_maps_fixed_width(
         the geometry, not a modelling failure: the unmatched heads are marked
         invalid in xb_valid and are permanently excluded from binding.
 
-    Setting legacy_crown_geometry=True substitutes a fixed lookup table for the
-    azimuth calculation, which is only meaningful for 3 heads per crown. It is
-    retained for compatibility with configurations that assume it.
-
     face_idx here is an abstract 0-5 label, not a physical angle. The mapping
     from label to direction — which differs by 30 degrees between the vertebrate
     and invertebrate lattices — was already resolved when thick_to_thin was
@@ -1366,9 +1359,9 @@ def _compute_flat_index_maps_fixed_width(
             Padded with neutral value (first candidate) for GPU parallelization
         xb_valid: (total_xbs,) bool - False where the XB has no real geometric
             thin-filament partner this crown (face didn't match, or the thick
-            filament genuinely has no neighbor there). Always True for the
-            legacy path. Downstream kinetics (transitions.py) must gate the
-            binding rate on this — it is NOT enforced here.
+            filament genuinely has no neighbor there). Downstream kinetics
+            (transitions.py) must gate the binding rate on this — it is NOT
+            enforced here.
     """
     total_xbs = n_thick * n_crowns * n_xb_per_crown
     max_mono_per_face = face_to_monomers.shape[2]
@@ -1384,20 +1377,14 @@ def _compute_flat_index_maps_fixed_width(
         crown_idx = local_idx // n_xb_per_crown
         xb_in_crown = local_idx % n_xb_per_crown
 
-        if legacy_crown_geometry:
-            # Verbatim original table — bit-identical, only valid at n_xb_per_crown==3
-            crown_level = (crown_idx + thick_starts[thick_idx] - 1) % 3 + 1
-            face_idx = _LEGACY_FACE_PATTERN[crown_level - 1, xb_in_crown]
-            matched = True
-        else:
-            eff_crown = crown_idx + (thick_starts[thick_idx] - 1)
-            azimuth_deg = (xb_in_crown * (360.0 / n_xb_per_crown)
-                           + eff_crown * crown_rotation_deg) % 360.0
-            nearest_face = int(round(azimuth_deg / 60.0)) % 6
-            residual_deg = abs(azimuth_deg - nearest_face * 60.0)
-            residual_deg = min(residual_deg, 360.0 - residual_deg)
-            matched = residual_deg < crown_face_wiggle_deg
-            face_idx = nearest_face
+        eff_crown = crown_idx + (thick_starts[thick_idx] - 1)
+        azimuth_deg = (xb_in_crown * (360.0 / n_xb_per_crown)
+                       + eff_crown * crown_rotation_deg) % 360.0
+        nearest_face = int(round(azimuth_deg / 60.0)) % 6
+        residual_deg = abs(azimuth_deg - nearest_face * 60.0)
+        residual_deg = min(residual_deg, 360.0 - residual_deg)
+        matched = residual_deg < crown_face_wiggle_deg
+        face_idx = nearest_face
 
         if matched:
             # Get thin filament and face from thick_to_thin connectivity
@@ -1444,13 +1431,13 @@ if __name__ == "__main__":
     print("Testing SarcTopology...")
     print("=" * 60)
 
-    from .params import get_skeletal_params
+    from .params import get_params
 
     # Test 1: Create geometry with skeletal parameters
     print("\nTest 1: Generate geometry with skeletal parameters")
     print("-" * 60)
-    static, dynamic, *_ = get_skeletal_params()
-    geometry = SarcTopology.create(nrows=2, ncols=2, static_params=static, dynamic_params=dynamic)
+    static, *_ = get_params('skeletal')
+    geometry = SarcTopology.create(2, 2, static)
     print(f"Geometry: {geometry}")
     print(f"  thick_to_thin shape: {geometry.thick_to_thin.shape}")
     print(f"  thin_to_thick shape: {geometry.thin_to_thick.shape}")

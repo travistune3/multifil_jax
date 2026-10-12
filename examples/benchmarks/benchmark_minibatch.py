@@ -26,7 +26,8 @@ import argparse
 import jax
 import jax.numpy as jnp
 
-from multifil_jax.simulation import run, get_skeletal_params, BATCH_BUCKETS
+from multifil_jax.simulation import run, BATCH_BUCKETS
+from multifil_jax.core.params import get_params
 from multifil_jax.core.sarc_geometry import SarcTopology
 
 
@@ -54,8 +55,8 @@ def main():
     print(f"Total runs: {total_runs}")
     print()
 
-    static, dynamic, z0, d0 = get_skeletal_params()
-    topo = SarcTopology.create(nrows=n, ncols=n, static_params=static, dynamic_params=dynamic)
+    static, dynamic, z0, d0 = get_params('skeletal')
+    topo = SarcTopology.create(n, n, static)
 
     # Candidate chunk sizes: powers of 2 up to total_runs (inclusive)
     # M == total_runs uses the single-call path (no minibatching) as baseline
@@ -77,18 +78,19 @@ def main():
 
         # Warmup: pays JIT compile for this chunk size once
         print(f"  Warming up {label}...", end='', flush=True)
-        r = run(topo, pCa=4.5, z_line=1100.0, lattice_spacing=d0, duration_ms=duration_ms,
-                replicates=total_runs, minibatch_size=minibatch_arg)
-        r.axial_force.block_until_ready()
+        r = run(topo, dynamic, pCa=4.5, z_line=1100.0, lattice_spacing=d0, dt=1.0,
+                duration_ms=duration_ms, replicates=total_runs, minibatch_size=minibatch_arg)
+        jax.block_until_ready(r.axial_force)
         print(" done")
 
         # Three timed runs
         times = []
         for seed in range(1, 4):
             t0 = time.perf_counter()
-            r = run(topo, pCa=4.5, z_line=1100.0, lattice_spacing=d0, duration_ms=duration_ms,
-                    replicates=total_runs, minibatch_size=minibatch_arg, rng_seed=seed)
-            r.axial_force.block_until_ready()
+            r = run(topo, dynamic, pCa=4.5, z_line=1100.0, lattice_spacing=d0, dt=1.0,
+                    duration_ms=duration_ms, replicates=total_runs, minibatch_size=minibatch_arg,
+                    rng_seed=seed)
+            jax.block_until_ready(r.axial_force)
             times.append(time.perf_counter() - t0)
 
         best_s = min(times)

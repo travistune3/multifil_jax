@@ -23,15 +23,15 @@ import jax.numpy as jnp
 
 from multifil_jax.simulation import run
 from multifil_jax.core.sarc_geometry import SarcTopology
-from multifil_jax.core.params import StaticParams, DynamicParams, get_skeletal_params
+from multifil_jax.core.params import get_params, poisson_spacing
 
 # ---------------------------------------------------------------------------
 # Topology (small 2x2 for fast examples)
 # ---------------------------------------------------------------------------
-static, dynamic, z0, d0 = get_skeletal_params()
-topo = SarcTopology.create(nrows=2, ncols=2, static_params=static, dynamic_params=dynamic)
+static, dynamic, z0, d0 = get_params('skeletal')
+topo = SarcTopology.create(2, 2, static)
 
-D0 = 14.0    # nm — reference lattice spacing
+D0 = d0      # nm — reference lattice spacing
 Z0 = 1100.0  # nm — reference z-line (skeletal SL ~2.2 µm)
 NU = 0.5     # Poisson exponent
 DT = 1.0     # ms timestep
@@ -57,7 +57,7 @@ pCa_trace1 = np.full(n1, 9.0)
 pCa_trace1[100:300] = 4.5
 
 result_dyn1 = run(
-    topo,
+    topo, dynamic,
     duration_ms=dur1,
     dt=DT,
     pCa=jnp.array(pCa_trace1),
@@ -91,7 +91,7 @@ print("Panel 2: Force comparison (fixed vs dynamic LS)...")
 
 # Reuse same pCa trace, same conditions
 result_fixed1 = run(
-    topo,
+    topo, dynamic,
     duration_ms=dur1,
     dt=DT,
     pCa=jnp.array(pCa_trace1),
@@ -128,7 +128,7 @@ pCa_trace3[50:] = 4.5
 d_deviations = []
 for k in K_lat_values:
     res = run(
-        topo,
+        topo, dynamic,
         duration_ms=dur3,
         dt=DT,
         pCa=jnp.array(pCa_trace3),
@@ -169,7 +169,7 @@ z_trace4[200:] = 900.0
 pCa4 = 4.5
 
 result_ramp = run(
-    topo,
+    topo, dynamic,
     duration_ms=dur4,
     dt=DT,
     pCa=pCa4,
@@ -184,7 +184,7 @@ result_ramp = run(
 
 time4 = np.arange(n4) * DT
 d_emergent = np.array(result_ramp.metrics['lattice_spacing'][0])
-d_poisson = D0 * (Z0 / z_trace4) ** NU  # Poisson prediction
+d_poisson = poisson_spacing(D0, Z0, z_trace4, NU, static.filament_radii_sum)  # Poisson prediction
 
 d_xb_perturbation = d_emergent - d_poisson
 

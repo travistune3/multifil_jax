@@ -28,7 +28,7 @@ import jax.numpy as jnp
 sys.path.insert(0, '.')
 from multifil_jax.simulation import run
 from multifil_jax.core.sarc_geometry import SarcTopology
-from multifil_jax.core.params import get_skeletal_params
+from multifil_jax.core.params import get_params
 
 
 def parse_args():
@@ -55,18 +55,18 @@ def run_section_a(dur, reps, seed):
     print("      To clear: rm -rf ~/.cache/multifil_jax/xla/")
     print()
 
-    static, dynamic, z0, d0 = get_skeletal_params()
-    topo = SarcTopology.create(nrows=2, ncols=2, static_params=static, dynamic_params=dynamic)
+    static, dynamic, z0, d0 = get_params('skeletal')
+    topo = SarcTopology.create(2, 2, static)
     n_steps = int(dur)
 
     common = dict(duration_ms=dur, dt=1.0, pCa=4.5, z_line=1100.0,
-                  lattice_spacing=14.0, replicates=reps, rng_seed=seed)
+                  lattice_spacing=d0, replicates=reps, rng_seed=seed)
 
     # Two kernels: fixed LS and dynamic LS (K_lat is traced so rigid/soft share one kernel)
     configs = [
-        ("Fixed LS",               lambda: run(topo, **common)),
-        ("Dynamic LS (K_lat=500)", lambda: run(topo, K_lat=500., nu=0.5, **common)),
-        ("Dynamic LS (K_lat=5.0)", lambda: run(topo, K_lat=5.0, nu=0.5, **common)),
+        ("Fixed LS",               lambda: run(topo, dynamic, **common)),
+        ("Dynamic LS (K_lat=500)", lambda: run(topo, dynamic, K_lat=500., nu=0.5, **common)),
+        ("Dynamic LS (K_lat=5.0)", lambda: run(topo, dynamic, K_lat=5.0, nu=0.5, **common)),
     ]
 
     print(f"{'Config':<28} {'1st call (s)':>12} {'ms/step':>8} {'Resid_max':>10} {'Force mean':>11}")
@@ -124,7 +124,7 @@ def run_section_b(dur, seed):
     print("K_lat per-filament fix: delta_d should be roughly constant across sizes.")
     print()
 
-    static, dynamic, z0, d0 = get_skeletal_params()
+    static, dynamic, z0, d0 = get_params('skeletal')
     K_LAT = 5.0
     NU = 0.5
     n_steps = int(dur)
@@ -134,25 +134,24 @@ def run_section_b(dur, seed):
     print("-" * len(cols))
 
     for nrows in [2, 4, 6, 8, 10]:
-        topo = SarcTopology.create(nrows=nrows, ncols=nrows,
-                                   static_params=static, dynamic_params=dynamic)
+        topo = SarcTopology.create(nrows, nrows, static)
 
         common = dict(
             duration_ms=dur, dt=1.0,
-            pCa=4.5, z_line=1100.0, lattice_spacing=14.0,
+            pCa=4.5, z_line=1100.0, lattice_spacing=d0,
             K_lat=K_LAT, nu=NU,
             replicates=1, rng_seed=seed,
         )
 
         # First call: compile + execute
         t0 = time.perf_counter()
-        result = run(topo, **common)
+        result = run(topo, dynamic, **common)
         jax.block_until_ready(result.metrics['axial_force'])
         compile_s = time.perf_counter() - t0
 
         # Second call: execute only
         t0 = time.perf_counter()
-        result = run(topo, **common)
+        result = run(topo, dynamic, **common)
         jax.block_until_ready(result.metrics['axial_force'])
         exec_s = time.perf_counter() - t0
 

@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 import jax
 import jax.numpy as jnp
 
-from multifil_jax.core.params import get_skeletal_params, StaticParams, DynamicParams
+from multifil_jax.core.params import get_params
 from multifil_jax.core.sarc_geometry import SarcTopology
 from multifil_jax.simulation import run, SimulationResult
 
@@ -84,12 +84,8 @@ def plot_metric_corner(results, metric_name='axial_force', last_n=20, cmap='viri
 
 print("Creating topology and running stiffness parameter sweep...")
 
-static, dynamic, z0, d0 = get_skeletal_params()
-topo_vert = SarcTopology.create(nrows=2, 
-                                  ncols=2, 
-                                  static_params=static, 
-                                  dynamic_params=dynamic)
-topo_vert = jax.device_put(topo_vert)
+static, dynamic, z0, d0 = get_params('skeletal')
+topo_vert = SarcTopology.create(2, 2, static)
 
 # Create parameter sweep values
 thick_sweep = [float(dynamic.thick_k) * (i * 0.5) for i in range(1, 20)]
@@ -99,17 +95,15 @@ titin_sweep = [float(dynamic.titin_b) * (i * 0.5) for i in range(1, 20)]
 print("Compiling + executing sweep...")
 start = time.time()
 results_vertebrate = run(
-    topo_vert,
+    topo_vert, dynamic,
     pCa=4,
     z_line=1100,
-    lattice_spacing=14,
+    lattice_spacing=d0,
     duration_ms=1000,
     dt=1.0,
-    dynamic_params={
-        'thick_k': thick_sweep,
-        'thin_EA': thin_sweep,
-        'titin_b': titin_sweep,
-    },
+    thick_k=thick_sweep,
+    thin_EA=thin_sweep,
+    titin_b=titin_sweep,
     replicates=1,
 )
 end = time.time()

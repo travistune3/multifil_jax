@@ -579,7 +579,8 @@ def _radial_residual(
     f_xb = -_xb_radial_force_total(
         xb_states, xb_bound_to, positions_thick, positions_thin, d, constants, topology
     )
-    f_titin = -_titin_radial_force_total(positions_thick, z_line, d, constants)
+    f_titin = -_titin_radial_force_total(positions_thick, z_line, d, constants,
+                                         topology.static.n_titin_per_thick)
     return f_lat + f_xb + f_titin
 
 

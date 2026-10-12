@@ -60,7 +60,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from multifil_jax import SarcTopology, run
-from multifil_jax.core.params import get_skeletal_params, get_lethocerus_params
+from multifil_jax.core.params import get_params, DYNAMIC_FIELDS
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -84,30 +84,25 @@ Z_LINES = {
 }
 
 PRESETS = {
-    'vertebrate': get_skeletal_params,
-    'lethocerus': get_lethocerus_params,
+    'vertebrate': 'skeletal',
+    'lethocerus': 'insect',
 }
 
 # Solver settings are held IDENTICAL across species, so that any difference in
 # the results is geometry and not solver tuning.
 #
-# The Newton cap is raised from its default of 4, which leaves residuals near
-# 17 pN at some IFM lengths. There used to be a residual-warning threshold set
-# alongside it, sized to a float32 precision floor that rose with node position
-# — IFM nodes sit at ~1500 nm rather than ~1100 nm. That floor is gone: node
-# positions are stored as displacements from rest, so the achievable residual
-# no longer depends on where the filament is. Convergence is now judged on the
-# dimensionless `solver_residual_norm` metric (<= 1 means converged).
+# The Newton cap is raised from the table's 4, which leaves some IFM lengths
+# unconverged. Convergence is judged on the dimensionless `solver_residual_norm`
+# metric (<= 1 means converged).
 N_NEWTON_STEPS = 16
 
 # ---------------------------------------------------------------------------
 # CAVEAT 1, ENFORCED: confirm the two presets really do share their kinetics.
 # ---------------------------------------------------------------------------
-_KINETIC_FIELDS = [f for f in vars(type(get_skeletal_params()[1])).get('__slots__', ())
-                   if f.startswith(('xb_', 'tm_'))]
+_KINETIC_FIELDS = [f for f in DYNAMIC_FIELDS if f.startswith(('xb_', 'tm_'))]
 
-_skeletal_dynamic = get_skeletal_params()[1]
-_ifm_dynamic = get_lethocerus_params()[1]
+_skeletal_dynamic = get_params('skeletal')[1]
+_ifm_dynamic = get_params('insect')[1]
 _differing = [f for f in _KINETIC_FIELDS
               if float(getattr(_skeletal_dynamic, f)) != float(getattr(_ifm_dynamic, f))]
 assert not _differing, (
@@ -143,12 +138,11 @@ topologies, n_valid_xbs, dynamics, spacings = {}, {}, {}, {}
 print("\n" + "=" * 72)
 print("STRUCTURE")
 print("=" * 72)
-for name, factory in PRESETS.items():
-    static, dynamic, z0, d0 = factory()
+for name, cls in PRESETS.items():
+    static, dynamic, z0, d0 = get_params(cls)
     static = static.replace(n_newton_steps=N_NEWTON_STEPS)
-    topo = SarcTopology.create(nrows=NROWS, ncols=NCOLS,
-                               static_params=static, dynamic_params=dynamic)
-    topologies[name] = (jax.device_put(topo), static)
+    topo = SarcTopology.create(NROWS, NCOLS, static)
+    topologies[name] = topo
     dynamics[name] = dynamic
     spacings[name] = d0
     n_valid_xbs[name] = describe(name, topo, dynamic)
@@ -168,22 +162,20 @@ print("SIMULATING")
 print("=" * 72)
 
 results = {}
-for name, (topo, static) in topologies.items():
+for name, topo in topologies.items():
     z_list = Z_LINES[name]
     print(f"  {name}: {len(z_list)} z_line x 2 pCa x {REPLICATES} replicates ...",
           end="", flush=True)
     t0 = time.time()
     res = run(
-        topo,
+        topo, dynamics[name],
         pCa=[PCA_RELAXED, PCA_ACTIVE],
         z_line=z_list, lattice_spacing=spacings[name],
         duration_ms=DURATION_MS,
         dt=1.0,
         replicates=REPLICATES,
-        dynamic_params=dynamics[name],
-        static_params=static,
     )
-    res.axial_force.block_until_ready()
+    jax.block_until_ready(res.axial_force)
     print(f" {time.time() - t0:.1f}s")
     results[name] = res
 
@@ -224,7 +216,7 @@ for name, res in results.items():
     force = np.stack([force_passive, force_total])
     bound = np.stack([np.zeros_like(bound), bound])
     tm_open = np.stack([np.zeros_like(tm_open), tm_open])
-    n_thick = topologies[name][0].n_thick
+    n_thick = topologies[name].n_thick
 
     summary[name] = dict(
         z=np.asarray(Z_LINES[name]),
