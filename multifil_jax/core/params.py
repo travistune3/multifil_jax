@@ -341,10 +341,10 @@ _DYNAMIC_DEFAULTS = {
     #     weak:   r=19.93 nm, theta=47.2 deg  ->  axial 13.55 nm, radial 14.61 nm
     #     strong: r=16.47 nm, theta=73.2 deg  ->  axial  4.76 nm, radial 15.77 nm
     #
-    # i.e. an ~8.8 nm separation between the rest configurations. There are only
-    # TWO of them, so the whole stroke is on the weak->strong isomerization
-    # (state 1 -> 2); states 2 and 3 share the strong configuration and the
-    # 2 -> 3 transition moves nothing. See kernels/rate_functions.py.
+    # i.e. an ~8.8 nm separation between the rest configurations. Tight_1 (state 2)
+    # has its own rest configuration between these two (see THE SPLIT STROKE
+    # below), so the stroke is split: ~79% on 1 -> 2 and ~21% on 2 -> 3. See
+    # kernels/rate_functions.py.
     #
     # 8.8 nm is NOT the stroke the mechanics delivers. A rest configuration is a
     # point in (r, theta) and is only reachable at its own natural radial
@@ -873,12 +873,13 @@ _DYNAMIC_DEFAULTS = {
                              #     (Q10 2–3 gives 68–120). If so, write that down;
                              #     otherwise drop the attribution.
     'xb_r23_coeff': 0.15,    # [G] ms⁻¹ Tight_1 -> Tight_2 isomerization at zero load.
-                             #     NOT the working stroke and NOT Pi release — both are
-                             #     on r12 (see rate_functions.py module docstring,
-                             #     "WHERE THE WORKING STROKE ACTUALLY IS"). This step
-                             #     moves nothing, does no work and changes no force; it
-                             #     commits the ~6 kT drop and makes the head
-                             #     ADP-release-competent.
+                             #     NOT Pi release (on r12) and NOT the main working
+                             #     stroke (also on r12) — it carries the SECOND, smaller
+                             #     step of the split stroke, ~21% of the lever swing
+                             #     (Capitanio et al. 2006's 1.0-1.3 nm step; see
+                             #     rate_functions.py module docstring, "WHERE THE
+                             #     WORKING STROKE ACTUALLY IS"). It also commits the
+                             #     ~6 kT drop and makes the head ADP-release-competent.
                              #     STALE-INDEX FIX 2026-08-27 (S127): this comment described the WORKING
                              #     STROKE. It does not live here. The model was renumbered
                              #     from 1-indexed to 0-indexed states; under the old scheme
@@ -949,8 +950,16 @@ _DYNAMIC_DEFAULTS = {
                              #     (rate_functions.xb_rate_23), so the delta_23/delta_34
                              #     coupling that used to hide changes here is gone and
                              #     this axis is now interpretable alone.
-    'xb_r40': 0.1,           # [G] ms⁻¹ recovery stroke. Unsourced, inherited as a
-                             #     hardcoded constant from an earlier version.
+    'xb_r40': 0.1,           # [G] ms⁻¹ recovery stroke. Inherited as a hardcoded
+                             #     constant from an earlier version, but corroborated:
+                             #     Sleep et al. 2005 J Physiol Fig. 6 legend uses
+                             #     "k2 = 100 s−1 , k–2 = 50 s−1" (rabbit psoas, 20 °C) —
+                             #     a model input there, not a measurement. The
+                             #     equilibrium r40/r04 = 10 is contested: Herrmann et
+                             #     al. 1994 find for myofibrils "In all cases, K3 > 10",
+                             #     while isolated S1 gives 1.7 (Burton et al. 2005
+                             #     Table 4, 5 °C) — likely attached vs detached heads,
+                             #     which r40/r04 do not distinguish. Treat as a range.
                              #     Caps the maximum cycling rate
     'xb_r04': 0.01,          # [M] ms⁻¹ reverse recovery; Mijailovich 2021
                              #     PMC7852458 (k−H = 10 s⁻¹). With r40 this gives
@@ -1556,12 +1565,13 @@ def get_cardiac_params() -> Tuple[StaticParams, DynamicParams, float, float]:
                                      this value is ~3× too fast. NOT resolved here.
         xb_r23_coeff = 0.065 ms⁻¹ — [G] STALE-INDEX FIX 2026-08-27 (S127). This was
                                      tagged [L-unverified] "lever arm rate ~2× slower",
-                                     but r23 is NOT the lever arm: the stroke is on r12
-                                     (old 1-indexed r23 == today's r12). r23 is the
-                                     Tight_1 -> Tight_2 isomerization, which does no
-                                     work. The Deacon lever-arm reasoning therefore does
-                                     not apply to this parameter at all, and the value
-                                     is UNJUSTIFIED rather than merely unverified.
+                                     but r23 is NOT the main lever-arm swing: that is on
+                                     r12 (old 1-indexed r23 == today's r12). r23 is the
+                                     Tight_1 -> Tight_2 isomerization, which carries only
+                                     the second, smaller step of the split stroke (~21%).
+                                     The Deacon lever-arm reasoning therefore does not
+                                     apply to this parameter, and the value is
+                                     UNJUSTIFIED rather than merely unverified.
                                      Retagged [L-unverified] -> [G].
                                      Also: the PDF on disk is the erratum reprint at
                                      69:4239–4255, not the cited 69:2261.
