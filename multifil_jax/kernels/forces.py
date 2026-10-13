@@ -208,9 +208,9 @@ def compute_thin_passive_forces(u_thin: jnp.ndarray, thin_k) -> jnp.ndarray:
     entirely. The thin frame is anchored on the Z-disc (absolute position is
     `z_line - node_offsets + u`), and `node_rests` is exactly the diff of
     `node_offsets`, so both the rest lengths and z_line cancel. The filament
-    therefore follows the Z-disc rigidly with no force and no state update —
-    which is why the simulation loop no longer shifts thin positions when the
-    Z-line moves. See core/state.py.
+    therefore follows the Z-disc rigidly with no force and no state update, so
+    the simulation loop never shifts thin positions when the Z-line moves. See
+    core/state.py.
 
     Row-wise: the Z-disc is the fixed anchor u = 0 past the last node, and the
     pointed-end node has no spring on its M-line side.
@@ -288,9 +288,8 @@ def xb_springs_for_state(xb_states_flat, params):
     """The two-spring parameters of whichever configuration a head is in.
 
     THREE configurations, not two: state 1 Loose (*_weak), state 2 Tight_1
-    (*_tight_1) and state 3 Tight_2 (*_strong). Tight_1 gained its own rest
-    configuration with the split stroke (the xb_*_tight_1 rows of
-    core/param_table.py). A plain three-way select, no interpolation:
+    (*_tight_1) and state 3 Tight_2 (*_strong); the split stroke is the
+    xb_*_tight_1 rows of core/param_table.py. A plain three-way select, no interpolation:
     there is no fraction to forget.
 
     Detached heads (states 0, 4, 5) fall through to the weak block. Nothing
@@ -364,9 +363,8 @@ def polar_to_filament(F_r, F_theta, cos_theta, sin_theta):
         F_axial  = F_r*cos(theta) - F_theta*sin(theta)   ( = dU/dx )
         F_radial = F_r*sin(theta) + F_theta*cos(theta)   ( = dU/dd )
 
-    THE MINUS ON THE AXIAL CONVERTER TERM IS THE S50 SIGN AND IS NOT
-    NEGOTIABLE (see the DO-NOT-REGRESS list). It is not a convention: the
-    rotation is orthonormal, and flipping it breaks
+    THE MINUS ON THE AXIAL CONVERTER TERM IS NOT NEGOTIABLE. It is not a
+    convention: the rotation is orthonormal, and flipping it breaks
     F_axial^2 + F_radial^2 == F_r^2 + F_theta^2.
 
     Returns:
@@ -409,14 +407,11 @@ def compute_xb_forces_vectorized(
     and because c_k can dominate g_k in the strong state, it can silently
     reverse the sign of total muscle force.
 
-    Which rest configuration applies depends on the head's state: strong
-    (states 2 and 3), weak otherwise. Only state 1 is both weak AND bound;
-    states 0, 4 and 5 are detached and carry no spring (rate_functions.py module
-    docstring), and n_bound counts states 1-3 only (metrics_fn.py). They are
-    given the weak parameter set by the `jnp.where` below purely because it
-    needs some value -- force is gated on xb_bound_to (-1 when unbound), not on
-    state, so a detached head contributes nothing regardless. An earlier version
-    of this sentence listed state 4 as weak-bound, which contradicted both.
+    Which rest configuration applies depends on the head's state (see
+    xb_springs_for_state): Loose, Tight_1 or Tight_2 for states 1, 2, 3. States
+    0, 4 and 5 are detached and carry no spring; they get the weak parameter set
+    only because the select needs some value -- force is gated on xb_bound_to
+    (-1 when unbound), not on state, so a detached head contributes nothing.
 
     Forces are equal and opposite: whatever a head does to its crown, it does the
     negative of to its bound MONOMER, and the monomer hands that reaction to the
@@ -536,9 +531,8 @@ def _xb_axial_forces_flat(
     THE LOAD-DEPENDENT RATE PATH (`transitions.xb_rate_matrix`, which imports
     `xb_polar_forces` and `polar_to_filament` directly) all read the same
     primitives, so a change to the physics cannot reach one and miss another.
-    The rate path is the one that did miss: it built its own scalar inline and
-    was wrong from the initial commit until 2026-09-09. See the primitives
-    header for the geometry, the sign conventions and the invariant.
+    See the primitives header for the geometry, the sign conventions and the
+    invariant.
 
     `positions_thin` is MONOMER positions (core.state.monomer_axial), not nodes.
 
@@ -611,9 +605,9 @@ def xb_axial_work(
     This is the quantity a tension-cost study wants in the numerator of an
     efficiency: what the motors actually delivered, per ATP they actually spent.
     It is NOT the work the half-sarcomere does externally — under an isometric
-    hold that is exactly zero while heads are still cycling and spending. Use
-    `sarcomere_work` for the external quantity; the two are different questions
-    and metrics_fn reports both.
+    hold that is exactly zero while heads are still cycling and spending. The
+    external work is -0.5*(F[t-1]+F[t])*dz from the axial_force and z_line
+    traces.
 
     SIGN CONVENTION, derived from this module and not chosen here.
     `x = site - crown` (see `_xb_axial_forces_flat`) and `F_axial = dU/dx` (see
@@ -629,9 +623,8 @@ def xb_axial_work(
 
     Trapezoid in force: `0.5*(f_old + f_new) * dx`. The force law is nonlinear
     in position, so this is second-order accurate in the step, not exact — the
-    error falls quadratically as dt shrinks, which
-    `local_projects/regression/xb_force_law_invariant.py` checks against
-    `xb_elastic_energy` directly.
+    error falls quadratically as dt shrinks (checkable against
+    `xb_elastic_energy` directly).
 
     >>> AXIAL COMPONENT ONLY. In dynamic-LS mode the lattice spacing `d` also
         changes over the step, and the radial force does real work that this
@@ -833,10 +826,8 @@ def _xb_radial_force_total(
     x_dist = bs_positions - xb_positions_flat
 
     # The SAME primitives as _xb_axial_forces_flat, taking the other component
-    # of the same rotation. The S129 prototype patch could not reach this
-    # function (it rewrote one function's source); sharing the law here removes
-    # the axial/radial mismatch that would otherwise exist for every state-2
-    # head under dynamic lattice spacing.
+    # of the same rotation, so the axial and radial forces of every head come
+    # from one law.
     r, theta, cos_theta, sin_theta = xb_geometry(x_dist, lattice_spacing)
     g_k, g_rest, c_k, c_rest = xb_springs_for_state(xb_states_flat, params)
     F_r, F_theta = xb_polar_forces(r, theta, g_k, g_rest, c_k, c_rest)

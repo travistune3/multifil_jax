@@ -1,30 +1,25 @@
 #!/usr/bin/env python
-# NOTE: Designed for interactive Jupyter/IPython use (VS Code or jupyter notebook).
-# The %% cell markers are for VS Code interactive mode.
+"""Three-way stiffness sweep (thick_k x thin_EA x titin_b), skeletal preset.
 
+19 values per axis, crossed: 6,859 simulations in one run() call. The result is
+shown as a corner plot of steady-state force — each diagonal panel is one
+stiffness averaged over the other two, each off-diagonal panel a pair.
 
-#%%
-
-
-# %load_ext autoreload
-# %autoreload 2
-
+The %% markers are cells for VS Code / Jupyter interactive mode.
+"""
 
 #%%
-import numpy as np
 import time
-import matplotlib.pyplot as plt
 
-import jax
-import jax.numpy as jnp
+import numpy as np
+import matplotlib.pyplot as plt
 
 from multifil_jax.core.params import get_params
 from multifil_jax.core.sarc_geometry import SarcTopology
-from multifil_jax.simulation import run, SimulationResult
+from multifil_jax.simulation import run
 
 
 #%%
-
 def plot_metric_corner(results, metric_name='axial_force', last_n=20, cmap='viridis'):
     """Generate corner plot for parameter sweep results.
 
@@ -73,15 +68,11 @@ def plot_metric_corner(results, metric_name='axial_force', last_n=20, cmap='viri
                 if j == 0: ax.set_ylabel(param_names[i])
                 if i == n_params - 1: ax.set_xlabel(param_names[j])
 
-    plt.suptitle(f"Corner Plot: {metric_name}")
-    plt.show()
+    fig.suptitle(f"Corner plot: {metric_name}")
+    return fig
 
 
 #%%
-# =============================================================================
-# STIFFNESS PARAMETER SWEEP
-# =============================================================================
-
 print("Creating topology and running stiffness parameter sweep...")
 
 static, dynamic, z0, d0 = get_params('skeletal')
@@ -112,86 +103,10 @@ print(results_vertebrate.summary())
 
 
 #%%
-# 
-# Derived metric
+force = np.array(results_vertebrate.axial_force[..., -100:].mean(axis=(-2, -1)))
+print(f"\nSteady-state force: mean={force.mean():.1f} pN, max={force.max():.1f} pN")
 
-pseudo_m6 = results_vertebrate.metrics['thick_displace_mean']
-
-force = results_vertebrate.axial_force
-
-
-# hystereisis = ...
-
-
-# plot_metric_corner(hystereisis, metric_name='thick_energy_first_avg', last_n=5)
-
-#%%
-
-
-
-#%%
-# =============================================================================
-# ANALYSIS
-# =============================================================================
-
-import numpy as np
-
-# Steady-state force: mean of last 100 timesteps, collapsed across sweep axes
-last_n = 100
-
-vert_ss_force = np.array(results_vertebrate.axial_force[..., -last_n:].mean(axis=(-2, -1)))
-
-print("\nSteady-state force:")
-print(f"  mean={vert_ss_force.mean():.1f} pN, max={vert_ss_force.max():.1f} pN")
-
-# Thick filament displacement metric
-vert_disp = np.array(results_vertebrate.metrics['thick_displace_mean'][..., -last_n:].mean(axis=(-2, -1)))
-
-print("\nThick filament displacement:")
-print(f"  mean={vert_disp.mean():.3f} nm, max={vert_disp.max():.3f} nm")
-
-# Optional: matplotlib plots
-try:
-    import matplotlib.pyplot as plt
-
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-
-    # Force vs time (diagonal of sweep: equal stiffness scaling)
-    diag_n = min(len(thick_sweep), 5)
-    ax = axes[0]
-    for i in range(diag_n):
-        t = np.arange(results_vertebrate.axial_force.shape[-1])
-        ax.plot(t, np.array(results_vertebrate.axial_force[i, i, i, 0, :]),
-                label=f'vert k={thick_sweep[i]:.0f}', alpha=0.7)
-    ax.set_xlabel('Timestep')
-    ax.set_ylabel('Force (pN)')
-    ax.set_title('Force Traces (diagonal sweep)')
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-
-    # Force vs stiffness (diagonal)
-    ax = axes[1]
-    ks = thick_sweep[:diag_n]
-    ax.plot(ks, vert_ss_force.diagonal()[:diag_n], 'o-')
-    ax.set_xlabel('thick_k (pN/nm)')
-    ax.set_ylabel('Steady-state Force (pN)')
-    ax.set_title('Force vs Stiffness')
-    ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig('hysteresis_analysis.png', dpi=150, bbox_inches='tight')
-    print("\nPlot saved to hysteresis_analysis.png")
-    # No plt.show() — it blocks until dismissed by hand and the figure is
-    # already saved above. Same reason as examples/dynamic_lattice_spacing.py.
-except ImportError:
-    print("\n(matplotlib not available, skipping plots)")
-
-
-
-
-
-
-
-
-
-
+fig = plot_metric_corner(results_vertebrate, 'axial_force', last_n=100)
+out = __file__.replace('.py', '.png')
+fig.savefig(out, dpi=150, bbox_inches='tight')
+print(f"Plot saved to {out}")

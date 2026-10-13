@@ -368,28 +368,17 @@ def get_bucket_size(actual_size: int) -> int:
 # When to split a padded batch into sequential chunks: (min_batch, chunk_size).
 #
 # Chunking is primarily a MEMORY control, not a speed one. Every simulation
-# accumulates all 43 metrics at every timestep, so peak GPU memory scales as
+# accumulates every metric at every timestep, so peak GPU memory scales as
 #
-#     peak VRAM (GB) ~ minibatch_size * n_steps * 43 * 4 bytes * 2 / 1e9
+#     peak VRAM (GB) ~ minibatch_size * n_steps * n_metrics * 4 bytes * 2 / 1e9
 #
 # A CHUNKED RUN ACCUMULATES ON THE HOST, NOT THE DEVICE — see the chunk loop in
 # run(). Chunking alone never bounded the total: every chunk stayed resident and
 # the concatenate then built a second full copy, so a big sweep finished its
 # compute and died assembling the result. 43 metrics x 4 bytes = 172 bytes per
 # sim per timestep, so 67k sims over 1200 steps wants 13.9 GB, twice, on a
-# 24 GB card. (It was 252 bytes over 63 metrics until 2026-09-19, when the 20
-# reconstructible ones were deleted — a 1.5x reduction, not a fix.)
-#
-# >>> THE HOST FIX TRADES A GPU LIMIT FOR A HOST-RAM LIMIT, AND THAT IS NOT A
-#     REAL SOLUTION. A 236k-sim x 1200-step grid still needs ~49 GB of system
-#     RAM to hold traces the caller usually reduces to one scalar per sim and
-#     throws away. It works here (125 GB under WSL2) and it will not work on a
-#     normal machine. The durable fix is to stop materialising what nobody
-#     wants — reduce each chunk's time axis before accumulating it — which is
-#     deliberately NOT done here because doing it inside the kernel changes its
-#     output signature and reintroduces the per-metric-list recompile that got
-#     explicit metric selection removed in the first place. Revisit with that
-#     constraint in mind. <<<
+# 24 GB card. Host RAM is then the limit: traces are materialised in full even
+# when the caller reduces each sim to one scalar.
 #
 # — roughly 0.7 GB of metrics for 4096 simulations over 1000 steps, and about
 # twice that in total. On an 8 GB card a long simulation at large batch will run

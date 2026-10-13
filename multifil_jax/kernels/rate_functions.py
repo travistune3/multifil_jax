@@ -23,14 +23,12 @@ States 1-2-3 are the classical blocked/closed/open picture (McKillop & Geeves
 enters as a genuine rate rather than a switch. Only state 3 permits binding.
 
 The cycle closes 3 -> 0 rather than running backwards through 1: calcium
-dissociates from the open state directly. A site with a crossbridge attached is
-locked in state 3 — the bound head physically holds tropomyosin out of the way,
-which is the structural basis for crossbridge binding being self-reinforcing.
-That lock is NOT expressed in the rates below: whether a site is locked changes
-every timestep while the rate matrices do not, so it is applied afterwards as a
-[0, 0, 0, 1] override on the locked site's probability vector (see
-transitions.thin_transitions). Gating 3->2 and 3->0 in the rates would give the
-same result, at the cost of the 27-matrix reduction.
+dissociates from the open state directly. A unit with crossbridges attached is
+biased towards state 3 — the bound heads hold tropomyosin out of the way, which
+is why crossbridge binding is self-reinforcing. That lock is a RATE: the
+generator builder divides k_30 and k_32 by (1 + xb_tm_K2)^n for n bound heads
+(see transitions._compute_unique_tm_Q_matrices); the functions below return the
+unlocked rates.
 
 THE CROSSBRIDGE CYCLE (6 states)
 --------------------------------
@@ -51,63 +49,31 @@ WHERE THE WORKING STROKE ACTUALLY IS
 Mostly on 1 -> 2, with the remainder on 2 -> 3. NOT on 2 -> 3 alone, despite
 the Tight_1/Tight_2 naming.
 
-THIS DEPENDS ON THE PARAMETERS, and the dependence is worth stating exactly,
-because it used to be a structural fact and is now a control path. When the
-*_tight_1 springs equal the *_strong ones, states 2 and 3 are elastically
-identical, the whole rest-position change happens on 1 -> 2, and 2 -> 3 moves
-nothing, does no work and changes no force — a purely chemical step. That was
-the model until 2026-09-01 and it is still exactly what the six control values
-in core/param_table.py reproduce.
+When the *_tight_1 springs equal the *_strong ones, states 2 and 3 are
+elastically identical, the whole rest-position change happens on 1 -> 2, and
+2 -> 3 is a purely chemical step. At the shipped defaults the *_tight_1 rest
+positions differ (the split stroke rows in core/param_table.py), so 2 -> 3
+carries part of the lever swing. The axial rest projection g_rest*cos(c_rest)
+for Loose / Tight_1 / Tight_2 is 13.55 / 6.60 / 4.76 nm skeletal and insect
+(6.95 nm on 1 -> 2, 1.84 nm on 2 -> 3) and 13.55 / 8.49 / 7.14 nm cardiac
+(5.07 and 1.34 nm); 2 -> 3 is 21% of the total in every class.
 
-At the shipped defaults the *_tight_1 rest positions differ (see the split
-stroke block in core/param_table.py), so 2 -> 3 carries part of the lever swing:
-the axial rest projection g_rest*cos(c_rest) is 13.5516 / 6.6021 / 4.7604 nm
-for Loose / Tight_1 / Tight_2, i.e. 6.949 nm on 1 -> 2 and 1.842 nm — 21.0% of
-the 8.791 nm total — on 2 -> 3. Note the projection is NOT linear in the
-interpolation fraction the two rest positions were built from (0.78), and
-1.842 nm is ~1.2-1.4x the ~1.5 nm second swing quoted below, so it is NOT a
-match to Doran 2023 or Woody 2019. It is also a different quantity from the 5.837 nm
-"effective stroke" measured mechanically in S109; do not mix the two.
+The 2 -> 3 swing stands for the second, smaller lever swing that accompanies
+ADP release: ~16 degrees / ~1.5 nm in cardiac myosin (Doran 2023 by cryo-EM;
+Woody 2019 measures 1-1.5 nm by single molecule), essentially absent in fast
+skeletal myosin (Gollub, Cremo & Cooke 1996).
 
 What separates the two states in every configuration is the ~6 kT free energy
 drop that makes the stroke effectively one-way, and the fact that only state 3
 can release ADP and detach.
 
-The two-configuration form was a deliberate design, not an oversight, and the
-case for it still stands on its own terms. Fibre mechanics and X-ray modelling
-both argue that ONE force-bearing conformation plus one low-force attached
-conformation is sufficient: Knupp & Squire 2020 (Biology 9:464) fit length-step
-transients, isotonic shortening and the M3 reflection with exactly that, and
-could not find parameters for variants carrying two force-producing attached
-states; Eakins 2016 (Biology 5:41) concludes from X-ray that "no more than two
-main attached structural states are necessary and sufficient", with the weak
-state contributing ~4% of tension. In that mapping state 1 is the low-force
-attached state and states 2+3 together are the single force-bearing one.
-
-The split stroke breaks that mapping: states 2 and 3 are now elastically
-distinct, so this model carries two force-bearing configurations against those
-two arguments. It was adopted anyway, on a measurement the two-configuration
-form fails outright — force per strong head 1.67 pN against Piazzesi 2007's
-~5.7, with the strong-bound FRACTION already right, i.e. a strain-distribution
-deficit rather than a recruitment one (S129). Splitting the stroke and taking
-the catch-bond sign of xb_delta_34 together carried force from 52% to 93% of
-the Kooiker target at literature values, with no fitting.
-
-The known omission WAS the second, much smaller lever swing that accompanies
-ADP release: ~16 degrees / ~1.5 nm in cardiac myosin (Doran 2023 JGP
-155:e202213267 by cryo-EM; Woody 2019 eLife 8:e49266 measures 1-1.5 nm by
-single molecule), essentially absent in fast skeletal myosin (Gollub, Cremo &
-Cooke 1996 Nat Struct Biol 3:796). Its structural role is argued to be strain
-sensing rather than force generation, and in the two-configuration model it
-appeared only as the Bell distance of the detachment step (xb_delta_34), never
-as a displacement.
-
-The split stroke is precisely the fix for that omission: the second swing is
-now a real displacement, and it is the 2 -> 3 step. That moves the model TOWARD
-the dissenting view — Offer & Ranatunga 2013 (Biophys J 105:928-940) require
-TWO tension-generating steps, of 5.6 and 4.6 nm, and reject single-step models
-on efficiency and on lengthening force-velocity — though not to their
-partition: this model's split is 6.69 / 2.10 nm, far more lopsided than theirs.
+Two force-bearing configurations is a modelling choice. Knupp & Squire 2020 fit
+length-step transients, isotonic shortening and the M3 reflection with one
+force-bearing plus one low-force attached state, and Eakins 2016 concludes from
+X-ray that "no more than two main attached structural states are necessary and
+sufficient". Offer & Ranatunga 2013 instead require TWO tension-generating
+steps, of 5.6 and 4.6 nm. This model sits between them: two force-bearing
+states with a lopsided split.
 
 SRX is not part of that cycle — it is a reserve. Heads parked in SRX have very
 low ATPase and cannot bind at all; calcium recruits them out (xb_rate_50).
@@ -136,17 +102,15 @@ Two distinct mechanisms, easy to conflate:
   depends on the axial FORCE the head is currently carrying, via
   exp(f*delta_34/kT), where delta_34 is the distance to the transition state.
   The load fed to it is the axial force from the same rotation the force law
-  uses (forces.polar_to_filament), not the head's radial spring force — see the
-  note at the call site in transitions.py for the bug that distinction fixed.
+  uses (forces.polar_to_filament), not the head's radial spring force.
 
   Barrier / elastic-energy — used for 2 -> 3. The barrier is the elastic energy
   difference between the flanking configurations, floored at zero, so the uphill
   direction is slowed and the downhill one is strain-free. This is Smith &
   Geeves' treatment of the force-generating isomerisation and it carries NO
-  transition-state distance. It replaced a Bell factor and its unsourced
-  delta_23 on 2026-09-09; see xb_rate_23 for the derivation, and note that under
-  it the pre-exponential A23 is the rate's CEILING rather than its
-  mid-distribution value.
+  transition-state distance. See xb_rate_23 for the derivation; under it the
+  pre-exponential A23 is the rate's CEILING rather than its mid-distribution
+  value.
 
   For 3 -> 4 the sign of delta_34 is NEGATIVE at the shipped defaults: a catch
   bond, in which resistive load SLOWS detachment. See xb_rate_34 for the five
@@ -190,13 +154,6 @@ outside this repository.
 
 Bell GI (1978), "Models for the specific adhesion of cells to cells", Science
     200:618-627.
-Capitanio M, Canepari M, Cacciafesta P, Lombardi V, Cicchi R, Maffei M, Pavone
-    FS, Bottinelli R (2006), "Two independent mechanical events in the
-    interaction cycle of skeletal muscle myosin with actin", PNAS 103:87-92.
-Caremani M, Pinzauti F, Powers JD, Governali S, Narayanan T, Stienen GJM,
-    Reconditi M, Linari M, Lombardi V, Piazzesi G (2019), "Inotropic
-    interventions do not change the resting state of myosin motors during
-    cardiac diastole", J Gen Physiol 151:53-65, doi:10.1085/jgp.201812196.
 Caremani M et al. (2025), "Multiple pathways in the actin-myosin cycle of
     energy transduction", Front Physiol 16, doi:10.3389/fphys.2025.1664568.
 Davis JP, Norman C, Kobayashi T, Solaro RJ, Swartz DR, Tikunova SB (2007),
@@ -212,8 +169,6 @@ Doran MH et al. (2023), "Conformational changes linked to ADP release from
 Eakins CG, Reconditi M, Morris EP, Squire JM (2016), "X-ray diffraction
     evidence for low force actin-attached and rigor-like cross-bridges in the
     contractile cycle", Biology 5:41, doi:10.3390/biology5040041.
-Fraser IDC, Marston SB (1995), "In vitro motility analysis of actin-tropomyosin
-    regulation by troponin and calcium", J Biol Chem 270:7836-7841.
 Fusi L, Brunello E, Yan Z, Irving M (2016), "Thick filament mechano-sensing is
     a calcium-independent regulatory mechanism in skeletal muscle", Nat Commun
     7:13281, doi:10.1038/ncomms13281.
@@ -227,8 +182,6 @@ Kawai M, Zhao Y (1993), "Cross-bridge scheme and force per cross-bridge state
 Knupp C, Squire JM (2020), "The transient mechanics of muscle require only a
     single force-producing cross-bridge state and a 100 Angstrom working
     stroke", Biology 9:475, doi:10.3390/biology9120475.
-Lehrer SS, Morris EP (1982), "Dual effects of tropomyosin and troponin-
-    tropomyosin on actomyosin subfragment 1 ATPase", J Biol Chem 257:8073-8080.
 McKillop DFA, Geeves MA (1993), "Regulation of the interaction between actin
     and myosin subfragment 1: evidence for three states of the thin filament",
     Biophys J 65:693-701.
@@ -246,19 +199,9 @@ Park-Holohan S-J et al. (2021), "Stress-dependent activation of myosin in the
     PNAS 118:e2023706118, doi:10.1073/pnas.2023706118.
 Pate E, Cooke R (1989), "A model of crossbridge action: the effects of ATP, ADP
     and Pi", J Muscle Res Cell Motil 10:181-196.
-Piazzesi G et al. (2007), "Skeletal muscle performance determined by modulation
-    of number of myosin motors rather than motor force or stroke size", Cell
-    131:784-795, doi:10.1016/j.cell.2007.09.045.
 Pinto JR et al. (2011), "Strong cross-bridges potentiate the Ca2+ affinity
     changes produced by hypertrophic cardiomyopathy cardiac troponin C mutants
     in myofilaments", J Biol Chem 286:1005-1013, doi:10.1074/jbc.M110.168583.
-Prodanovic M, Irving TC, Mijailovich SM (2019), "Estimation of forces on actin
-    filaments in living muscle from X-ray diffraction patterns and mechanical
-    data", Int J Mol Sci 20:6044, doi:10.3390/ijms20236044.
-Reconditi M, Brunello E, Fusi L, Linari M, Piazzesi G, Lombardi V, Irving M
-    (2011), "Motion of myosin head domains during activation and force
-    development in skeletal muscle", PNAS 108:7236-7240,
-    doi:10.1073/pnas.1018330108.
 Siemankowski RF, White HD (1984), "Kinetics of the interaction between actin,
     ADP, and cardiac myosin-S1", J Biol Chem 259:5045-5053.
 Stewart MA, Franks-Skiba K, Chen S, Cooke R (2010), "Myosin ATP turnover rate
@@ -271,9 +214,6 @@ Sung J, Nag S, Mortensen KI, Vestergaard CL, Sutton S, Ruppel K, Flyvbjerg H,
 Veigel C, Schmitz S, Wang F, Sellers JR (2005), "Load-dependent kinetics of
     myosin-V can explain its high processivity", Nat Cell Biol 7:861-869,
     doi:10.1038/ncb1287.
-Walcott S, Warshaw DM (2010), "Modeling smooth muscle myosin's two heads: long-
-    lived enzymatic roles and phosphorylation-dependent equilibria", Biophys J
-    99:1129-1138, doi:10.1016/j.bpj.2010.06.018.
 Wang Y et al. (2024), "Single-molecule investigation of load-dependent
     actomyosin dissociation kinetics for cardiac and slow skeletal myosin",
     Small, doi:10.1002/smll.202406865.
@@ -342,14 +282,10 @@ def tm_rate_12(k_12_base, mod):
 
     Args:
         k_12_base: Rate constant (ms^-1) - params.tm_k_12.
-                   1.0 skeletal / 0.5 cardiac. NO MEASURED RATE SOURCE EXISTS for
-                   this step (audit 2026-08-19). The former citation to Geeves &
-                   Lehrer 1994 for "20-1000 s^-1" was withdrawn: that range is not
-                   in the paper, and the one rate statement it does make
-                   (k+T + k-T >> 500 s^-1) is a ONE-SIDED bound on the closed<->open
-                   step, i.e. tm_rate_23, not this one. Fraser & Marston 1995 was
-                   also withdrawn: it contains no rate constants at all (it is a
-                   steady-state motility paper). The EQUILIBRIUM is constrained --
+                   NO MEASURED RATE SOURCE EXISTS for this step. Geeves &
+                   Lehrer 1994's one rate statement (k+T + k-T >> 500 s^-1) is a
+                   ONE-SIDED bound on the closed<->open step, i.e. tm_rate_23,
+                   not this one. The EQUILIBRIUM is constrained --
                    McKillop & Geeves 1993 K_B = [closed]/[blocked] = 0.3 without
                    Ca2+ and >=16 with Ca2+ -- see params.tm_Keq_12.
         mod: Cooperativity multiplier, exp(+h/2) on the Ising path (1.0 = none)
@@ -528,20 +464,14 @@ def xb_rate_10(r01, U_DRX, U_loose):
     The +0.005 floor inside the logarithm keeps the rate finite where r01 is
     exactly zero, which happens for every head facing a covered site
     (permissiveness = 0). Without it those heads would produce log(0) = -inf and
-    poison the rate matrix. The floor is numerical housekeeping with no physical
-    effect — but for a different reason since 2026-09-01 than the one that used
-    to be written here. It is no longer that a head cannot be bound at a covered
-    site because the hard lock forbids tropomyosin from closing over one; the
-    lock is finite now and tropomyosin does close. It is that closure DETACHES
-    every bound head in the same timestep (kernels/transitions.thin_transitions,
+    poison the rate matrix. The floor has no physical effect: tropomyosin
+    closure DETACHES every bound head in the same timestep (kernels/transitions.thin_transitions,
     which runs before thick_transitions), so no state-1 head is ever at a
     covered site when this rate is evaluated.
 
     DO NOT "SIMPLIFY" THIS FUNCTION. Because the rate is analytically constant,
     the log-space form, the floor and the 10000 ms^-1 cap all look removable.
-    Removing the floor changes r10 at OPEN sites by a relative 1.6e-5 — small,
-    but not bit-identical, and an exact control path is worth more than the
-    three lines. It is a good follow-up on its own.
+    Removing the floor changes r10 at OPEN sites by a relative 1.6e-5.
 
     Args:
         r01: Forward binding rate (ms^-1)
@@ -643,10 +573,10 @@ def xb_rate_23(A23, E_tight_1, E_tight_2):
     is on 1 -> 2; see the module docstring. What this step always does is commit
     the head to the ~6 kT drop that makes the stroke effectively irreversible,
     and move it into the only state from which ADP release and detachment are
-    possible. At the shipped (split-stroke) defaults it also carries 2.099 nm of
-    the 8.791 nm axial swing (23.9%), so it does work and changes force.
+    possible. At the shipped (split-stroke) defaults it also carries part of
+    the axial swing (module docstring), so it does work and changes force.
 
-    THE ELASTIC-ENERGY FORM, NOT A BELL DISTANCE (changed 2026-09-09).
+    THE ELASTIC-ENERGY FORM, NOT A BELL DISTANCE.
 
         dE   = E_tight_2 - E_tight_1        elastic, in kT
         r23  = A23 * exp(-max(dE, 0))
@@ -663,22 +593,9 @@ def xb_rate_23(A23, E_tight_1, E_tight_2):
     negative, so a downhill step can be strain-independent but never
     strain-ACCELERATED.
 
-    WHAT THIS REPLACED, AND WHY. The step used a Bell factor exp(-f*delta_23/kT)
-    fed by a scalar that was not a force (see the note at the call site in
-    transitions.py). Correcting the force alone leaves delta_23 — an unsourced
-    [I] parameter whose cited literature (Pate & Cooke 1989; Huxley & Simmons
-    1971) describes the STROKE, which in this model is r12, not this step. The
-    energy form removes the parameter instead of re-anchoring it, and gives the
-    step a ceiling of A23 that the Bell form did not have.
-
-    delta_23's reputation as a major lever was STALE. The "-78%/-83% if zeroed"
-    table in xb_rate_34's docstring was measured before the split stroke, with
-    states 2 and 3 mechanically identical AND on the old slip bond; the same
-    table shows the cost collapsing to -46%/-19% under the shipped catch bond,
-    and the note itself said delta_23 "has been standing in for the missing
-    catch bond". Under this form the lever does not vanish — it moves into the
-    tight_1/tight_2 REST-CONFIGURATION difference that sets dE, which is
-    structural and sourced where delta_23 was not.
+    The strain dependence of this step lives in the tight_1/tight_2
+    REST-CONFIGURATION difference that sets dE, so the step has no free
+    transition-state distance and a ceiling of A23.
 
     r32 IS DELIBERATELY LEFT AS PLAIN DETAILED BALANCE (xb_rate_32). Substitute
     this rate into it and the strain factor lands on whichever direction climbs,
@@ -690,10 +607,8 @@ def xb_rate_23(A23, E_tight_1, E_tight_2):
              [G] UNSOURCED, and now the binding uncertainty on this step. The
              usual citation (Millar & Homsher 1990, ~70-100 s^-1) measured k_Pi
              from caged-phosphate photolysis, i.e. Pi release coupled to force
-             generation, which in this model is 1 -> 2. Under this form A23 is
-             additionally the CEILING of the rate, not its mid-distribution
-             value as it was under Bell, so its numerical meaning has changed
-             even though the symbol has not.
+             generation, which in this model is 1 -> 2. A23 is the CEILING of
+             the rate, not its mid-distribution value.
         E_tight_1: Elastic energy of state 2's configuration at this geometry (kT)
         E_tight_2: Elastic energy of state 3's configuration at this geometry (kT)
 
@@ -777,27 +692,18 @@ def xb_rate_34(A34, f_strong, delta34, k_t):
 
     Bell form: r34 = A34 * exp(f * delta_34 / kT), where f is the head's AXIAL
     force (positive = resisting). CATCH BOND at the shipped defaults, because
-    delta_34 = -0.80 nm is negative: resistive load SLOWS detachment. That sign
-    landed in S129 and is sourced three independent ways — see THE SIGN IS
-    CONTESTED below, and note that all three sources measure axial load, which
-    is exactly the quantity this rate is now fed (the load handed to it was not
-    an axial force until 2026-09-09; see the call site in transitions.py).
-
-    This is the model's ONLY Bell rate. 2 -> 3 used to be the other one; it
-    moved to Smith & Geeves' elastic-energy barrier and lost its
-    transition-state distance, so delta_34 no longer has a partner to trade
-    against. See xb_rate_23.
+    delta_34 = -0.80 nm is negative: resistive load SLOWS detachment. This is
+    the model's ONLY Bell rate (2 -> 3 uses the elastic-energy barrier, see
+    xb_rate_23), so delta_34 can be swept alone.
 
     Args:
         A34: Zero-load detachment rate (ms^-1) - params.xb_r34_coeff.
-             [I] skeletal / [L] cardiac. Siemankowski & White 1984 JBC 259:5045
-             VERIFY cardiac exactly: "the rate constant for the dissociation of
-             ADP from cardiac actomyosin-S1, k_AD, is ~65 s^-1 at 15 C" (bovine
-             ventricle, beta-MHC). For skeletal the same paper gives ">500 s^-1"
-             at 15 C, but that is a ONE-SIDED BOUND and is quoted from their
-             ref (14), not measured there -- hence [I], not [M]. "Cardiac ~10x
-             slower" is a 15 C statement only: k_AD extrapolates to ~550 s^-1 at
-             38 C (Q10 ~ 2.4).
+             [I] skeletal / [L] cardiac. Siemankowski & White 1984 JBC 259:5045:
+             "the rate constant for the dissociation of ADP from cardiac
+             actomyosin-S1, k_AD, is ~65 s^-1 at 15 C" (bovine ventricle,
+             beta-MHC). For skeletal the same paper gives ">500 s^-1" at 15 C,
+             a ONE-SIDED BOUND quoted from their ref (14) -- hence [I], not [M].
+             "Cardiac ~10x slower" is a 15 C statement only.
         f_strong: Force carried in the strong state (pN); positive = tensile
         delta34: Transition-state distance (nm) - params.xb_delta_34
         k_t: Thermal energy kT (pN*nm)
@@ -805,100 +711,31 @@ def xb_rate_34(A34, f_strong, delta34, k_t):
     Returns:
         Rate r34 (ms^-1), capped at 10000 ms^-1
 
-    THE SIGN IS CONTESTED, AND THIS MODEL'S OWN LINEAGE TAKES THE OTHER ONE.
-    Pate & Cooke 1989 JMRCM 10:181, Table 2, make ADP release a decreasing
-    function of strain — 2 s^-1 for a highly strained force-producing bridge
-    (x >= 3.7 nm) rising to 750 s^-1 once it is dragging (x < 0), a 375-fold
-    catch bond. VERIFIED EXACTLY against Table 2 (2026-08-19):
-    R45(x) = 2 s^-1 (x >= 3.7); 273.3 - 73.3x (1 <= x < 3.7);
-             750 - 550x (0 <= x < 1); 750 s^-1 (x < 0).
-    Note their own wording makes this an ASSUMPTION, not a measurement: the
-    rates "are assumed to rise dramatically as x approaches 0". They state the
-    reasoning directly: "we assume that Mg2+ADP release
-    is slow for highly strained crossbridges in the A.M.D state, limiting the
-    isometric ATPase. For values of x < 0, any crossbridge which remains attached
-    produces a force which inhibits filament sliding, decreasing efficiency."
-    That is the classical Huxley g(x): hold on while doing work, let go when
-    resisting.
-
-    Two single-molecule studies measure the same sign. Sung 2015 Nat Commun 6:7931
-    (human beta-cardiac, harmonic force spectroscopy) VERIFIED: "they average to
-    k0 = 87 +/- 7 s^-1 and d = 0.8 +/- 0.1 nm (mean +/- s.e.m., N = 7)"; resisting
-    load slows detachment. Wang 2024 Small (rabbit native beta-cardiac and slow
-    skeletal) VERIFIED on the sign: "both kf and ks responded to increasing
-    resistive as well as assistive load by slowing the actomyosin unbinding rates
-    ... exhibiting 'catch bond' behavior".
-    CORRECTION 2026-08-19: delta = 0.97 nm was previously attributed to Wang here.
-    It is NOT their number -- "0.97" appears zero times in that paper; 0.97 nm is
-    Greenberg et al.'s porcine value quoted inside Sung. Wang's own fitted
-    distances are 1.53 +/- 0.31, 1.53 +/- 0.17 and 1.87 +/- 1.4 nm. So the measured
-    Bell distances are 0.8 nm (Sung) and ~1.5-1.9 nm (Wang) -- both above this
-    model's 0.5, and Wang further above than previously stated.
-    Two caveats on Wang: the catch behaviour holds for ASSISTIVE as well as
-    resistive load, and it was measured at 10 uM ATP to isolate a strong-bound
-    rigor-like state, far below physiological ATP.
-
-    The likely resolution is that two detachment routes are being conflated: a
-    slow, ADP-release-limited exit from the post-stroke state, which is a catch
-    bond (Sung 2015; Wang 2024; and Veigel 2005 Nat Cell Biol 7:861 for myosin-V,
-    where resisting load slows ADP release -- VERIFIED: "extrapolation would
-    predict the detachment kinetics of the front head to slow down 50-fold and the
-    kinetics of the rear head to accelerate"; note this is mouse brain myosin-V, a
-    processive motor, and the effect is INTRAMOLECULAR strain between two heads,
-    not external load on a muscle crossbridge), and a fast premature detachment
-    from early force-generating states, which is a slip bond (Woody 2019;
-    Caremani 2025 -- neither checked yet). This model already has the second route
-    as the strain-gated 3->2->1->0 path, so this rate is the first one.
-    REMOVED 2026-08-19: Capitanio 2006 PNAS 103:87 was cited here for the slip
-    route. It does not support that. The paper measures a TWO-STEP working stroke
-    (~3.4-5.2 nm then ~1.0-1.3 nm) whose second phase "depends linearly on ATP
-    concentration"; "catch bond" and "slip bond" appear zero times in it, and
-    every occurrence of "load" is in the Introduction discussing other work. Its
-    locator (PNAS 103(1):87-92) is correct; its content does not fit the claim.
-
-    RESOLVED 2026-09-01: the default is now NEGATIVE (-0.80 nm), i.e. a catch
-    bond, matching Sung's beta-cardiac measurement in this kernel's own sign
-    convention. Marang et al. 2025 PNAS 122:e2504758122 is a fifth measurement
-    on the same side, in the same Bell form, in rabbit fast skeletal: Fig. 6
-    caption, d = -0.89 +/- 0.12 nm at 0 mM added Pi, progressing to +0.34 nm at
-    30 mM Pi — so the slip result quoted from that paper's abstract is its
-    high-Pi arm, not a contradiction. Provenance and both isoforms:
-    core/param_table.py, xb_delta_34.
-
-    THE SLIP SIGN'S STATED JUSTIFICATION IS FALSIFIED, not merely unsourced. It
-    was that a catch bond "contradicts the fast unloaded shortening velocities".
-    Tested by length-controlled ramps (S129): V0 is 0.215 nm/ms shipped and
-    0.214 nm/ms with the catch bond — identical. V0 in this model is not
-    detachment-limited. What the catch bond does change is sub-V0 force, ~3x the
-    power output at 0.1 nm/ms.
-
-    IT IS NOW SEPARABLE, which it was not. delta_23 was deleted on 2026-09-09
-    when 2 -> 3 moved to the elastic-energy barrier, so this parameter has no
-    partner left to trade against and can be swept alone.
-
-    HISTORICAL, kept because it is the measurement that justified the deletion.
-    The cost in active force of setting delta_23 = 0, at three values of this
-    parameter (8x8 lattice, pCa 4.5 vs pCa 9 passive reference, z_line = 1100
-    nm, 3 replicates):
-
-                                 skeletal    cardiac
-        delta_34 = +0.5 (slip)     -78%        -83%
-        delta_34 = -0.5 (catch)    -67%        -45%
-        delta_34 = -0.9 (catch)    -46%        -19%
-
-    Read at the time as "delta_23 is a major lever". Read correctly it is the
-    opposite: delta_23's authority COLLAPSES as this rate becomes a deeper
-    catch, because a catch bond retains strained force-bearing heads and that
-    was the only job delta_23 was doing — the note that accompanied this table
-    said as much, that delta_23 "has been standing in for the missing catch
-    bond". The catch bond has since landed at -0.80, in the -46%/-19% row.
-    The table was also measured BEFORE the split stroke, on a model in which
-    states 2 and 3 were mechanically identical, so the step delta_23 sat on had
-    zero displacement and no structural referent at all. Both premises are gone.
+    THE SIGN. Measurements on the catch side, all of axial load:
+      - Sung 2015 Nat Commun 6:7931 (human beta-cardiac, harmonic force
+        spectroscopy): "k0 = 87 +/- 7 s^-1 and d = 0.8 +/- 0.1 nm"; resisting
+        load slows detachment. The shipped -0.80 nm is this value in this
+        kernel's sign convention.
+      - Wang 2024 Small (rabbit beta-cardiac and slow skeletal): "both kf and ks
+        responded to increasing resistive as well as assistive load by slowing
+        the actomyosin unbinding rates ... exhibiting 'catch bond' behavior";
+        fitted distances 1.5-1.9 nm, at 10 uM ATP.
+      - Marang et al. 2025 PNAS 122:e2504758122 (rabbit fast skeletal), Fig. 6
+        caption: d = -0.89 +/- 0.12 nm at 0 mM added Pi, progressing to
+        +0.34 nm at 30 mM Pi.
+      - Veigel 2005 Nat Cell Biol 7:861 (myosin-V, intramolecular strain):
+        resisting load slows ADP release.
+      - Pate & Cooke 1989 JMRCM 10:181 Table 2 ASSUME the same sign (R45 = 2 s^-1
+        for x >= 3.7 nm, rising to 750 s^-1 for x < 0).
+    Fast premature detachment from early force-generating states is a slip bond;
+    in this model that is the strain-gated 3 -> 2 -> 1 -> 0 path, so this rate is
+    the ADP-release-limited exit only. V0 in this model is not
+    detachment-limited: the catch sign leaves unloaded shortening velocity
+    unchanged and raises sub-V0 force.
 
     References:
         Bell 1978 Science 200:618 (the functional form); Siemankowski & White 1984
-        JBC 259:5045 (the zero-load rates); Prodanovic 2019 J Gen Physiol 151:1013.
+        JBC 259:5045 (the zero-load rates).
     """
     upper = 10000.0
     r34 = A34 * jnp.exp(f_strong * delta34 / k_t)
@@ -987,7 +824,7 @@ def xb_rate_50(ca_conc, k0, kmax, b, ca50):
         ca_conc: Calcium concentration (M)
         NOTE: this rate law is taken directly from Mijailovich 2021 JGP
         153:e202012604 Eq. 1, and ALL FOUR of its parameters are marked "Assumed"
-        in that paper's Table 1 (audit 2026-08-19). Nothing in this function is
+        in that paper's Table 1. Nothing in this function is
         measured. Conditions there: rat cardiac trabeculae, 27.2 C.
 
         k0: Basal rate at zero calcium (ms^-1) - params.xb_srx_k0.
@@ -996,7 +833,7 @@ def xb_rate_50(ca_conc, k0, kmax, b, ca50):
             it is pinned to xb_r05 by construction.
         kmax: Saturating rate at high calcium (ms^-1) - params.xb_srx_kmax.
               [G] 0.4; Mijailovich kPSmax = 400 s^-1, also "Assumed"
-              (retagged from [M] 2026-08-19).
+              (an assumption, hence [G]).
         b: Hill exponent - params.xb_srx_b.
            [G] 5.0. Mijailovich 2021 Table 1 lists b = 5 but marks it "Assumed" —
            a shape parameter chosen inside a model, not a measurement, so [G] not

@@ -41,11 +41,12 @@ matrices than there are units.
     so that many matrices serve every unit on every filament.
 
   Crossbridges (thick_transitions): rates depend on the head's axial distance to
-    its target (continuous) and on whether that target is open (binary). The
-    continuous axis is discretized into n_xb_bins bins, giving 2 * n_xb_bins
-    matrices regardless of lattice size. Heads then gather the row for their own
-    bin. Bin resolution is a genuine accuracy/cost tradeoff, controlled by
-    StaticParams.n_xb_bins / xb_bin_lo / xb_bin_hi.
+    its target (continuous) and on the target's block: closed, open, or open but
+    screened by thin-thin overlap. The continuous axis is discretized into
+    n_xb_bins bins, giving 3 * n_xb_bins matrices regardless of lattice size.
+    Heads then gather the row for their own bin. Bin resolution is a genuine
+    accuracy/cost tradeoff, controlled by StaticParams.n_xb_bins / xb_bin_lo /
+    xb_bin_hi.
 
 In every case: build the small set of distinct matrices, exponentiate them in one
 batch, then gather per unit.
@@ -186,32 +187,20 @@ def expm_pade6_batch(
     it is a mixture of stochastic matrices over the unit interval.
 
     WHY THE INTEGRAL GETS ITS OWN fori_loop, AND WHY ITS MATMULS ARE PINNED TO
-    precision=HIGHEST. Both were forced by measurement (2026-09-11), and the
-    first version of this code had neither. Carrying J in the SAME loop carry as
-    `result` changes `result` by max |d| = 0.90 — not one ulp. ROOT CAUSE: XLA
-    lowers a loop body holding TWO einsums to the TF32 tensor-core GEMM on this
-    GPU while the one-einsum body here is not so lowered, and TF32's 10-bit
-    mantissa compounds over the 16 squarings the worst bins need (r12 reaches
-    1e4 /ms, so ||Q*dt|| reaches 2e4 on a matrix whose entries span 1e-20 to 1).
-    A separate loop keeps the probability path byte-for-byte identical to the
-    with_integral=False path — which is the whole premise of the metric work
-    this exists for — at the cost of 18 extra matmuls for a second copy of E.
+    precision=HIGHEST. A loop body holding two einsums is lowered by XLA to the
+    TF32 tensor-core GEMM on some GPUs, and TF32's 10-bit mantissa compounds over
+    the 16 squarings the stiffest bins need (r12 reaches 1e4 /ms, so ||Q*dt||
+    reaches 2e4 on a matrix whose entries span 1e-20 to 1). A separate loop keeps
+    the probability path byte-for-byte identical to the with_integral=False path,
+    at the cost of 18 extra matmuls for a second copy of E.
 
-    ACCURACY, scored against float64 (scipy) on real settled Q_bins, 8x8,
-    dt = 1 ms, by local_projects/tension_cost/expm_integral_proto.py:
-        this kernel's phi1*dt   3.2e-04     (cardiac)  2.6e-04 (skeletal)
-        a float32 12x12 expm    2.3e-04                2.3e-04
-        this kernel's own P     6.3e-04                7.0e-04
-    i.e. the integral is MORE accurate than the probabilities it ships beside,
-    and every exported flux is good to < 2e-5 of its own total. 1e-5 absolute is
-    not reachable in float32 on these bins and never was.
+    ACCURACY against float64 on settled Q_bins (8x8, dt = 1 ms): phi1*dt is good
+    to ~3e-4, slightly better than the probabilities it ships beside (~7e-4), and
+    every exported flux is good to < 2e-5 of its own total.
 
-    DO NOT REPLACE THIS WITH expm([[A, I], [0, 0]]). Two reasons, both measured:
-    that block matrix's top rows sum to 1 + dt, so step 8's row normalization
-    silently wrecks it (max |d| 0.409 on entries <= 0.831); and it costs 3.5x a
-    6x6 expm and ~+20% of a BATCHED timestep (S138 [H]). It is cheaper than a
-    6x6 expm at batch 1 — 0.65x here — but that is the launch-bound regime, and
-    a sweep is not run at batch 1.
+    DO NOT REPLACE THIS WITH expm([[A, I], [0, 0]]). That block matrix's top rows
+    sum to 1 + dt, so step 8's row normalization wrecks it, and it costs 3.5x a
+    6x6 expm (~+20% of a batched timestep).
 
     Args:
         A_batch: (batch, n, n) matrices to exponentiate (typically Q * dt)
@@ -583,28 +572,19 @@ def _compute_unique_tm_Q_matrices(ca_concentration: float,
     one unit multiply the ratio by (1 + K2)^n; the Fig. 1 caption (p. 694) writes
     the series K_T(1 + K2 + K2^2 + ...), 1.2% away at n = 2, K2 = 79. One head per
     binding candidate, so n_lock = SarcTopology.tm_max_heads, the most candidates
-    any unit covers. A binary lock (any head -> one factor) under-locked a unit
-    holding two heads by ~(1 + K2). That is a statement about an EQUILIBRIUM RATIO, and this is the
-    form that reproduces it at any dt — steady-state open/closed becomes
-    k_23/(k_32/(1+K2)) = K_T(1+K2) exactly. See the xb_tm_K2 block in
-    core/param_table.py for the measured values.
+    any unit covers. That is a statement about an EQUILIBRIUM RATIO, and a rate
+    inside Q is the form that reproduces it at any dt — steady-state open/closed
+    becomes k_23/(k_32/(1+K2)) = K_T(1+K2) exactly. Dividing the sampled exit
+    PROBABILITY by (1 + K2) after the exponential would match only to first order
+    in dt; at dt = 1 ms the unlocked exit probability from state 3 spans
+    0.058-0.974 across the 27 configurations, deep in the saturation of
+    1 - exp(-L*dt). See the xb_tm_K2 row in core/param_table.py for the value.
 
-    IT USED TO BE APPLIED AFTER THE MATRIX EXPONENTIAL, by dividing the sampled
-    row's total exit PROBABILITY by (1 + K2). That equals this only to first
-    order in dt, and dt = 1 ms is nowhere near that limit: the unlocked exit
-    probability from state 3 over 1 ms spans 0.058-0.974 across the 27
-    configurations, deep in the saturation of 1 - exp(-L*dt). Measured (S135,
-    both presets, pCa 4.5 and 6.2, all 27 configurations, float64), a nominal
-    xb_tm_K2 = 79 ran as an effective 174.2 at dt = 1 ms, falling to 79.9 at
-    dt = 0.01 ms. The stated reason for the post-hoc form — that folding it into
-    Q "would defeat the 27-matrix reduction" — was also wrong: the reduction is
-    n_sites -> a constant, and 54 is as constant as 27.
-
-    THE CONTROL PATH IS EXACT, not approximate. At K2 = jnp.inf every locked
-    block gets k_30 = k_32 = k_33 = 0, so state 3 is absorbing and expm returns
-    row 3 = [0, 0, 0, 1] — the old hard lock, bit for bit. Rows 0-2 of the
-    locked blocks are never read there, because a head can only bind an open
-    (state 3) site and a hard-locked site can never leave it.
+    THE CONTROL PATH IS EXACT. At K2 = jnp.inf every locked block gets
+    k_30 = k_32 = k_33 = 0, so state 3 is absorbing and expm returns row 3 =
+    [0, 0, 0, 1], a hard lock. Rows 0-2 of the locked blocks are never read
+    there, because a head can only bind an open (state 3) site and a hard-locked
+    site can never leave it.
 
     The local field h is applied as exp(+h/2) on the three forward rates and
     exp(-h/2) on their reverses, leaving the one-way cycle-closing rate k_30 at
@@ -740,28 +720,19 @@ def thin_transitions(state: 'State',
 
     LOCKED UNITS — A FINITE LOCK, PER HEAD, APPLIED TO RATES. A unit with n
     crossbridges attached has its two exits from the open state 3 divided by
-    (1 + xb_tm_K2)^n inside the generator: a bound head biases tropomyosin towards open, it does
-    not pin it. McKillop & Geeves 1993 Fig. 1 — one bound S1 multiplies the
-    open/closed ratio by (1 + K2) — is a statement about an EQUILIBRIUM RATIO,
-    and the rate-side form is the one that reproduces it at any dt. See
-    _compute_unique_tm_Q_matrices for the derivation, for what the previous
-    post-hoc probability form got wrong (a nominal K2 = 79 ran as ~174 at
-    dt = 1 ms), and for why the K2 = jnp.inf hard lock is still exact. The
-    xb_tm_K2 block in core/param_table.py has the measured values and why some lock
-    is necessary.
+    (1 + xb_tm_K2)^n inside the generator: a bound head biases tropomyosin
+    towards open, it does not pin it. See _compute_unique_tm_Q_matrices for the
+    derivation and for why the K2 = jnp.inf hard lock is exact. The bound/unbound
+    axis is a second constant-size axis on the matrix set, not a per-site one.
 
-    "Whether a site is locked changes every timestep while the rate matrices do
-    not" was the old justification for doing this after the exponential. It is
-    not a reason: the bound/unbound axis is a second constant-size axis on the
-    matrix set, not a per-site one, and 27 extra 4x4 expms against the 200-300
-    already run on the thick-filament side is noise.
-
-    DETACHMENT ON CLOSURE. Once the lock is finite, tropomyosin CAN close over
-    a bound head, and that configuration has to mean something. Here the head
-    detaches and its bound_to is cleared on both sides. xb_rate_01 gates
-    attachment on permissiveness, so this model does not permit a head to bind
-    unless tropomyosin is fully open; leaving ANY bound head — weak included —
-    behind after closure would contradict the model's own binding rule.
+    DETACHMENT ON CLOSURE. With a finite lock, tropomyosin can close over a bound
+    head. The head then detaches and its bound_to is cleared on both sides.
+    xb_rate_01 gates attachment on permissiveness, so a head cannot bind unless
+    tropomyosin is fully open; leaving any bound head (weak included) behind
+    after closure would contradict that binding rule. This is a self-consistency
+    rule of the model, not a measured mechanism: closed tropomyosin and an
+    attached head are mutually exclusive, and the finite lock (K2 measured
+    finite) means the closure must be resolved somehow.
 
     WHERE IT LANDS DEPENDS ON WHAT IT HAD ALREADY SPENT. A Loose head returns to
     state 0 DRX and owes nothing; a Tight_1 or Tight_2 head goes to state 4
@@ -769,85 +740,12 @@ def thin_transitions(state: 'State',
     why the destination is written as a test on states 2 and 3 rather than as an
     "else".
 
-    >>> THAT SELF-CONSISTENCY ARGUMENT IS THE WHOLE JUSTIFICATION. Detachment
-    on closure is NOT a measured mechanism, and this docstring used to imply it
-    was. The nearest support is Smith & Geeves 2003 Biophys J 84:3168, Abstract,
-    verbatim: "Myosin is detached by the actin binding of TnI" — but that is
-    (a) about TnI competing with myosin for actin through oppositely-directed
-    kinks in a flexible chain, NOT about tropomyosin's azimuthal position
-    closing over a bound head, and (b) a PREDICTION OF THEIR MODEL, whose own
-    parameters are fitted, not an observation. It is a theoretical precedent for
-    a regulatory protein displacing myosin from actin. Cite it as that or not at
-    all. Nothing in .claude/papers/ measures this; part I of the same pair
-    records no detachment rate of any kind.
-
-    AND THE STRUCTURAL EVIDENCE OPPOSES THE WEAK-HEAD HALF — see the rejected
-    alternative below, which is not merely an option not taken but a direct
-    measurement pointing the other way.
-
-    >>> VIBERT DOES NOT DISCRIMINATE BETWEEN THIS MODEL AND THE OLD ONE, so do
-    not cite it as support for the change. It establishes that a closed
-    tropomyosin and an attached head are MUTUALLY EXCLUSIVE — a symmetric
-    geometric fact, satisfied equally by (a) the hard lock, where the excluded
-    configuration never arises, and (b) this code, where it arises and is
-    resolved by detaching. Three static structures cannot say which mechanism
-    prevents a state, only that the state does not exist.
-    THE ENTIRE CASE FOR THE FINITE LOCK IS McKILLOP'S TABLE 1: K2 is measured
-    at 241 / 79 / 18, all finite. The hard lock is the unmeasured K2 -> inf
-    limit. That one fact is what makes the old model wrong; Vibert then applies
-    only CONDITIONALLY — given that closure happens, the head cannot stay.
-    Ordering matters when this is written up: lead with K2, not with sterics.
-
-    REJECTED ALTERNATIVE, recorded so it is not mistaken for what the code does.
-    Vibert et al. 1997 J Mol Biol 266:8 (negative-stain 3D EM), Results p.13,
-    verbatim: in the off-state the residues taking part in "strong,
-    stereospecific myosin-binding ... are seen to lie beneath tropomyosin and
-    are therefore completely blocked ..., while residues 1 to 4 and 92 to 95,
-    thought to be involved in weak binding, remain exposed" — which would spare
-    weak heads and demote strong ones instead of detaching them. Taken seriously that implies
-    weak binding is tropomyosin-INDEPENDENT: r01 should not be gated either,
-    tropomyosin should gate 1 -> 2, and closure should demote. That is a
-    different model and is NOT what this function implements.
-
-    ATP: A WEAK TEAR IS FREE, A STRONG TEAR COSTS ONE, AND IT IS BOOKED IN
-    metrics_fn FROM THE `torn` MASK THIS FUNCTION RETURNS — as
-    `closure_detach_free` and `closure_detach_atp`, and added into both
-    `atp_consumed` and `atp_expected`. It needs no expectation: the tear is
-    fully observed and the charge is deterministic given it, unlike the 3 -> 4
-    term, where the sampler gives only endpoints and multi-hop traversals are
-    unobservable. Neither is `xb_give_up` this route: that key is the 2 -> 1
-    crossing count, i.e. the non-ATP strain-gated reversal, and a head it counts
-    is still weakly bound afterwards.
-
-    This paragraph used to claim "atp_expected is computed from the Q matrix
-    (P_abs_all[:, 3, 4]) so nothing is miscounted". That was wrong three ways:
-    the index named a metric that no longer exists, the metric was itself off by
-    0.06-0.46% (it was read from a stale state), and under the rule above a
-    strong tear is no longer a non-ATP detachment at all.
-
-    NOT QUITE EQUIVALENT TO THE S129 PROTOTYPE, and the residue is measured. The
-    patch stack that produced the validated cohort detached only STRONG heads
-    here and compensated by ungating r10, whose value at a covered site is then
-    41.4 /ms — argued to be the same thing at dt = 1 ms, since P(detach within
-    one step) rounds to 1 and this function runs before thick_transitions. It is
-    nearly the same thing, not exactly. Measured over 200 steps, cardiac 2x2,
-    pCa 6.2 (2026-09-01): of 24 weak heads caught by closure, the patch leaves 1
-    still bound after thick_transitions (r12 competes with r10 for the same
-    head), while detaching here returns the head to DRX one sub-step earlier, so
-    1 of them re-binds a different open site within the same step. Over a
-    150-step trace the two arms are bit-identical for 107 steps and then differ
-    by one bound head for three steps: 0.072% of peak axial force. Both are
-    ~1-in-24 events on a population that is itself rare. This form is the root
-    cause and the patch's was the workaround; the difference is recorded so that
-    nobody re-derives "exactly equivalent" from the algebra alone.
-
-    >>> 0.072% IS SCOPED TO THOSE CONDITIONS AND IS NOT A BOUND. At 8x8, pCa 4.0,
-    5000 ms the WT force-pCa plateau differs by **+11.2%** between the patch
-    stack and this code (53.28 -> 59.24 kPa, measured 2026-09-08). frac
-    0.75-vs-0.78 accounts for -2.1% of that, wrong sign; the lock formula and the
-    rate matrix are byte-identical; the remaining candidates are this detach rule
-    and the patch's axial/radial mismatch. UNRESOLVED, deliberately deferred. Do
-    not quote 0.072% as the patch-core difference at other conditions.
+    ATP: A WEAK TEAR IS FREE, A STRONG TEAR COSTS ONE. metrics_fn books both
+    from the `torn` mask this function returns, as `closure_detach_free` and
+    `closure_detach_atp`, and adds them into `atp_consumed` and `atp_expected`.
+    No expectation is needed: the tear is fully observed and the charge is
+    deterministic given it. `xb_give_up` is a different route — the 2 -> 1
+    crossing count, after which the head is still weakly bound.
 
     Args:
         state: Current State (reads tm_states and bound_to)
@@ -975,19 +873,14 @@ def thin_transitions(state: 'State',
     # lever; putting it in DRX (= M.ADP.Pi) would regenerate that phosphate and
     # re-cock the lever for free, which is the same leak xb_rate_43 is held at
     # exactly zero to prevent. Those go to state 4 Free_2 — detached,
-    # post-stroke, ATP bound — and are charged one ATP in metrics_fn. Measured:
-    # this books 7.0 of the 8.0 percentage points of ATP the model spent and
-    # never counted (closure_spy.py); the remaining ~1.0% is the give-up route,
-    # a genuine refund.
+    # post-stroke, ATP bound — and are charged one ATP in metrics_fn.
     #
     # >>> WRITTEN AS `(s == 2) | (s == 3) -> 4, else 0`, NEVER AS
     #     `weak -> 0, else -> 4`. `hit` is raised from the two binding records
     #     together, and if they were ever stale — a head's xb_bound_to naming a
     #     site that no longer names it — the "else" form would push an already
     #     detached head into Free_2 and charge it an ATP it never spent. Testing
-    #     the states that actually owe one cannot do that. The two-sided binding
-    #     invariant that makes such a record impossible is asserted by
-    #     local_projects/regression/binding_invariant.py.
+    #     the states that actually owe one cannot do that.
     #
     # >>> THIS IS A DYNAMICS CHANGE, NOT ONLY ACCOUNTING. A head in Free_2 must
     #     wait for xb_rate_40 before it can rebind, and xb_r40 = 0.1 /ms is a
@@ -1095,7 +988,7 @@ def xb_rate_matrix(xb_distances: jnp.ndarray,
     g_r_strong = spring_constants[:, 5]
     c_k_strong = spring_constants[:, 6]
     c_r_strong = spring_constants[:, 7]
-    # Tight_1's own spring configuration (the split stroke, S129). Equal to the
+    # Tight_1's own spring configuration (the split stroke). Equal to the
     # Tight_2 block in stiffness and distinct only in rest position at the
     # shipped defaults, but read separately so the chemistry can never silently
     # fall back to Tight_2's geometry.
@@ -1144,18 +1037,10 @@ def xb_rate_matrix(xb_distances: jnp.ndarray,
 
     # THE LOAD FED TO THE BELL RATES IS THE AXIAL FORCE, obtained by rotating the
     # head's two polar spring forces into the filament frame exactly as the force
-    # law does. It is not F_r + F_theta.
-    #
-    # It read `F_r + F_theta` from the initial commit until 2026-09-09 — both
-    # trig projections dropped and the converter term's sign flipped relative to
-    # the axial law (the S50 sign, fixed in forces.py and never here). That sum
-    # is not a force in any frame: F_r and F_theta are orthogonal components.
-    # The error tracked LATTICE SPACING rather than strain, because
-    # xb_g_rest_tight_1 = 17.231 nm exceeds d and r = sqrt(x^2 + d^2) >= d, so a
-    # head splayed straight across the lattice at x ~ 0 carried F_r ~ -16 pN
-    # while doing exactly zero axial work — and fed that phantom compression to
-    # an exponential. See the primitives header in forces.py for the invariant
-    # that now makes this class of error unwriteable.
+    # law does. It is not F_r + F_theta: those are orthogonal components, and
+    # their sum tracks lattice spacing rather than strain (a head splayed across
+    # the lattice at x ~ 0 carries a large F_r while doing zero axial work). See
+    # the primitives header in forces.py.
     F_r_strong, F_theta_strong = xb_polar_forces(
         r, theta, g_k_strong, g_r_strong, c_k_strong, c_r_strong)
     f_strong = polar_to_filament(F_r_strong, F_theta_strong, cos_theta, sin_theta)[0]
@@ -1198,12 +1083,10 @@ def xb_rate_matrix(xb_distances: jnp.ndarray,
     r21 = xb_rate_21(r12, U_loose, U_tight_1)
 
     # 2 Tight_1 <-> 3 Tight_2 : the AM.ADP isomerization (strain-dependent).
-    # LABEL CORRECTED 2026-09-01: this line used to read "the working stroke",
-    # a survivor of the 1-indexed scheme that b63a724 missed. The stroke is
-    # split across 1->2 (the larger part) and this step; see
+    # The stroke is split across 1->2 (the larger part) and this step; see
     # rate_functions.xb_rate_23.
     #
-    # Smith & Geeves' elastic-energy form, not a Bell distance (2026-09-09):
+    # Smith & Geeves' elastic-energy form, not a Bell distance:
     # the barrier is the elastic energy the step must climb, floored at zero, so
     # the uphill direction is slowed and the downhill one is strain-FREE rather
     # than strain-accelerated. r32 is left as the plain detailed-balance line
@@ -1227,7 +1110,7 @@ def xb_rate_matrix(xb_distances: jnp.ndarray,
     r05 = xb_rate_05(r05_rate) * ones
 
     # Diagonal rates: row sums must be zero for valid rate matrices
-    # Direct arithmetic — avoids vmap+stack overhead (ordered_sum was just jnp.sum)
+    # Direct arithmetic — avoids vmap+stack overhead
     r00 = -(r01 + r04 + r05)
     r11 = -(r10 + r12)
     r22 = -(r21 + r23)
@@ -1415,12 +1298,8 @@ def _xb_Q_resolved(
     so the sampling path and the metrics path cannot disagree about the physics
     of a given step no matter how they diverge afterwards.
 
-    UNTIL 2026-09-11 THIS DOCSTRING SAID the two callers "need exponentials of
-    DIFFERENT generators" — the sampler wanted plain Q, the metrics wanted Q with
-    rows 0 and 4 zeroed (the absorbing construction, deleted with
-    xb_exit_probabilities). They now need the SAME generator: exp(Q*dt) and its
-    occupancy-time integral come out of one call. That is what makes a single
-    exponential per step possible.
+    Both callers need the SAME generator: exp(Q*dt) and its occupancy-time
+    integral come out of one call, so there is a single exponential per step.
 
     Args:
         state: Current State NamedTuple
@@ -1487,12 +1366,10 @@ class XBBins(NamedTuple):
     """The one binned crossbridge generator a step is built on, and both
     exponentials of it.
 
-    THERE IS EXACTLY ONE PER STEP. Until 2026-09-11 there were two: the sampler
-    exponentiated Q for the endpoint probabilities and the metrics path
-    exponentiated a DIFFERENT, absorbing generator for the ATP estimate. The
-    exact estimator needs no absorbing construction, so both now want exp(Q*dt)
-    of the same matrix — and its occupancy-time integral comes out of the same
-    scaling-and-squaring. `kinetics_step` builds this once and hands it to both.
+    THERE IS EXACTLY ONE PER STEP. The sampler and the ATP estimator both use
+    exp(Q*dt) of the same matrix, and its occupancy-time integral comes out of
+    the same scaling-and-squaring. `kinetics_step` builds this once and hands it
+    to both.
 
     Fields:
         Q: (n_cells, 6, 6) rate matrices on the bin grid, or the stacked
@@ -1574,17 +1451,13 @@ def xb_expected_crossings(
     and G comes free alongside P from the same scaling-and-squaring (see
     expm_pade6_batch, with_integral).
 
-    WHY AN EDGE COUNT AND NOT A REACHABILITY PROBABILITY. Until 2026-09-11 the
-    ATP metrics asked "did this head VISIT Free_2 during the step", read from a
-    generator with rows 0 and 4 made absorbing. That is P(visit >= 1), which is a
-    LOWER BOUND on E(visits), so it was biased low whenever a head could cycle
-    twice inside one step: -0.07% cardiac, -1.2% skeletal at dt = 1 ms, measured
-    by two independent routes (S137 [F], S138 [E]). It also needed the absorbing
-    construction and its row mask purely to stop "reached state 4 from state 0"
-    counting r04, the reverse recovery stroke, as an ATP. Counting the EDGE
-    3 -> 4 cannot make that mistake, so the mask becomes unnecessary rather than
-    merely wrong, and every head can be read — including one that runs
-    0 -> 1 -> 2 -> 3 -> 4 inside a single step, which really does spend an ATP.
+    WHY AN EDGE COUNT AND NOT A REACHABILITY PROBABILITY. "Did this head visit
+    Free_2 during the step" is P(visit >= 1), a LOWER BOUND on E(visits), biased
+    low whenever a head can cycle twice inside one step (about -1% skeletal at
+    dt = 1 ms). Counting the EDGE 3 -> 4 is exact in expectation, never counts
+    r04 (the reverse recovery stroke) as an ATP, and needs no mask, so every head
+    can be read — including one that runs 0 -> 1 -> 2 -> 3 -> 4 inside a single
+    step, which really does spend an ATP.
 
     Reads each head's OWN start state, so pass the MID state — the sarcomere as
     thick_transitions found it, carried on KineticsTrace — not the state at the
@@ -1775,10 +1648,7 @@ def thick_transitions(state: 'State',
         # `thin.bound_to[t, i]` names the head — and nothing reconciles them
         # afterwards. Both writes below therefore have to be collision-free by
         # construction, because `.at[].set()` with duplicate indices picks a
-        # winner nondeterministically. Until 2026-09-10 neither was, and both
-        # failure modes were live: see local_projects/regression/
-        # binding_invariant.py, which asserts the two-sided property and
-        # measured 115,846 violations over 400 steps before this rewrite.
+        # winner nondeterministically.
         # thin.bound_to is per CANDIDATE; every nearest site is a candidate.
         n_cand = topology.n_cand
         n_cand_total = n_thin * n_cand
@@ -1791,12 +1661,8 @@ def thick_transitions(state: 'State',
         # ARBITRATION. `can_bind` is read against the occupancy at the START of
         # the step, so two heads whose nearest site is the same free site BOTH
         # pass it — and exactly one of them may have it. Scatter-MIN over head
-        # index picks the lowest, deterministically. The old code scattered the
-        # head index with `.at[].set()` and reverted only heads whose site was
-        # occupied at the start of the step, so the loser of a same-step
-        # collision kept a bound state and an `xb_bound_to` pointing at a site
-        # another head owned: two heads on one site, both exerting force.
-        # Non-binders are sent past the end and dropped, so they can never win
+        # index picks the lowest, deterministically; the loser reverts below, so
+        # two heads can never share a site. Non-binders are sent past the end and dropped, so they can never win
         # and never touch the array. Dropping rather than writing a sentinel
         # also keeps them off the few sites they would otherwise pile onto
         # (invalid heads all name thin 0), which is the slow path for a GPU scatter.
@@ -1845,38 +1711,17 @@ def thick_transitions(state: 'State',
         new_thin_bound_to = new_thin_bound_to_flat.reshape(n_thin, n_cand)
 
         # Binding failed — the site was taken before the step, or another head
-        # won it during the step. One line now covers both; the old form saw
-        # only the first.
+        # won it during the step.
         #
         # >>> THIS IS A FLUX THAT IS NOT IN Q, AND IT IS NOT SMALL. A head sent
         #     back here did not follow its own generator: it is placed in DRX
-        #     regardless of which bound state it sampled. Measured 2026-09-11,
-        #     8x8, z 1100, dt = 1 ms, as a fraction of all heads that sampled a
-        #     bound state from 0/4/5: cardiac 4.8% (pCa 4.5) / 1.2% (pCa 6.2),
-        #     skeletal 7.1% / 5.3%. The realised endpoint histogram therefore
-        #     departs from the sampled P by ~45 heads per step at
-        #     cardiac pCa 4.5 — all of it moved from Loose into DRX.
-        #     ANY METRIC THAT READS P OR Q AS THE TRUTH ABOUT THE STEP must say
-        #     why that gap does not reach it.
-        #     >>> UNTIL 2026-09-11 THE ANSWER HERE WAS STRUCTURAL AND IT NO
-        #         LONGER IS. atp_expected masked on mid states 1-3, which are
-        #         ALREADY BOUND, so `is_binding` was false for every head it
-        #         read. The exact estimator drops that mask and reads every
-        #         head, states 0/4/5 included — which is correct for the ATP
-        #         (a head really can run 0 -> 1 -> 2 -> 3 -> 4 in one step) but
-        #         removes the immunity along with it. The answer is now a
-        #         measured BOUND, not a structural argument.
-        #         8x8, dt = 1 ms: heads in mid states 0/4/5 contribute
-        #         0.028% (cardiac 4.5) / 0.024% (6.2) and 0.567% (skeletal 4.5)
-        #         / 0.593% (6.2) of total N34. Only the reverted subset of those
-        #         is misattributed, and reverts are 4.8-7.1% of binding
-        #         attempts, so the exposure is at most ~0.002% cardiac and
-        #         ~0.04% skeletal — an order below the noise floor on the
-        #         ledger, and an order below the bias the exact estimator
-        #         removed. It is a bound, not a measurement of the effect
-        #         itself; a tighter figure needs `won` exported.
-        #     The residue this leaves in the ATP ledger is bounded and measured
-        #     in local_projects/tension_cost/atp_balance_spy.py.
+        #     regardless of which bound state it sampled (8x8, dt = 1 ms: 1-5% of
+        #     heads that sampled a bound state from 0/4/5 cardiac, 5-7%
+        #     skeletal). ANY METRIC THAT READS P OR Q AS THE TRUTH ABOUT THE STEP
+        #     must say why that gap does not reach it. For atp_expected the
+        #     exposure is bounded: heads in mid states 0/4/5 contribute < 0.6% of
+        #     the 3 -> 4 count, and only the reverted subset of those is
+        #     misattributed (~0.002% cardiac, ~0.04% skeletal).
         new_states_flat = jnp.where(is_binding & (~won), 0, new_states_flat)
         new_xb_states = new_states_flat.reshape(n_thick, n_crowns, n_xb_per_crown).astype(jnp.int8)
     else:

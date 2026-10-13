@@ -128,7 +128,7 @@ def compute_complex_stiffness(result, frequencies, settling_cycles=1):
     Analyzes the force response to sinusoidal length perturbations.
 
     Args:
-        result: SimulationResult from Protocol
+        result: SimulationResult from run()
         frequencies: List of frequencies used
         settling_cycles: Number of initial cycles to discard
 

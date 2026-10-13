@@ -240,7 +240,7 @@ class KineticsTrace(NamedTuple):
             was taken with, and both exponentials of it. Carried rather than
             rebuilt so the sampler and the metrics cannot disagree about the
             step, and so only ONE matrix exponential is taken per step. The bin
-            grid is (2 * n_xb_bins, 6, 6) = (400, 6, 6) plus one index per head
+            grid is (3 * n_xb_bins, 6, 6) plus one index per head
             — small, and a within-step value, which is what this trace is for.
     """
     state: 'State'

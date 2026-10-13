@@ -90,30 +90,25 @@ rm -rf ~/.cache/multifil_jax/xla/
 Peak VRAM scales with batch size and simulation duration:
 
 ```
-peak VRAM (GB) ≈ minibatch_size × n_steps × 61 metrics × 4 bytes × 2 / 1e9
+peak VRAM (GB) ≈ minibatch_size × n_steps × n_metrics × 4 bytes × 2 / 1e9
 ```
 
-| minibatch_size | Peak VRAM (approx, at 1000 steps) |
-|---|---|
-| 256 | ~0.1 GB |
-| 1024 | ~0.4 GB |
-| 4096 | ~1.5 GB |
-| 8192 | ~3 GB |
-| 16384 | ~6 GB |
+where `n_metrics = len(result.metrics)`. Every metric is stored at every timestep
+as float32, and the factor 2 covers the copy made when the trace is assembled.
+At 1000 steps that is roughly 1.4 GB per 4096 simulations.
 
 For an **8 GB GPU (e.g. RTX 4060):** the default `minibatch_size="auto"` is safe up to batch=16384 at 1000 steps. For longer simulations at large batch, set it explicitly:
 
 ```python
-# ~3 GB peak for 2000-step sim with large batch:
-result = run(topo, pCa=4.5, z_line=z0, lattice_spacing=d0,
-             replicates=16384, duration_ms=2000, minibatch_size=2048)
+result = run(topo, dynamic, pCa=4.5, z_line=z0, lattice_spacing=d0, dt=1.0,
+             duration_ms=2000, replicates=16384, minibatch_size=2048)
 ```
 
-`minibatch_size` splits the batch into sequential chunks — it does not affect results, only peak memory and marginally performance. Non-power-of-2 values are snapped down to the nearest power of 2 automatically.
+`minibatch_size` splits the batch into sequential chunks — it does not affect results, only peak GPU memory. Chunks are accumulated in host RAM, so a very large sweep is limited by system memory instead. Non-power-of-2 values are snapped down to the nearest power of 2.
 
 ## XLA compilation cache
 
-The first time you run a simulation with a given configuration, JAX compiles the GPU kernel. This takes 1–5 minutes. Compiled kernels are cached in `~/.cache/multifil_jax/xla/` and reused in future sessions.
+The first time you run a simulation with a given configuration, JAX compiles the GPU kernel. This takes from 30 seconds to a few minutes. Compiled kernels are cached in `~/.cache/multifil_jax/xla/` and reused in future sessions.
 
 Different configurations (lattice size, batch size, `StaticParams`) each get their own cache entry automatically — you do not need to clear the cache when switching between them. Clear it only after upgrading JAX:
 

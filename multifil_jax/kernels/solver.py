@@ -94,21 +94,13 @@ if TYPE_CHECKING:
     from multifil_jax.core.state import State
     from multifil_jax.core.params import DynamicParams
 
-# Convergence is judged on a SCALE-FREE, PER-BLOCK criterion; there is no
-# absolute floor constant here any more.
-#
-# There used to be one, plus a `thick_k * 1e-4` floor, because node positions
-# were absolute (~1000 nm) and float32 could not express a residual below
-# k * ulp(1000 nm). That floor scaled WITH the problem: at 100x stiffness it
-# became 75 pN and Newton exited on its first iteration reporting a clean
-# residual, while at (soft thick, stiff thin) it ignored thin_k entirely and
-# sat below an unreachable target so the loop always ran to its cap. Storing
-# displacements (core/state.py) removed the floor itself; what replaces the
-# constant is `_convergence_tolerance` below.
+# Convergence is judged on a SCALE-FREE, PER-BLOCK criterion; see
+# `_convergence_tolerance`. Because the state holds displacements
+# (core/state.py), float32 imposes no stiffness-scaled floor on the residual.
 
 
 # ============================================================================
-# THOMAS ALGORITHM (Pure-JAX tridiagonal solver — replaces Lineax cusparse)
+# THOMAS ALGORITHM (pure-JAX tridiagonal solver)
 # ============================================================================
 
 class ThomasFactors(NamedTuple):
@@ -442,32 +434,21 @@ def _run_newton(residual_fn, precond_mv, pos0, tol_vec, n_newton_steps, n_cg_ste
         # stable PERIOD-2 CYCLE on strongly non-linear configurations -- it
         # oscillates around the root forever without ever landing on it, even
         # though the problem is convex with a unique solution and every step is
-        # computed correctly. Measured 2026-09-19 at thick_k 0.0316x /
-        # titin_a 31.6x: the iterates converge to a 2-cycle on
-        # {100.14, 197.86} nm straddling the true root at 159.97 nm, where the
-        # full 52-DOF residual is 0.825 pN. The parity is the signature -- an
-        # ODD Newton cap lands on one cycle point and an EVEN cap on the other,
-        # which is why raising n_newton_steps 4 -> 8 -> 16 -> 32 (all even) had
-        # appeared to change nothing.
-        #
-        # More iterations CANNOT fix a limit cycle: over a 0.01-100x grid the
-        # undamped loop plateaus at ~11% of steps over tolerance at every cap
-        # from 4 to 32 and its worst residual grows to inf, while this search
-        # reaches 0.000% at cap 32 with a worst residual_norm of exactly 1.0.
+        # computed correctly (e.g. thick_k 0.03x with titin_a 30x). The parity
+        # is the signature: an ODD Newton cap lands on one cycle point and an
+        # EVEN cap on the other. More iterations cannot fix a limit cycle; this
+        # search does.
         #
         # THE LADDER IS EVALUATED BRANCH-FREE, ON PURPOSE. Under vmap different
         # lanes need different lambdas, so a nested while_loop would be both a
         # data-dependent inner loop and an XLA fusion barrier -- the mistake the
-        # thomas_solve fori_loop made (20x regression, see the DO-NOT list).
+        # a fori_loop Thomas solve makes (a 20x regression).
         # Evaluating a fixed ladder and selecting is vectorised and bounded.
         #
         # lambda = 1 IS ALWAYS TRIED FIRST AND WINS WHENEVER IT IMPROVES, so
-        # well-behaved cells are BIT-IDENTICAL to the undamped loop: measured
-        # 0 rejections in 100 timesteps at the shipped preset, +0.0000% force
-        # on every commonly-converged cell of a 125-point grid, and the preset's
-        # own axial force unchanged to the last digit. The cost on a normal
-        # 0.1-10x grid is within run-to-run noise, because the merit value at
-        # lambda = 1 is one the loop had to compute anyway for `cond`.
+        # well-behaved cells are BIT-IDENTICAL to the undamped loop, and the
+        # cost is within run-to-run noise: the merit value at lambda = 1 is one
+        # the loop computes anyway for `cond`.
         base = jnp.max(jnp.abs(f))
         xs, fs = [], []
         for lam in _NEWTON_LADDER:
@@ -734,12 +715,9 @@ def _convergence_tolerance(state, constants, thin_k, n_axial, K_lat, d_ref):
     with `scale` the RMS backbone spring force on the axial rows, and
     |K_lat| * d_ref on the radial row of the augmented dynamic-LS system.
 
-    WHY SCALE-FREE. The previous criterion was an absolute pN target with a
-    `thick_k * 1e-4` floor under it — the float32 coordinate quantum, which
-    scaled with the problem rather than with the physics and ignored thin_k
-    entirely. In displacement coordinates there is no such quantum, so the
-    right question is "small compared to what", and the answer is the forces
-    the backbone is actually carrying. `atol` covers pCa 9, where the only
+    WHY SCALE-FREE. An absolute pN target is too loose for soft filaments and
+    unreachable for stiff ones. The right question is "small compared to
+    what", and the answer is the forces the backbone is actually carrying. `atol` covers pCa 9, where the only
     axial forces are titin's.
 
     WHY NOT A STEP-SIZE CRITERION. max|du| would be the obvious alternative,

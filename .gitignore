@@ -38,3 +38,4 @@ local_projects/
 
 # Generated output images
 examples/*.png
+/*.png

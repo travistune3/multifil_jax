@@ -120,9 +120,6 @@ def kinetics_step(state: 'State',
     # `state` is at this instant exactly what the generator must be built from.
     # Both consumers read these same bins: thick_transitions samples from
     # bins.P, and the ATP metrics read expected crossing counts out of bins.G.
-    # Until 2026-09-11 metrics_fn took a SECOND exponential of its own, of a
-    # different (absorbing) generator; the exact estimator needs no such
-    # generator, so the duplication went with it.
     bins = xb_binned_generator(state, constants, topology, drivers.pCa,
                                drivers.z_line, drivers.lattice_spacing, dt,
                                xb_subpop=xb_subpop)

@@ -62,6 +62,6 @@ ax.set_ylabel('thin_EA (pN)')
 ax.set_title('Stiffness sweep — cardiac params\nSteady-state Δ thick-filament tip energy')
 
 plt.tight_layout()
-out = 'examples/stiffness_sweep_cardiac.png'
+out = __file__.replace('.py', '.png')
 plt.savefig(out, dpi=150)
 print(f"Saved → {out}")

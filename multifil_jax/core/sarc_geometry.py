@@ -346,7 +346,7 @@ class SarcTopology:
         # thin_starts default is geometry-aware:
         #   invertebrate → base_k = 0 (crystalline lattice is locked; the 3-fold
         #     class supplies the only systematic phase variation),
-        #   vertebrate  → S83 deterministic decorrelated spread.
+        #   vertebrate  → deterministic decorrelated spread.
         # An explicit thin_starts= still overrides either default.
         if thin_starts is None:
             if actin_geometry == "vertebrate":
@@ -999,7 +999,7 @@ def _compute_thin_registration_classes(
 
     Vertebrate geometry has no thin_thick_pairs (thins sit at interstices, not
     edges) — returns None, treated downstream as all class 0, so registration is
-    a no-op and byte-identical to the pre-registration behavior.
+    a no-op.
     """
     if thin_thick_pairs is None:
         return None
@@ -1077,7 +1077,7 @@ def _build_thin_layers(
       angular: start += class · round(mono_per_poly/3)  (≈ 60°/120° rotation)
       axial:   grid  += class · (actin_half_pitch/3)    (12.9/25.8 nm, +Z; see
                the sign/handedness rationale in the body)
-    At class 0 both shifts vanish, so vertebrate/cardiac is byte-identical.
+    At class 0 both shifts vanish, so vertebrate/cardiac are unshifted.
 
     Returns a dict keyed by SarcTopology field name (NumPy arrays).
     """

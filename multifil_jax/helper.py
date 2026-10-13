@@ -47,14 +47,8 @@ if TYPE_CHECKING:
 # Elementary crossbridge transitions — exactly the non-zero off-diagonals of the
 # rate matrix built in kernels/transitions.py. States are 0-based:
 # 0 DRX, 1 Loose, 2 Tight_1, 3 Tight_2, 4 Free_2, 5 SRX.
-#
-# LABELS CORRECTED 2026-09-01. This block was never touched by the S127
-# stale-index fix (b63a724), so it still carried the 1-indexed scheme's names:
-# it called 1->2 "Pi release" and 2->3 "the working stroke". Both belong to
-# 1->2 in the 0-indexed scheme — see kernels/rate_functions.py, which is the
-# source of truth for what each transition physically is. Only the labels were
-# wrong; the WIRING has always been right (r23 has always been
-# Tight_1 -> Tight_2). Nothing computed here or anywhere else was affected.
+# kernels/rate_functions.py is the source of truth for what each transition
+# physically is.
 _XB_TRANSITION_PAIRS = (
     (0, 1), (1, 0),   # weak attachment (Tm-gated) / weak detachment
     (1, 2), (2, 1),   # Pi release + the larger part of the lever swing / reverse
@@ -234,7 +228,7 @@ def validate_forces_numerical(state: 'State', constants: 'DynamicParams',
 
     # ------------------------------------------------------------------ setup
     # Per-crossbridge constants. Which spring configuration applies depends on
-    # the head's state: three of them since the split stroke (S129) — Loose
+    # the head's state: three of them — Loose
     # (*_weak), Tight_1 (*_tight_1) and Tight_2 (*_strong). This validator is
     # written independently of kernels/forces.py, so it must be split here too:
     # left two-way it would silently disagree with the force kernel for every
@@ -281,7 +275,7 @@ def validate_forces_numerical(state: 'State', constants: 'DynamicParams',
         DISPLACEMENT vector, as the solver's is. Written in absolute positions
         instead, the gradient would be mathematically identical (the rest frame
         is a constant offset, so dU/du == dU/dx) but would reintroduce exactly
-        the float32 cancellation the kernel no longer has — and the validator
+        the float32 cancellation the kernel avoids — and the validator
         would report the difference as a force-law failure.
         """
         ut = u_flat[:n_thick_nodes].reshape(n_thick, n_crowns)
@@ -388,7 +382,6 @@ def validate_equilibrium(state: 'State', constants: 'DynamicParams',
     simulation, so it verifies that the solve CONVERGED, not that the forces are
     correct. A model with a sign error would pass this check happily.
 
-    There is no longer a stiffness-scaled floor under the achievable residual.
     Positions are stored as displacements from rest (core/state.py), so the
     backbone error is relative rather than k * ulp(1000 nm), and a rest state
     with nothing attached returns exactly zero. What the solver actually aims

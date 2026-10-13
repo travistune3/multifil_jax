@@ -261,7 +261,7 @@ ax.legend(fontsize=8, loc='upper left')
 
 plt.tight_layout()
 
-outfile = 'dynamic_lattice_spacing.png'
+outfile = __file__.replace('.py', '.png')
 plt.savefig(outfile, dpi=150, bbox_inches='tight')
 print(f"\nFigure saved to: {outfile}")
 

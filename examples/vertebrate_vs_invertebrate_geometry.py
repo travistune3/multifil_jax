@@ -315,7 +315,7 @@ try:
     fig.suptitle('Geometry-only comparison — identical kinetics, no stretch activation',
                  fontsize=10)
     plt.tight_layout()
-    plt.savefig('vertebrate_vs_invertebrate_geometry.png', dpi=150, bbox_inches='tight')
-    print("Plot saved to vertebrate_vs_invertebrate_geometry.png")
+    plt.savefig(__file__.replace('.py', '.png'), dpi=150, bbox_inches='tight')
+    print(f"Plot saved to {__file__.replace('.py', '.png')}")
 except ImportError:
     print("(matplotlib not available, skipping plot)")

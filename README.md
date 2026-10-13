@@ -2,30 +2,36 @@
 
 JAX-accelerated half-sarcomere muscle contraction simulator.
 
-Simulates thick and thin filament mechanics, crossbridge cycling, and tropomyosin cooperativity in a half-sarcomere lattice. Runs parameter sweeps of hundreds of conditions in parallel on GPU via `jax.vmap`.
+Simulates thick and thin filament mechanics, crossbridge cycling and tropomyosin
+cooperativity in a half-sarcomere lattice, and runs parameter sweeps of thousands
+of conditions in parallel on a GPU.
 
-See `docs/README.md` for a detailed walkthrough and `docs/INSTALL.md` for installation instructions.
+- [docs/INSTALL.md](docs/INSTALL.md) — installation (Linux / WSL2, CUDA)
+- [docs/README.md](docs/README.md) — user guide: running, sweeping, reading results, the physics
+- [docs/CODE_Architecture.md](docs/CODE_Architecture.md) — how the code is organised
 
 ## Quick start
 
 ```python
-from multifil_jax import run, get_skeletal_params, SarcTopology
-import jax
+from multifil_jax import get_params, SarcTopology, run
 
-static, dynamic, z0, d0 = get_skeletal_params()   # z0, d0: preset z_line / lattice spacing
-topo = SarcTopology.create(nrows=2, ncols=2, static_params=static, dynamic_params=dynamic)
-topo = jax.device_put(topo)
+static, dynamic, z0, d0 = get_params('cardiac_beta')   # structure, physics, operating point
+topo = SarcTopology.create(2, 2, static)
 
-result = run(topo, pCa=4.5, z_line=z0, lattice_spacing=d0, duration_ms=1000)
-print(result.axial_force.mean())
+result = run(topo, dynamic, pCa=4.5, z_line=z0, lattice_spacing=d0,
+             dt=1.0, duration_ms=1000)
+print(result.axial_force[..., -100:].mean())
 ```
+
+Muscle classes: `skeletal`, `cardiac_beta`, `cardiac_alpha`, `insect`.
 
 ## Examples
 
-- `examples/quickstart.py` — isometric contraction, sweeps, time traces
-- `examples/dynamic_lattice_spacing.py` — emergent lattice spacing from radial force balance
-- `examples/sinusoidal_analysis.py` — Nyquist frequency sweep (Kawai & Brandt 1980)
-- `examples/hysteresis.py` — stiffness parameter sweep, vertebrate vs invertebrate
-- `examples/benchmarks/benchmark_dynamic_ls.py` — dynamic LS performance and lattice scaling
-- `examples/benchmarks/benchmark_minibatch.py` — GPU memory / throughput tuning
-- `examples/benchmarks/profile_jax.py` — Perfetto GPU trace generation
+- `examples/quickstart.py` — the `run()` patterns: sweeps, overrides, time courses, sampling
+- `examples/dynamic_lattice_spacing.py` — lattice spacing solved from radial force balance
+- `examples/subpopulation.py` — mixed motor populations (mean-field, random, C-zone)
+- `examples/sinusoidal_analysis.py` — complex stiffness from a sinusoidal frequency sweep
+- `examples/vertebrate_vs_invertebrate_geometry.py` — skeletal vs insect lattice geometry
+- `examples/stiffness_sweep_cardiac.py` — cardiac thick/thin stiffness sweep
+- `examples/stiffness_corner_sweep.py` — three-way stiffness sweep as a corner plot
+- `examples/benchmarks/` — dynamic-LS scaling, minibatch tuning, profiling
