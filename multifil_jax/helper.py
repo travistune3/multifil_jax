@@ -223,6 +223,8 @@ def validate_forces_numerical(state: 'State', constants: 'DynamicParams',
 
     # Compute numerical forces via jax.grad on total energy
     thick_k = constants.thick_k
+    # Deliberately NOT core.state.thin_segment_k: an independent copy of the
+    # EA -> k conversion is what lets this check catch an error in that function.
     thin_k = constants.thin_EA / topology.thin_node_spacing   # per node segment
     d = lattice_spacing
 
