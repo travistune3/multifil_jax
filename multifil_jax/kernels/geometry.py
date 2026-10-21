@@ -40,9 +40,14 @@ spurious forces from heads near the M-line.
 WHAT "DISTANCE" MEANS HERE
 --------------------------
 xb_distances stores an (axial, radial) PAIR per head, not two candidate sites.
-Axial is the offset along the filament to the chosen site; radial is simply the
+Axial is the offset along the filament to the head's site; radial is simply the
 current lattice spacing. Together they give the head's polar geometry, which is
 what the two-spring model needs.
+
+The site is the BOUND monomer for a bound head and the nearest candidate for an
+unbound one. A bound head stays on its monomer as the filaments slide, so after
+a few nm another candidate is nearer; its rates must still see the strain of the
+monomer it holds, which is the strain the force uses.
 """
 
 import jax
@@ -199,9 +204,10 @@ def update_nearest_neighbors(
     filaments moved during the previous equilibrium solve and the rates depend
     on where everything now is.
 
-    Note that this updates the NEAREST site for all heads, attached or not. For
-    an attached head the stored distances describe its current strain; for a
-    detached one they describe the opportunity it is being offered.
+    xb_nearest_bs is the NEAREST site for every head, attached or not.
+    xb_distances is measured to the BOUND monomer for an attached head (its
+    current strain) and to the nearest site for a detached one (the opportunity
+    it is being offered).
 
     Args:
         state: Current State. Reads the stored displacements and reconstructs
@@ -244,12 +250,14 @@ def update_nearest_neighbors(
         n_mono_per_face_flat,
     )
 
-    # Calculate distances using BASE position (WITHOUT +13 offset)
+    # Calculate distances using BASE position (WITHOUT +13 offset), to the bound
+    # monomer where there is one.
+    bound = state.thick.xb_bound_to.reshape(-1)
     distances = calculate_xb_to_bs_distances(
         xb_base_positions,
         thin_pos,
         nearest_thin,
-        nearest_site,
+        jnp.where(bound >= 0, bound, nearest_site),
         lattice_spacing
     )
 
