@@ -1080,7 +1080,7 @@ def xb_rate_matrix(xb_distances: jnp.ndarray,
 
     # 1 Loose <-> 2 Tight_1 : weak-to-strong isomerization (Pi release)
     r12 = xb_rate_12(r12_coeff, E_diff)
-    r21 = xb_rate_21(r12, U_loose, U_tight_1)
+    r21 = xb_rate_21(r12_coeff, E_diff, U_loose, U_tight_1)
 
     # 2 Tight_1 <-> 3 Tight_2 : the AM.ADP isomerization (strain-dependent).
     # The stroke is split across 1->2 (the larger part) and this step; see

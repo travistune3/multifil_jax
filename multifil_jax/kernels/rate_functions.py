@@ -540,7 +540,7 @@ def xb_rate_12(A12, E_diff):
     return jnp.where(jnp.isnan(r12), 0.0, r12)
 
 
-def xb_rate_21(r12, U_loose, U_tight_1):
+def xb_rate_21(A12, E_diff, U_loose, U_tight_1):
     """Rate 2->1: strong-to-weak reversal (phosphate rebinding).
 
     Detailed balance: r21 = r12 * exp(U_tight_1 - U_loose). Since the strong
@@ -551,9 +551,14 @@ def xb_rate_21(r12, U_loose, U_tight_1):
     the cycle and paying an ATP.
 
     Log-space arithmetic, as with r10, to survive the dynamic range in float32.
+    r12 is rebuilt here as log(A12) + E_diff / 2 (xb_rate_12's law and cap)
+    rather than passed in: at large strain r12 underflows to exactly 0 while r21
+    is at its cap, and log(0) would turn the cap into 0.
 
     Args:
-        r12: Forward isomerization rate (ms^-1)
+        A12: Pre-exponential rate coefficient of r12 (ms^-1) - params.xb_r12_coeff
+        E_diff: E_weak - E_strong at the head's current geometry (kT), as for
+                xb_rate_12
         U_loose: Free energy of the loose state, including strain (kT)
         U_tight_1: Free energy of the tight_1 state, including strain (kT)
 
@@ -561,8 +566,8 @@ def xb_rate_21(r12, U_loose, U_tight_1):
         Rate r21 (ms^-1), capped at 10000 ms^-1
     """
     upper = 10000.0
-    log_r32 = jnp.log(r12) - (U_loose - U_tight_1)
-    r21 = jnp.exp(log_r32)
+    log_r12 = jnp.log(A12) + jnp.minimum(E_diff, 30.0) / 2.0
+    r21 = jnp.exp(log_r12 - (U_loose - U_tight_1))
     return jnp.minimum(r21, upper)
 
 
