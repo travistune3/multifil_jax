@@ -1098,7 +1098,8 @@ def xb_rate_matrix(xb_distances: jnp.ndarray,
     r32 = xb_rate_32(r23, U_tight_1, U_tight_2)
 
     # 3 Tight_2 -> 4 Free_2 : ADP release and detachment; r43 is structurally 0
-    r34 = xb_rate_34(r34_coeff, f_strong, params.xb_delta_34, k_t)
+    r34 = xb_rate_34(r34_coeff, f_strong, params.xb_delta_34_catch,
+                     params.xb_delta_34_slip, params.xb_r34_slip_frac, k_t)
     r43 = xb_rate_43() * ones  # Always 0
 
     # 4 Free_2 <-> 0 DRX : recovery stroke, re-priming the lever arm

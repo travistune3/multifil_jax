@@ -346,8 +346,18 @@ row('xb_r34_coeff', 'dynamic', '1/ms',
                         'alpha/beta detachment: k-ADP 4.2-5.6 (Wang 2013, 17 C) vs k2 1.7-2 '
                         '(Kawai 2016, 25 C); nominal splits them'),
     insect=inh('skeletal'))
-row('xb_delta_34', 'dynamic', 'nm',
-    skeletal=P(-0.80, 'M', 'detachment distance; negative = catch bond'),
+row('xb_delta_34_catch', 'dynamic', 'nm',
+    skeletal=P(-0.80, 'M', 'catch-pathway detachment distance; negative = load slows detachment'),
+    cardiac_beta=inh('skeletal'), cardiac_alpha=inh('cardiac_beta'), insect=inh('skeletal'))
+row('xb_delta_34_slip', 'dynamic', 'nm',
+    skeletal=P(1.0, 'I', 'slip-pathway distance; Bell x 1.25 nm from rupture force vs loading rate '
+               '(Colombini 2007, intact frog fibre, 14 C); 0.40-0.5 nm single molecule, load '
+               'perpendicular to actin (Guo & Guilford 2006)', lo=0.8, hi=1.5),
+    cardiac_beta=inh('skeletal'), cardiac_alpha=inh('cardiac_beta'), insect=inh('skeletal'))
+row('xb_r34_slip_frac', 'dynamic', '-',
+    skeletal=P(0.05, 'I', "slip pathway's share of the zero-load rate: ~0.08 from Guo & Guilford 2006 "
+               'two-pathway fit (rat skeletal HMM); ks 20 -> 1 /s to +/-15 pN (Wang 2024, rabbit '
+               'soleus slow myosin)', lo=0.03, hi=0.15),
     cardiac_beta=inh('skeletal'), cardiac_alpha=inh('cardiac_beta'), insect=inh('skeletal'))
 row('xb_r40', 'dynamic', '1/ms',
     skeletal=P(0.1, 'G', 'recovery stroke', lo=0.03, hi=0.3, source=BG),

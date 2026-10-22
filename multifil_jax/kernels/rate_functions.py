@@ -688,18 +688,40 @@ def xb_rate_32(r23, U_tight_1, U_tight_2):
     return jnp.exp(jnp.minimum(log_r43, jnp.log(upper)))
 
 
-def xb_rate_34(A34, f_strong, delta34, k_t):
+def xb_rate_34(A34, f_strong, delta_catch, delta_slip, slip_frac, k_t):
     """Rate 3->4: ADP release and detachment.
 
     The post-stroke head releases ADP, binds ATP, and lets go of actin. This is
     the rate-limiting step of the cycle for most myosins, and it consumes the
     ATP: state 4 is the model's accounting point for ATP turnover.
 
-    Bell form: r34 = A34 * exp(f * delta_34 / kT), where f is the head's AXIAL
-    force (positive = resisting). CATCH BOND at the shipped defaults, because
-    delta_34 = -0.80 nm is negative: resistive load SLOWS detachment. This is
-    the model's ONLY Bell rate (2 -> 3 uses the elastic-energy barrier, see
-    xb_rate_23), so delta_34 can be swept alone.
+    Two-pathway catch-slip form, two Bell terms in parallel:
+        r34 = A34 * ((1 - slip_frac) * exp(f * delta_catch / kT)
+                     + slip_frac * exp(f * delta_slip / kT)),
+    where f is the head's AXIAL force (positive = resisting). The rate at zero
+    load is exactly A34. delta_catch < 0: resistive load SLOWS the catch
+    pathway. delta_slip > 0: it speeds the slip pathway, which takes over at
+    high load. These are the model's only Bell terms (2 -> 3 uses the
+    elastic-energy barrier, see xb_rate_23).
+
+    The rate is slowest at
+        f_crit = kT * ln((1 - slip_frac) * |delta_catch| / (slip_frac * delta_slip))
+                 / (delta_slip - delta_catch),
+    which does not depend on A34. Beyond f_crit detachment speeds up, so the
+    force (and with the head's stiffness, the strain) a stretched head reaches
+    is bounded for any A34.
+
+    THE SLIP PATHWAY. Guo & Guilford 2006 PNAS 103:9844 (rat skeletal HMM,
+    single-molecule step loads 1.8-26.4 pN, perpendicular to actin): lifetimes
+    rise to ~6 pN, then "Above 6 pN, bond lifetimes decrease with increasing
+    loads" (p. 9846). Their Table 2 fits this form: slip k0 13 / 15 s^-1 and
+    x 0.5 / 0.40 nm, catch k0 127 / 176 s^-1 and x -1.5 / -2.5 nm (rigor / ADP),
+    so slip_frac ~0.08. Colombini et al. 2007 PNAS 104:9284 (intact frog fibres,
+    14 C, fast stretches): "cross-bridge rupture force increased linearly with
+    the logarithm" of loading rate (p. 9286), a single Bell barrier of
+    x_beta 1.25 nm; and series compliance changes the stretch needed "but does
+    not affect the rupture force itself" (p. 9287) -- rupture is set by force,
+    not strain.
 
     Args:
         A34: Zero-load detachment rate (ms^-1) - params.xb_r34_coeff.
@@ -710,13 +732,15 @@ def xb_rate_34(A34, f_strong, delta34, k_t):
              a ONE-SIDED BOUND quoted from their ref (14) -- hence [I], not [M].
              "Cardiac ~10x slower" is a 15 C statement only.
         f_strong: Force carried in the strong state (pN); positive = tensile
-        delta34: Transition-state distance (nm) - params.xb_delta_34
+        delta_catch: Catch-pathway distance (nm), negative - params.xb_delta_34_catch
+        delta_slip: Slip-pathway distance (nm), positive - params.xb_delta_34_slip
+        slip_frac: Slip pathway's share of A34 - params.xb_r34_slip_frac
         k_t: Thermal energy kT (pN*nm)
 
     Returns:
         Rate r34 (ms^-1), capped at 10000 ms^-1
 
-    THE SIGN. Measurements on the catch side, all of axial load:
+    THE CATCH SIGN. Measurements on the catch side, all of axial load:
       - Sung 2015 Nat Commun 6:7931 (human beta-cardiac, harmonic force
         spectroscopy): "k0 = 87 +/- 7 s^-1 and d = 0.8 +/- 0.1 nm"; resisting
         load slows detachment. The shipped -0.80 nm is this value in this
@@ -732,18 +756,19 @@ def xb_rate_34(A34, f_strong, delta34, k_t):
         resisting load slows ADP release.
       - Pate & Cooke 1989 JMRCM 10:181 Table 2 ASSUME the same sign (R45 = 2 s^-1
         for x >= 3.7 nm, rising to 750 s^-1 for x < 0).
-    Fast premature detachment from early force-generating states is a slip bond;
-    in this model that is the strain-gated 3 -> 2 -> 1 -> 0 path, so this rate is
-    the ADP-release-limited exit only. V0 in this model is not
-    detachment-limited: the catch sign leaves unloaded shortening velocity
-    unchanged and raises sub-V0 force.
+    Premature detachment from earlier force-generating states is the
+    strain-gated 3 -> 2 -> 1 -> 0 path; this rate is the exit from the
+    post-stroke state. V0 in this model is not detachment-limited: the catch
+    sign leaves unloaded shortening velocity unchanged and raises sub-V0 force.
 
     References:
         Bell 1978 Science 200:618 (the functional form); Siemankowski & White 1984
-        JBC 259:5045 (the zero-load rates).
+        JBC 259:5045 (the zero-load rates); Guo & Guilford 2006 PNAS 103:9844 and
+        Colombini et al. 2007 PNAS 104:9284 (the slip pathway).
     """
     upper = 10000.0
-    r34 = A34 * jnp.exp(f_strong * delta34 / k_t)
+    r34 = A34 * ((1.0 - slip_frac) * jnp.exp(f_strong * delta_catch / k_t)
+                 + slip_frac * jnp.exp(f_strong * delta_slip / k_t))
     return jnp.minimum(r34, upper)
 
 
