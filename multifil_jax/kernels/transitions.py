@@ -36,14 +36,16 @@ depend on only a few DISCRETE quantities, so there are far fewer distinct
 matrices than there are units.
 
   Tropomyosin (thin_transitions): a unit's rates depend only on how many of its
-    two chain neighbours are in each state, and on how many crossbridges are
-    bound on it (0..tm_max_heads). That is 27 x (tm_max_heads + 1) combinations,
-    so that many matrices serve every unit on every filament.
+    two chain neighbours are in each state, on how many STRONG crossbridges are
+    bound on it (0..tm_max_heads). That is 27 x (tm_max_heads + 1)
+    combinations, so that many
+    matrices serve every unit on every filament.
 
   Crossbridges (thick_transitions): rates depend on the head's axial distance to
-    its target (continuous) and on the target's block: closed, open, or open but
-    screened by thin-thin overlap. The continuous axis is discretized into
-    n_xb_bins bins, giving 3 * n_xb_bins matrices regardless of lattice size.
+    its target (continuous) and on the target unit's block: blocked, closed,
+    closed but screened by thin-thin overlap, open, open but screened. The
+    continuous axis is discretized into n_xb_bins bins, giving 5 * n_xb_bins
+    matrices regardless of lattice size.
     Heads then gather the row for their own bin. Bin resolution is a genuine
     accuracy/cost tradeoff, controlled by StaticParams.n_xb_bins / xb_bin_lo /
     xb_bin_hi.
@@ -80,8 +82,7 @@ if TYPE_CHECKING:
 
 # Import rate functions and energy calculations
 from .rate_functions import (
-    tm_rate_01, tm_rate_10, tm_rate_12, tm_rate_21,
-    tm_rate_23, tm_rate_32, tm_rate_30,
+    tm_ca_affinity_ratios, tm_rate_ca_on, tm_rate_ca_off, tm_rate_forward, tm_rate_reverse,
     xb_rate_01, xb_rate_10, xb_rate_12, xb_rate_21,
     xb_rate_23, xb_rate_32, xb_rate_34, xb_rate_43,
     xb_rate_40, xb_rate_04, xb_rate_50, xb_rate_05,
@@ -204,7 +205,7 @@ def expm_pade6_batch(
 
     Args:
         A_batch: (batch, n, n) matrices to exponentiate (typically Q * dt)
-        identity: (n, n) identity from SarcTopology (eye_4 or eye_6). Passed in
+        identity: (n, n) identity from SarcTopology (eye_6). Passed in
             rather than built with jnp.eye(n) inside, which would make XLA
             materialize a fresh copy per batch element under vmap.
         with_integral: also return phi1(A). Static — it changes the returned
@@ -295,51 +296,6 @@ def expm_pade6_batch(
 # ============================================================================
 # OPTIMIZED RATE MATRIX CONSTRUCTION
 # ============================================================================
-
-def _build_tm_Q_matrix_optimized(k_00, k_01, k_10, k_11, k_12,
-                                  k_21, k_22, k_23, k_30, k_32, k_33):
-    """Assemble tropomyosin rate matrices from their individual rates.
-
-    Layout of the 4x4 generator (row = current state, column = destination):
-
-            to:   0        1        2        3
-        from 0 [ k_00     k_01      0        0   ]
-        from 1 [ k_10     k_11     k_12      0   ]
-        from 2 [  0       k_21     k_22     k_23 ]
-        from 3 [ k_30      0       k_32     k_33 ]
-
-    The zeros are structural, not merely small. A site cannot jump from blocking
-    straight to open (0->3) — calcium must bind first — and it cannot go from
-    Ca-bound-blocking straight back to open (1->3). The one asymmetry is the
-    3->0 entry, which closes the cycle: calcium dissociates directly from the
-    open state rather than retracing the forward path.
-
-    Diagonal entries k_ii are negative and make each row sum to zero, which is
-    what makes this a valid generator: probability is conserved.
-
-    Built by stacking rows rather than scattering into a zero matrix with
-    .at[].set(), which would emit a separate XLA scatter per entry.
-
-    Args:
-        k_ij: (n_configs,) arrays, one entry per distinct neighbour configuration
-
-    Returns:
-        Q: (n_configs, 4, 4) rate matrices
-    """
-    n = k_00.shape[0]
-    zeros = jnp.zeros(n)
-
-    # Build each row as (n, 4)
-    row0 = jnp.stack([k_00, k_01, zeros, zeros], axis=1)
-    row1 = jnp.stack([k_10, k_11, k_12, zeros], axis=1)
-    row2 = jnp.stack([zeros, k_21, k_22, k_23], axis=1)
-    row3 = jnp.stack([k_30, zeros, k_32, k_33], axis=1)
-
-    # Stack rows to form (n, 4, 4)
-    Q = jnp.stack([row0, row1, row2, row3], axis=1)
-
-    return Q
-
 
 def _build_xb_Q_matrix_optimized(r00, r01, r04, r05, r10, r11, r12,
                                   r21, r22, r23, r32, r33, r34,
@@ -435,7 +391,7 @@ def matrix_exponential_batch(
     Args:
         Q: (n_matrices, n_states, n_states) rate matrices, rows summing to zero
         dt: Timestep length (ms)
-        identity: (n_states, n_states) identity from the topology — topology.eye_4
+        identity: (n_states, n_states) identity from the topology — topology.eye_6
             for tropomyosin, topology.eye_6 for crossbridges. Passing it in
             avoids XLA materializing a fresh identity per batch element.
         with_integral: also return G. Static.
@@ -468,218 +424,205 @@ def matrix_exponential_batch(
 # predecessor and successor in its chain's axial ordering. There is no distance
 # threshold and no length scale to tune.
 #
-# Each site feels a local field, in kT:
+# THE FIELD IS A STATE ENERGY ON POSITION. Each position carries a weight
+# W = (-1, 0, +1) for (blocked, closed, open), and a unit's energy in its
+# neighbours' field is -J * W(own) * sum W(neighbours). A transition s -> t is
+# multiplied by
 #
-#     h(i) = J_C * n_2(i) + J_M * n_3(i) - 0.5*(J_C + J_M) * n_closed(i)
+#     exp((W(pos t) - W(pos s)) * h / 2),   h = J * (W . (n_blocked, n_closed, n_open))
 #
-# where n_2, n_3 and n_closed count how many of site i's neighbours are Ca-open,
-# crossbridge-bound, and closed respectively. Each count is in {0, 1, 2}, since
-# a site has at most two same-chain neighbours by construction.
+# so every equilibrium shifts by exactly the Boltzmann factor and detailed
+# balance holds around every cycle, for every neighbour configuration. A
+# CALCIUM edge joins two states of the same position, so its multiplier is
+# exp(0) = 1: the field cannot touch calcium affinity at all. Counts are in
+# {0, 1, 2}, since a unit has at most two same-chain neighbours by construction.
 #
-# WHY THE FIELD IS SPLIT SYMMETRICALLY. Forward rates are multiplied by
-# exp(+h/2) and reverse rates by exp(-h/2). The equilibrium constant therefore
-# shifts by exactly exp(h) — precisely the Boltzmann factor for a state whose
-# energy has been lowered by h kT. This makes the coupling a genuine free-energy
-# term rather than an ad hoc rate boost, and detailed balance survives on every
-# reversible leg. Multiplying only the forward rates — as the retired
-# tension-span cooperativity model did — would not have that property.
+# The weights are symmetric, so at J = 0 the chain is uncoupled and J > 0 only
+# steepens (nH) without a built-in shift of the midpoint.
 #
-# The one-way cycle-closing rate k_30 is deliberately left unscaled: boosting it
-# alongside the forward rates produces anti-cooperative runaway rather than
-# sharper activation.
-#
-# LIMITS. At J_C = J_M = 0 the field vanishes and this reduces exactly to the
-# uncoupled baseline. At J_C = J_M = J it reduces to the textbook 1D Ising
-# chain, h = J * (n_open - n_closed).
-#
-# IMPLEMENTATION. Since the field depends only on the triple
-# (n_2, n_3, n_closed), there are 3^3 = 27 distinct rate matrices per lock state
-# for the entire system, however large the lattice. The crossbridge lock adds a
-# head-count axis (see _compute_unique_tm_Q_matrices), giving 27 x (tm_max_heads + 1). Build them
-# all, exponentiate in one batch, then gather per site.
+# IMPLEMENTATION. The field depends only on (n_blocked, n_closed, n_open), so
+# there are 27 index slots per block for the entire system, however large the
+# lattice. The strong-head count adds one axis (see
+# _compute_unique_tm_Q_matrices), giving 27 x (tm_max_heads + 1). Build them
+# all, exponentiate in one batch, then gather per unit.
 
 
-def count_neighbor_states_split(tm_states: jnp.ndarray,
-                                tm_prev_neighbor: jnp.ndarray,
-                                tm_next_neighbor: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Count same-chain neighbors in state 2, state 3, and closed (state 0/1),
-    using the fixed (<=2) topological same-chain neighbor set per site.
+#: Number of tropomyosin unit states: 2 * position + has_calcium.
+N_TM_STATES = 6
 
-    NEIGHBOURS ARE STRUCTURAL, NOT SPATIAL. A site couples to its immediate
+#: Ising weight of each position (blocked, closed, open).
+TM_POSITION_WEIGHT = (-1.0, 0.0, 1.0)
+
+
+def tm_position(tm_states):
+    """Tropomyosin POSITION of each unit: 0 blocked, 1 closed, 2 open.
+
+    state = 2 * position + has_calcium, so position = state >> 1. Every rule that reads a unit's position — the crossbridge gates and
+    the closure tears — reads it through this, never through a state literal.
+    Works on NumPy and JAX integer arrays alike.
+    """
+    return tm_states >> 1
+
+
+def tm_has_calcium(tm_states):
+    """1 where troponin has calcium bound (odd state), else 0."""
+    return tm_states & 1
+
+
+def xb_gate_position(state: 'State', topology: 'SarcTopology') -> jnp.ndarray:
+    """Position of the unit whose gates each head reads, (n_xb_total,) in {0, 1, 2}.
+
+    A BOUND head reads the unit under the monomer it is bound to; an unbound
+    head reads the unit under its nearest monomer, the one it would bind. The
+    nearest monomer of a bound head can sit on a neighbouring unit, and that
+    unit's gate says nothing about the site the head actually holds.
+
+    Heads with no geometric partner (xb_valid False) carry a placeholder target
+    and are forced to blocked, the block where attachment is exactly zero.
+    """
+    thin = topology.xb_to_thin_id
+    bound = state.thick.xb_bound_to.reshape(-1)
+    mono = jnp.where(bound >= 0, bound, state.thick.xb_nearest_bs.reshape(-1))
+    mono = jnp.clip(mono, 0, topology.n_mono - 1)
+    pos = tm_position(state.thin.tm_states[thin, topology.mono_tm[thin, mono]])
+    return jnp.where(topology.xb_valid, pos, 0).astype(jnp.int32)
+
+
+def count_neighbor_positions(tm_states: jnp.ndarray,
+                             tm_prev_neighbor: jnp.ndarray,
+                             tm_next_neighbor: jnp.ndarray) -> jnp.ndarray:
+    """Field-slot index of each unit: n_blocked*9 + n_closed*3 + n_open over its
+    real same-chain neighbours, one strand.
+
+    NEIGHBOURS ARE STRUCTURAL, NOT SPATIAL. A unit couples to its immediate
     predecessor and successor in its own chain's axial ordering, precomputed once
-    when the topology is built. There is no distance threshold and no length
-    scale to tune, which is what makes the coupling a genuine nearest-neighbour
-    Ising chain rather than a windowed approximation to one.
-
-    Endpoints self-reference rather than carrying a sentinel index, so every
-    gather is valid and no masking is needed. A site therefore has at most two
-    real neighbours by construction, and the counts fall in {0, 1, 2} naturally —
-    the jnp.minimum(..., 2) below is defensive, kept because the downstream
-    Q-matrix gather assumes that range structurally.
-
-    Nothing is written to state: the counts are consumed inline by
-    thin_transitions().
+    when the topology is built. Endpoints self-reference rather than carrying a
+    sentinel index, so every gather is valid; a self-reference is not counted.
+    Each count is in {0, 1, 2} by construction.
 
     Args:
-        tm_states:        (n_tm,) TM states (0-3)
-        tm_prev_neighbor: (n_tm,) nearest same-chain predecessor site index
-            (self-referencing at chain endpoints/padding)
-        tm_next_neighbor: (n_tm,) nearest same-chain successor site index
-            (self-referencing at chain endpoints/padding)
+        tm_states:        (n_tm,) unit states
+        tm_prev_neighbor: (n_tm,) predecessor index (self at a chain end)
+        tm_next_neighbor: (n_tm,) successor index (self at a chain end)
 
     Returns:
-        n_2:      (n_tm,) int32 same-chain state-2 neighbors, in {0,1,2}
-        n_3:      (n_tm,) int32 same-chain state-3 neighbors, in {0,1,2}
-        n_closed: (n_tm,) int32 same-chain state-{0,1} neighbors, in {0,1,2}
+        (n_tm,) int32 in [0, 27)
     """
-    n_tm = tm_states.shape[0]
-    site_idx = jnp.arange(n_tm)
+    idx = jnp.arange(tm_states.shape[0])
+    pos = tm_position(tm_states.astype(jnp.int32))
 
-    is_2 = (tm_states == 2)
-    is_3 = (tm_states == 3)
-    is_closed = (tm_states == 0) | (tm_states == 1)
+    def count(p):
+        hit = pos == p
+        return ((hit[tm_prev_neighbor] & (tm_prev_neighbor != idx)).astype(jnp.int32)
+                + (hit[tm_next_neighbor] & (tm_next_neighbor != idx)).astype(jnp.int32))
 
-    prev_real = (tm_prev_neighbor != site_idx)
-    next_real = (tm_next_neighbor != site_idx)
-
-    n_2 = (is_2[tm_prev_neighbor] & prev_real).astype(jnp.int32) + (is_2[tm_next_neighbor] & next_real).astype(jnp.int32)
-    n_3 = (is_3[tm_prev_neighbor] & prev_real).astype(jnp.int32) + (is_3[tm_next_neighbor] & next_real).astype(jnp.int32)
-    n_c = (is_closed[tm_prev_neighbor] & prev_real).astype(jnp.int32) + (is_closed[tm_next_neighbor] & next_real).astype(jnp.int32)
-
-    return jnp.minimum(n_2, 2), jnp.minimum(n_3, 2), jnp.minimum(n_c, 2)
+    return count(0) * 9 + count(1) * 3 + count(2)
 
 
 def _compute_unique_tm_Q_matrices(ca_concentration: float,
-                                  J_C: float,
-                                  J_M: float,
                                   params,
                                   n_lock: int) -> jnp.ndarray:
-    """Build the 27 x (n_lock + 1) rate matrices of the Ising cooperativity model.
+    """Build the 27 x (n_lock + 1) six-state generators of the tropomyosin unit.
 
-    One matrix per possible neighbour composition (n_2, n_3, n_closed), each
-    count running over {0, 1, 2}, TIMES the number of crossbridges bound on the
-    unit, 0..n_lock. Because that is the only thing a unit's rates depend on,
-    these matrices cover every unit in the system regardless of lattice size.
+    One matrix per neighbour composition (n_blocked, n_closed, n_open), each
+    count in {0, 1, 2}, TIMES the number of STRONG crossbridges (Tight_1,
+    Tight_2) bound on the unit, 0..n_lock. That is everything a unit's rates
+    depend on, so these matrices cover every unit regardless of lattice size.
 
-    THE CROSSBRIDGE LOCK IS A RATE, and it lives here. A unit with n heads bound
-    has its two exits from the open state 3 divided by (1 + xb_tm_K2)^n:
+    THE UNIT (rate_functions module docstring): state = 2*position + has_Ca.
+    Position edges blocked <-> closed <-> open at each calcium level, with that
+    level's equilibrium (tm_Keq_unblock_*, tm_Keq_swing_*); calcium edges at
+    every position, with the affinity there forced by detailed balance
+    (tm_ca_affinity_ratios). No blocked <-> open edge.
 
-        k_30 /= (1 + K2)^n,  k_32 /= (1 + K2)^n,  k_33 = -(k_30 + k_32)
+    THE FIELD is a state energy on position (section header above): detailed
+    balance holds on every cycle of every unlocked block, and calcium
+    edges are untouched.
 
-    McKillop & Geeves 1993 Fig. 1: one bound S1 multiplies the open/closed ratio
-    by (1 + K2). THE LOCK IS PER HEAD. Their structural unit is seven actins, and
-    their Eq. 4 (p. 695) gives each actin P = 1 + K1[M](1 + K2), so n S1 bound in
-    one unit multiply the ratio by (1 + K2)^n; the Fig. 1 caption (p. 694) writes
-    the series K_T(1 + K2 + K2^2 + ...), 1.2% away at n = 2, K2 = 79. One head per
-    binding candidate, so n_lock = SarcTopology.tm_max_heads, the most candidates
-    any unit covers. That is a statement about an EQUILIBRIUM RATIO, and a rate
-    inside Q is the form that reproduces it at any dt — steady-state open/closed
-    becomes k_23/(k_32/(1+K2)) = K_T(1+K2) exactly. Dividing the sampled exit
-    PROBABILITY by (1 + K2) after the exponential would match only to first order
-    in dt; at dt = 1 ms the unlocked exit probability from state 3 spans
-    0.058-0.974 across the 27 configurations, deep in the saturation of
-    1 - exp(-L*dt). See the xb_tm_K2 row in core/param_table.py for the value.
+    THE CROSSBRIDGE LOCK IS A RATE. A unit with n STRONG heads has its exits
+    from the open set (4 -> 2, 5 -> 3) divided by (1 + xb_tm_K2)^n. Both exits
+    scale together, so the lock shifts the open/closed equilibrium by
+    (1 + K2)^n at either calcium level and detailed balance survives. Weak
+    heads do not lock: in McKillop & Geeves' scheme the A state binds closed
+    and open units identically, and only the R state shifts the equilibrium.
+    THE LOCK IS PER HEAD: their Eq. 4 (p. 695) gives each actin
+    P = 1 + K1[M](1 + K2), so n S1 in one unit multiply the ratio by (1 + K2)^n.
+    n_lock = SarcTopology.tm_max_heads, the most candidates any unit covers. A
+    rate inside Q reproduces the equilibrium ratio at any dt; scaling a sampled
+    exit PROBABILITY would match only to first order in dt.
 
-    THE CONTROL PATH IS EXACT. At K2 = jnp.inf every locked block gets
-    k_30 = k_32 = k_33 = 0, so state 3 is absorbing and expm returns row 3 =
-    [0, 0, 0, 1], a hard lock. Rows 0-2 of the locked blocks are never read
-    there, because a head can only bind an open (state 3) site and a hard-locked
-    site can never leave it.
+    Weak heads do not shift blocked <-> closed: a unit carrying weak heads
+    blocks at the same rate as a bare one, and thin_transitions tears them off
+    when it does.
 
-    The local field h is applied as exp(+h/2) on the three forward rates and
-    exp(-h/2) on their reverses, leaving the one-way cycle-closing rate k_30 at
-    its base value — see the section header above for why.
+    THE CONTROL PATH IS EXACT. At K2 = jnp.inf every block with a strong head
+    has zero exits from the open set, so open is absorbing (up to its calcium
+    edge) and a strong head can never be torn.
 
-    The rate laws themselves are NOT written here: each comes from its
-    tm_rate_XY function in rate_functions.py, evaluated on all 27 configurations
-    at once. This function only decides which modifier each rate receives and
-    assembles the results, exactly as xb_rate_matrix does for the crossbridge
-    cycle.
+    The rate laws come from rate_functions.py (tm_rate_forward/_reverse,
+    tm_rate_ca_on/_off, tm_ca_affinity_ratios); this function only decides which
+    modifier each rate receives and assembles the blocks.
 
     Args:
         ca_concentration: Calcium concentration (M)
-        J_C: Coupling to Ca-open neighbours (kT)
-        J_M: Coupling to crossbridge-bound neighbours (kT)
-        params: DynamicParams with the tm_* rates and equilibrium constants
+        params: DynamicParams with the tm_* rates and equilibria, tm_J
+            (kT) and xb_tm_K2
         n_lock: the most heads one unit can hold (SarcTopology.tm_max_heads)
 
     Returns:
-        Q_unique: (27 * (n_lock + 1), 4, 4), indexed by
-            (n_2*9 + n_3*3 + n_closed) + 27*n_heads
+        Q_unique: (27 * (n_lock + 1), 6, 6), indexed by
+            (n_blocked*9 + n_closed*3 + n_open) + 27*n_strong
     """
-    Keq_01 = params.tm_Keq_01
-    Keq_12 = params.tm_Keq_12
-    Keq_23 = params.tm_Keq_23
-    k_01_base = params.tm_k_01
-    k_12_base = params.tm_k_12
-    k_23_base = params.tm_k_23
-    k_30_base = params.tm_k_30
+    W = TM_POSITION_WEIGHT
+    lv = jnp.arange(3, dtype=jnp.float32)
+    n_b, n_c, n_o = (g.reshape(-1) for g in jnp.meshgrid(lv, lv, lv, indexing='ij'))
+    h = params.tm_J * (W[0] * n_b + W[1] * n_c + W[2] * n_o)        # (27,) field, kT
 
-    # 27 configurations as flat arrays (index = n_2*9 + n_3*3 + n_closed)
-    levels = jnp.array([0, 1, 2], dtype=jnp.float32)
-    n2g, n3g, ncg = jnp.meshgrid(levels, levels, levels, indexing='ij')
-    n_2_flat = n2g.reshape(-1)
-    n_3_flat = n3g.reshape(-1)
-    n_c_flat = ncg.reshape(-1)
+    def field(s_, t_):
+        """Multiplier on s -> t: exp((W(pos t) - W(pos s)) * h / 2)."""
+        return jnp.exp((W[t_ >> 1] - W[s_ >> 1]) * 0.5 * h)
 
-    h = J_C * n_2_flat + J_M * n_3_flat - 0.5 * (J_C + J_M) * n_c_flat
-    forward_boost = jnp.exp(0.5 * h)    # (27,)
-    backward_boost = jnp.exp(-0.5 * h)  # (27,)
+    ones = jnp.ones(27, jnp.float32)
+    rate = {}
+    for ca, sfx in ((0, 'noca'), (1, 'ca')):
+        b, c, o = 0 + ca, 2 + ca, 4 + ca
+        K_B = getattr(params, f'tm_Keq_unblock_{sfx}')
+        K_T = getattr(params, f'tm_Keq_swing_{sfx}')
+        rate[b, c] = tm_rate_forward(params.tm_k_unblock) * field(b, c)
+        rate[c, b] = tm_rate_reverse(params.tm_k_unblock, K_B) * field(c, b)
+        rate[c, o] = tm_rate_forward(params.tm_k_swing) * field(c, o)
+        rate[o, c] = tm_rate_reverse(params.tm_k_swing, K_T) * field(o, c)
+    ratio = tm_ca_affinity_ratios(params.tm_Keq_unblock_noca, params.tm_Keq_unblock_ca,
+                                  params.tm_Keq_swing_noca, params.tm_Keq_swing_ca)
+    for p_ in range(3):
+        s_ = 2 * p_
+        # Calcium edges: same position, so the field multiplier is exactly 1.
+        rate[s_, s_ + 1] = tm_rate_ca_on(ca_concentration, params.tm_k_ca_on, ratio[p_],
+                                         params.tm_alpha_ca) * ones
+        rate[s_ + 1, s_] = tm_rate_ca_off(params.tm_k_ca_on, ratio[p_], params.tm_alpha_ca,
+                                          params.tm_Keq_ca) * ones
 
-    # Boost ALL three forward TM transitions (0→1 Ca-bind, 1→2 intermediate shift,
-    # 2→3 TM-to-M-position) and their backwards symmetrically. State 3 = M-position
-    # (TM open, available for XB binding). The cycle-close step k_30 stays at base
-    # — slowing it produces anti-cooperative cascade behavior (verified empirically),
-    # which is why tm_rate_30 takes no modifier argument at all.
-    # This is the original Tanner 2012 prescription (Ψ on r_{t,12} and r_{t,23}),
-    # plus the Ca-binding step, applied Glauber-symmetrically.
-    #
-    # k_30 is broadcast to (27,) so every rate entering the Q builder has the
-    # same shape, even though this one does not vary across configurations.
-    k_01 = tm_rate_01(ca_concentration, k_01_base, forward_boost)
-    k_12 = tm_rate_12(k_12_base, forward_boost)
-    k_23 = tm_rate_23(k_23_base, forward_boost)
-    k_30 = tm_rate_30(jnp.broadcast_to(k_30_base, (27,)))
-
-    k_10 = tm_rate_10(k_01_base, Keq_01, backward_boost)
-    k_21 = tm_rate_21(k_12_base, Keq_12, backward_boost)
-    k_32 = tm_rate_32(k_23_base, Keq_23, backward_boost)
-
-    # One block of 27 per number of heads bound on the unit, n = 0..n_lock. Only
-    # the two exits from state 3 differ between blocks, each scaled by
-    # (1 + K2)^-n; every other rate is shared, so this is a concatenate rather
-    # than another pass over the rate laws.
+    # One block of 27 per n_strong. The lock scales the two exits from the open
+    # SET (4 -> 2, 5 -> 3), never the 4 <-> 5 calcium edge.
     #
     # 1/(1 + K2) is formed once and multiplied, not divided by per rate: at
-    # K2 = jnp.inf that is a multiply by exactly 0.0, whereas dividing by inf
-    # would be too but only by IEEE luck, and 0.0 is what makes row 3 of every
-    # locked generator identically zero and the control path exact. The powers
-    # are built by repeated multiplication, so the n = 1 block is bit-identical
-    # to the single-head lock.
-    lock_n = [lock := 1.0 / (1.0 + params.xb_tm_K2)]
-    for _ in range(n_lock - 1):
+    # K2 = jnp.inf that is a multiply by exactly 0.0, which makes the open rows
+    # of every locked generator absorbing and the control path exact. Powers by
+    # repeated multiplication, so the n = 1 block is bit-identical to a
+    # single-head lock.
+    lock = 1.0 / (1.0 + params.xb_tm_K2)
+    lock_n = [1.0]
+    for _ in range(n_lock):
         lock_n.append(lock_n[-1] * lock)
-    k_30 = jnp.concatenate([k_30] + [k_30 * f for f in lock_n])
-    k_32 = jnp.concatenate([k_32] + [k_32 * f for f in lock_n])
-
-    def _tile(a):
-        return jnp.concatenate([a] * (n_lock + 1))
-
-    k_01, k_12, k_23 = _tile(k_01), _tile(k_12), _tile(k_23)
-    k_10, k_21 = _tile(k_10), _tile(k_21)
-
-    # Diagonals
-    k_00 = -k_01
-    k_11 = -(k_10 + k_12)
-    k_22 = -(k_21 + k_23)
-    k_33 = -(k_30 + k_32)
-
-    Q_flat = _build_tm_Q_matrix_optimized(
-        k_00, k_01, k_10, k_11, k_12,
-        k_21, k_22, k_23, k_30, k_32, k_33,
-    )  # (27 * (n_lock + 1), 4, 4)
-
-    return Q_flat
+    full = {e: jnp.concatenate([r * (lock_n[n] if e in ((4, 2), (5, 3)) else 1.0)
+                                for n in range(n_lock + 1)])
+            for e, r in rate.items()}
+    zero = jnp.zeros(27 * (n_lock + 1), jnp.float32)
+    rows = [[full.get((i, j), zero) for j in range(N_TM_STATES)] for i in range(N_TM_STATES)]
+    for i in range(N_TM_STATES):
+        rows[i][i] = -sum(full[e] for e in full if e[0] == i)
+    # (27 * (n_lock + 1), 6, 6), built by stacking rather than scattering.
+    return jnp.stack([jnp.stack(r, axis=-1) for r in rows], axis=-2)
 
 
 def _populations(subpop, constants):
@@ -713,44 +656,37 @@ def thin_transitions(state: 'State',
     and the structural chain adjacency. That is why the kinetics phase needs no
     thin-filament force calculation ahead of it.
 
-    Sequence: build 27 x (tm_max_heads + 1) rate matrices, exponentiate them in
-    one batch, count each unit's neighbours and its bound heads to get its
-    configuration index, gather its probability vector, sample, then detach any head whose
-    tropomyosin closed underneath it.
+    Sequence: build 27 x (tm_max_heads + 1) rate matrices, exponentiate them
+    in one batch, count each unit's neighbours and its strong heads to get its
+    configuration index, gather its probability vector, sample, then tear the
+    heads the new position does not support.
 
-    LOCKED UNITS — A FINITE LOCK, PER HEAD, APPLIED TO RATES. A unit with n
-    crossbridges attached has its two exits from the open state 3 divided by
-    (1 + xb_tm_K2)^n inside the generator: a bound head biases tropomyosin
-    towards open, it does not pin it. See _compute_unique_tm_Q_matrices for the
-    derivation and for why the K2 = jnp.inf hard lock is exact. The bound/unbound
-    axis is a second constant-size axis on the matrix set, not a per-site one.
+    LOCKED UNITS — A FINITE LOCK, PER STRONG HEAD, APPLIED TO RATES. A unit with
+    n Tight_1/Tight_2 heads has its two exits from the open set divided by
+    (1 + xb_tm_K2)^n inside the generator. Weak heads do not lock. See
+    _compute_unique_tm_Q_matrices for the derivation and for why the
+    K2 = jnp.inf hard lock is exact.
 
-    DETACHMENT ON CLOSURE. With a finite lock, tropomyosin can close over a bound
-    head. The head then detaches and its bound_to is cleared on both sides.
-    xb_rate_01 gates attachment on permissiveness, so a head cannot bind unless
-    tropomyosin is fully open; leaving any bound head (weak included) behind
-    after closure would contradict that binding rule. This is a self-consistency
-    rule of the model, not a measured mechanism: closed tropomyosin and an
-    attached head are mutually exclusive, and the finite lock (K2 measured
-    finite) means the closure must be resolved somehow.
+    CLOSURE. A head is torn when its unit moves to a position that does not
+    support it. Only the open position permits the weak -> strong step, so a
+    STRONG head on a unit that leaves open is torn to state 4 Free_2 and charged
+    one ATP (it has already released phosphate and swung its lever; returning
+    it to DRX = M.ADP.Pi would hand that phosphate back for free). Closed and
+    open units bind weak heads (xb_rate_01 is attach-gated) and blocked units
+    bind nothing, so a WEAK head stays through open -> closed and is torn to
+    state 0 DRX, owing nothing, when its unit enters blocked.
 
-    WHERE IT LANDS DEPENDS ON WHAT IT HAD ALREADY SPENT. A Loose head returns to
-    state 0 DRX and owes nothing; a Tight_1 or Tight_2 head goes to state 4
-    Free_2 and is charged one ATP. See the closure block itself for why, and for
-    why the destination is written as a test on states 2 and 3 rather than as an
-    "else".
-
-    ATP: A WEAK TEAR IS FREE, A STRONG TEAR COSTS ONE. metrics_fn books both
-    from the `torn` mask this function returns, as `closure_detach_free` and
-    `closure_detach_atp`, and adds them into `atp_consumed` and `atp_expected`.
+    ATP: metrics_fn books every tear from the `torn` mask this function returns,
+    split by destination into `closure_detach_free` and `closure_detach_atp`,
+    and adds the second into `atp_consumed` and `atp_expected`.
     No expectation is needed: the tear is fully observed and the charge is
     deterministic given it. `xb_give_up` is a different route — the 2 -> 1
     crossing count, after which the head is still weakly bound.
 
     Args:
         state: Current State (reads tm_states and bound_to)
-        constants: DynamicParams with tm_J_C, tm_J_M and the tm_* rates
-        topology: SarcTopology, for chain neighbours and the eye_4 identity
+        constants: DynamicParams with tm_J and the tm_* rates
+        topology: SarcTopology, for chain neighbours and the eye_6 identity
         pCa: this step's calcium level, -log10([Ca2+] in M)
         rng_key: JAX random key for sampling
         dt: Timestep length (ms)
@@ -764,80 +700,78 @@ def thin_transitions(state: 'State',
     Returns:
         new_state: State with updated tm_states
         P_flat: the distinct probability matrices used, for validation —
-            (27 * (tm_max_heads + 1), 4, 4), or (K, ..., 4, 4) for an explicit
-            mixture, in blocks of 27 by the number of heads bound on the unit.
+            (27 * (tm_max_heads + 1), 6, 6), or (K, ..., 6, 6) for an
+            explicit mixture, indexed as _compute_unique_tm_Q_matrices.
         closure_detached: (n_thick, n_crowns, n_xb_per_crown) bool, True for
-            each head this call tore off because its tropomyosin closed. Not
-            recoverable downstream — a torn head lands in state 0 or state 4,
-            both of which an ordinary head also reaches — so it is returned
-            rather than re-derived, and travels to metrics_fn inside the
-            KineticsTrace. metrics_fn splits it into `closure_detach_free` (free)
-            and `closure_detach_atp` (one ATP each) by the state the head is in
-            after this call.
+            each head this call tore off. Not recoverable downstream — a torn
+            head lands in state 0 or 4, which an ordinary head also reaches —
+            so it is returned rather than re-derived, and travels to metrics_fn
+            inside the KineticsTrace.
     """
     tm_states = state.thin.tm_states                    # (n_thin, n_tm) int8
     tm_prev_neighbor = topology.tm_prev_neighbor        # (n_thin, n_tm)
     tm_next_neighbor = topology.tm_next_neighbor        # (n_thin, n_tm)
     bound_to = state.thin.bound_to                      # (n_thin, n_cand)
-    eye_4 = topology.eye_4
+    eye = topology.eye_6
 
     n_thin, n_tm = tm_states.shape
     n_tm_total = n_thin * n_tm
 
-    # A UNIT's lock level is the number of heads bound on the monomers it covers.
-    # Read from the HEADS, not from the monomers: scatter-ADD of one per bound
-    # head onto its unit, n_xb updates rather than one per monomer. A candidate
-    # holds at most one head, so the count never exceeds topology.tm_max_heads.
-    # The two binding records agree (thick_transitions keeps them so), which is
-    # what makes the head side a complete record of what is bound.
-    # Unbound heads are sent past the end and dropped: left in place they all
-    # land on one unit (monomer 0, and the (0, 0) placeholder of invalid heads),
-    # and a GPU scatter that hammers one slot is the slow path.
+    # A UNIT's lock level is the number of STRONG heads bound on the monomers it
+    # covers. Read from the HEADS,
+    # not from the monomers: scatter-ADD of one per head onto its unit, n_xb
+    # updates rather than one per monomer. A candidate holds at most one head,
+    # so the count never exceeds topology.tm_max_heads. The two binding records
+    # agree (thick_transitions keeps them so), which is what makes the head side
+    # a complete record of what is bound.
+    # Heads that do not count are sent past the end and dropped: left in place
+    # they all land on one unit (monomer 0, and the (0, 0) placeholder of
+    # invalid heads), and a GPU scatter that hammers one slot is the slow path.
     xb_mono = state.thick.xb_bound_to.reshape(-1)       # (n_xb,) monomer, -1 unbound
+    xb_flat = state.thick.xb_states.reshape(-1)
     head_bound = xb_mono >= 0
-    head_unit = jnp.where(
-        head_bound,
-        topology.xb_to_thin_id * n_tm
-        + topology.mono_tm[topology.xb_to_thin_id, jnp.maximum(xb_mono, 0)],
-        n_tm_total)
-    n_heads = jnp.zeros(n_tm_total, jnp.int32).at[head_unit].add(1).reshape(n_thin, n_tm)
-    is_bound = n_heads > 0
+    head_strong = head_bound & ((xb_flat == 2) | (xb_flat == 3))
+    head_unit = (topology.xb_to_thin_id * n_tm
+                 + topology.mono_tm[topology.xb_to_thin_id, jnp.maximum(xb_mono, 0)])
+
+    def _per_unit(mask):
+        return jnp.zeros(n_tm_total, jnp.int32).at[
+            jnp.where(mask, head_unit, n_tm_total)].add(1).reshape(n_thin, n_tm)
+
+    n_strong = _per_unit(head_strong)
     n_lock = topology.tm_max_heads
     n_mat = 27 * (n_lock + 1)
 
     ca_conc = 10.0 ** (-pCa)
 
     # Per-filament neighbor counts (each function call processes one strand)
-    n_2, n_3, n_c = jax.vmap(count_neighbor_states_split)(tm_states, tm_prev_neighbor, tm_next_neighbor)
-    # all shape (n_thin, n_tm), int32 capped at 2
+    nb_idx = jax.vmap(count_neighbor_positions)(tm_states, tm_prev_neighbor, tm_next_neighbor)
 
-    # The head-count axis selects the unit's lock block. It is
-    # read here, once, from the state at the START of the step — the same
-    # operator-splitting approximation the rest of the kinetics phase makes.
-    config_idx = ((n_2 * 9 + n_3 * 3 + n_c).reshape(-1)
-                  + 27 * n_heads.reshape(-1))                     # (n_tm_total,)
+    # The strong-head count selects the unit's block. Read here, once, from the
+    # state at the START of the step — the same operator-splitting
+    # approximation the rest of the kinetics phase makes.
+    config_idx = (nb_idx + 27 * n_strong).reshape(-1)  # (n_tm_total,)
 
     mode, constants_k, extra = _populations(tm_subpop, constants)
-    # Per-population n_mat-matrix sets. The couplings are per-population too,
-    # so a subpopulation may scale tm_J_C / tm_J_M as well as the rates —
-    # and, now that the lock is a rate, its own xb_tm_K2.
-    Q_k = [_compute_unique_tm_Q_matrices(ca_conc, ck.tm_J_C, ck.tm_J_M, ck, n_lock)
-           for ck in constants_k]  # each (n_mat, 4, 4)
+    # Per-population n_mat-matrix sets. The coupling is per-population too,
+    # so a subpopulation may scale tm_J as well as the rates, and its own xb_tm_K2.
+    Q_k = [_compute_unique_tm_Q_matrices(ca_conc, ck, n_lock)
+           for ck in constants_k]  # each (n_mat, 6, 6)
     if mode == 'mean_field':
-        P_flat = expm_pade6_batch(_blend(extra, Q_k) * dt, identity=eye_4)  # (n_mat, 4, 4)
-        P_indexed = P_flat[config_idx]                          # (n_tm_total, 4, 4)
+        P_flat = expm_pade6_batch(_blend(extra, Q_k) * dt, identity=eye)  # (n_mat, 6, 6)
+        P_indexed = P_flat[config_idx]                          # (n_tm_total, 6, 6)
     else:  # explicit mixture: per-unit label select
         labels = extra  # (n_tm_total,) INT in [0, K)
-        Q_stack = jnp.stack(Q_k)  # (K, n_mat, 4, 4)
+        Q_stack = jnp.stack(Q_k)  # (K, n_mat, 6, 6)
         Kp = Q_stack.shape[0]
         P_flat = expm_pade6_batch(
-            Q_stack.reshape(Kp * n_mat, 4, 4) * dt, identity=eye_4).reshape(Kp, n_mat, 4, 4)
-        P_indexed = P_flat[labels, config_idx]  # (n_tm_total, 4, 4)
+            Q_stack.reshape(Kp * n_mat, 6, 6) * dt, identity=eye).reshape(Kp, n_mat, 6, 6)
+        P_indexed = P_flat[labels, config_idx]  # (n_tm_total, 6, 6)
 
     tm_states_flat = tm_states.reshape(-1).astype(jnp.int32)
 
-    # The lock is already in these rows: config_idx selected each unit's lock
-    # block by its bound-head count. There is no post-hoc rescaling step.
+    # The lock is already in these rows: config_idx selected each unit's block
+    # by its strong-head count. No post-hoc step.
     prob_vectors = jax.vmap(lambda P, s: P[s])(P_indexed, tm_states_flat)
 
     if random_values is None:
@@ -850,53 +784,34 @@ def thin_transitions(state: 'State',
     new_tm_states = new_states.reshape(n_thin, n_tm).astype(jnp.int8)
 
     # ---------------------------------------------------------------- closure
-    # Tropomyosin that closed over a bound head detaches it. See DETACHMENT ON
-    # CLOSURE in the docstring: every bound head, weak included, because
-    # xb_rate_01 lets nothing bind unless the site is fully open.
-    # Unreachable while xb_tm_K2 is jnp.inf — the lock and this trigger read the
-    # same head records, so a locked unit can never leave state 3 — which is
-    # what makes the control path those six parameter values and no flag.
-    # A unit that leaves the open state releases every head on every monomer it
-    # covers.
-    left_unit = (tm_states == 3) & (new_tm_states != 3) & is_bound
+    # A strong head whose unit left the open position is torn to Free_2; a weak
+    # head whose unit entered blocked is torn to DRX (see CLOSURE in the
+    # docstring). The strong tear is unreachable while xb_tm_K2 is jnp.inf — the
+    # lock and this trigger read the same head records, so a unit with a strong
+    # head can never leave the open set.
+    old_pos, new_pos = tm_position(tm_states), tm_position(new_tm_states)
+    left_open = ((old_pos == 2) & (new_pos != 2)).reshape(-1)
+    blocked = ((old_pos != 0) & (new_pos == 0)).reshape(-1)
+    hit_strong = head_strong & left_open[head_unit]
+    hit_weak = head_bound & (xb_flat == 1) & blocked[head_unit]
+    hit = hit_strong | hit_weak
 
     xb_shape = state.thick.xb_states.shape
-    xb_flat = state.thick.xb_states.reshape(-1)
-
-    # A bound head is torn when the unit covering its monomer left. One GATHER
-    # per head at the unit index the lock already built — no scatter.
-    hit = head_bound & left_unit.reshape(-1)[head_unit]
-
-    # WHERE A TORN HEAD LANDS. A Loose (state 1) head is still primed —
-    # A.M.ADP.Pi, nothing spent — so it goes to state 0 DRX and owes nothing. A
-    # Tight_1 or Tight_2 head has already released phosphate and swung its
-    # lever; putting it in DRX (= M.ADP.Pi) would regenerate that phosphate and
-    # re-cock the lever for free, which is the same leak xb_rate_43 is held at
-    # exactly zero to prevent. Those go to state 4 Free_2 — detached,
-    # post-stroke, ATP bound — and are charged one ATP in metrics_fn.
-    #
-    # >>> WRITTEN AS `(s == 2) | (s == 3) -> 4, else 0`, NEVER AS
-    #     `weak -> 0, else -> 4`. `hit` is raised from the two binding records
-    #     together, and if they were ever stale — a head's xb_bound_to naming a
-    #     site that no longer names it — the "else" form would push an already
-    #     detached head into Free_2 and charge it an ATP it never spent. Testing
-    #     the states that actually owe one cannot do that.
-    #
-    # >>> THIS IS A DYNAMICS CHANGE, NOT ONLY ACCOUNTING. A head in Free_2 must
-    #     wait for xb_rate_40 before it can rebind, and xb_r40 = 0.1 /ms is a
-    #     ~10 ms dwell — so `n_xb_free_2` rises and relaxation slows relative to
-    #     landing in DRX. The table tags xb_r40 [G]: unsourced, inherited.
-    torn_dest = jnp.where((xb_flat == 2) | (xb_flat == 3), jnp.int8(4), jnp.int8(0))
-    new_xb_states = jnp.where(hit, torn_dest, xb_flat).reshape(xb_shape)
-    # Clear bound_to on BOTH sides. If the site kept its record it would stay
-    # flagged occupied and nothing could ever rebind it.
-    new_xb_bound_to = jnp.where(
-        hit, jnp.int32(-1), state.thick.xb_bound_to.reshape(-1)).reshape(xb_shape)
-    # Per candidate: clear every candidate whose unit left (an unbound one is
-    # already -1).
-    cand_unit = jnp.take_along_axis(topology.mono_tm, topology.cand_mono, axis=1)
-    new_bound_to = jnp.where(jnp.take_along_axis(left_unit, cand_unit, axis=1),
-                             jnp.int32(-1), bound_to)
+    new_xb_states = jnp.where(hit_strong, jnp.int8(4),
+                              jnp.where(hit_weak, jnp.int8(0), xb_flat)).reshape(xb_shape)
+    # Clear bound_to on BOTH sides, from the same per-head `hit`, so the two
+    # records cannot disagree. If the site kept its record it would stay
+    # flagged occupied and nothing could ever rebind it. The site side is a
+    # scatter-MAX of a flag (as in thick_transitions): a head contributing 0
+    # cannot lower a raised flag, and non-hit heads are sent past the end.
+    new_xb_bound_to = jnp.where(hit, jnp.int32(-1), xb_mono).reshape(xb_shape)
+    n_cand = topology.n_cand
+    thin_id = topology.xb_to_thin_id
+    cand_flat = thin_id * n_cand + jnp.maximum(
+        topology.mono_cand[thin_id, jnp.maximum(xb_mono, 0)], 0)
+    clear = jnp.zeros(n_thin * n_cand, jnp.int32).at[
+        jnp.where(hit, cand_flat, n_thin * n_cand)].max(1) == 1
+    new_bound_to = jnp.where(clear.reshape(n_thin, n_cand), jnp.int32(-1), bound_to)
 
     new_thin = state.thin._replace(tm_states=new_tm_states,
                                    bound_to=new_bound_to)
@@ -914,7 +829,8 @@ def thin_transitions(state: 'State',
 def xb_rate_matrix(xb_distances: jnp.ndarray,
                    lattice_spacing: float,
                    spring_constants: jnp.ndarray,
-                   permissiveness: jnp.ndarray,
+                   attach: jnp.ndarray,
+                   stroke: jnp.ndarray,
                    site_access: jnp.ndarray,
                    ca_concentration: float,
                    temp_celsius: float,
@@ -957,8 +873,10 @@ def xb_rate_matrix(xb_distances: jnp.ndarray,
             [:, 0:4]  g_k_weak, g_rest_weak, c_k_weak, c_rest_weak
             [:, 4:8]  g_k_strong, g_rest_strong, c_k_strong, c_rest_strong
             [:, 8:12] g_k_tight_1, g_rest_tight_1, c_k_tight_1, c_rest_tight_1
-        permissiveness: (n_xb,) 1 if the target site's tropomyosin is open,
-            else 0. Gates attachment entirely.
+        attach: (n_xb,) 1 if the target unit is closed or open, 0 if blocked.
+            Gates weak attachment, r01, only.
+        stroke: (n_xb,) 1 if the target unit is open, else 0. Gates the
+            weak -> strong step, r12, only.
         site_access: (n_xb,) fraction of the attachment rate that survives
             thin-thin overlap screening: 1 - thin_thin_overlap_screening for a
             target past the hiding line, 1 otherwise. Scales r01 only.
@@ -1069,18 +987,23 @@ def xb_rate_matrix(xb_distances: jnp.ndarray,
     srx_b = params.xb_srx_b
     srx_ca50 = params.xb_srx_ca50
 
-    # 0 DRX <-> 1 Loose : attachment, gated by tropomyosin permissiveness.
-    # site_access (thin-thin overlap screening) scales the FORWARD rate only:
-    # r10 comes from the unscreened r01, so a screened site is bound less often
-    # rather than just more slowly. Scaling both would leave the weak-state
-    # occupancy untouched, which is not what screening means.
-    r01_open = xb_rate_01(permissiveness, r01_coeff, E_weak)
-    r10 = xb_rate_10(r01_open, U_DRX, U_loose)
-    r01 = site_access * r01_open
+    # TWO GATES, AND EACH STOPS ONLY ARRIVAL. A blocked unit stops weak
+    # attachment (r01); a unit that is not open stops the weak -> strong step
+    # (r12). Each reverse rate comes from its UNGATED forward rate: a steric
+    # block stops a head arriving, not one leaving, so a weak head on a closed
+    # unit detaches at the ordinary r10 and a strong head reverses at the
+    # ordinary r21.
+    # site_access (thin-thin overlap screening) scales the FORWARD rate only,
+    # for the same reason: a screened site is bound less often rather than
+    # just more slowly.
+    r01_free = xb_rate_01(1.0, r01_coeff, E_weak)
+    r10 = xb_rate_10(r01_free, U_DRX, U_loose)
+    r01 = attach * site_access * r01_free
 
     # 1 Loose <-> 2 Tight_1 : weak-to-strong isomerization (Pi release)
-    r12 = xb_rate_12(r12_coeff, E_diff)
+    r12_free = xb_rate_12(r12_coeff, E_diff)
     r21 = xb_rate_21(r12_coeff, E_diff, U_loose, U_tight_1)
+    r12 = stroke * r12_free
 
     # 2 Tight_1 <-> 3 Tight_2 : the AM.ADP isomerization (strain-dependent).
     # The stroke is split across 1->2 (the larger part) and this step; see
@@ -1141,17 +1064,17 @@ def _build_xb_Q_bins(
     """Evaluate crossbridge rate matrices on a distance grid, and index each head.
 
     The cost-saving step behind thick_transitions. A head's rates depend on three
-    things: its axial distance to its target site (continuous), whether that
-    target's tropomyosin is open (binary), and whether the target lies in the
-    thin-thin double-overlap zone (binary). Rather than build a rate matrix per
-    head, build them on a grid:
+    things: its axial distance to its target site (continuous), the position of
+    its target unit (blocked / closed / open, see xb_gate_position), and
+    whether the target lies in the thin-thin double-overlap zone (binary).
+    Rather than build a rate matrix per head, build them on a grid:
 
-        n_xb_bins axial positions x 3 blocks
+        n_xb_bins axial positions x 5 blocks
 
-    laid out as closed (permissiveness 0), open, and open-but-screened. A
-    closed site binds at no rate, screened or not, so the fourth combination
-    needs no block of its own. Each head is then assigned the index of the
-    cell it falls in, and gathers from there.
+    laid out as blocked, closed, closed-screened, open, open-screened. A
+    blocked site binds at no rate, screened or not, so it needs one block.
+    Each head is then assigned the index of the cell it falls in, and gathers
+    from there.
 
     THE HIDING LINE. Every thin filament has the same length, so when the
     half-sarcomere is shorter than the thin filament, the thin filaments pass
@@ -1172,12 +1095,12 @@ def _build_xb_Q_bins(
 
     THE xb_valid GATE. Heads with no real geometric partner carry a placeholder
     target index, so the tropomyosin state they read is meaningless. They are
-    forced to permissiveness 0, which routes them into the block where the
-    attachment rate r01 is exactly zero at every bin position. This is a hard
-    gate, not a distance penalty: such a head can never bind, at any strain.
+    forced to blocked, the block where the attachment rate r01 is exactly zero
+    at every bin position. This is a hard gate, not a distance penalty: such a
+    head can never bind, at any strain.
 
     RETURNING Q RATHER THAN P is deliberate. The gather key depends only on
-    geometry and permissiveness, never on the rate constants, so it is shared
+    geometry and the gate, never on the rate constants, so it is shared
     across every population in a subpopulation run. Keeping the exponential
     separate lets mean-field blending average the GENERATORS before a single
     exponential — the mathematically correct blend — while the explicit modes
@@ -1192,7 +1115,8 @@ def _build_xb_Q_bins(
         lattice_spacing: this step's (pre-solve) lattice spacing, nm
 
     Returns:
-        Q_bins: (3 * n_bins, 6, 6) rate matrices: closed, open, open-screened
+        Q_bins: (5 * n_bins, 6, 6) rate matrices: blocked, closed,
+            closed-screened, open, open-screened
         key: (n_xb_total,) index into Q_bins for each crossbridge
     """
     xb_states = state.thick.xb_states
@@ -1209,34 +1133,16 @@ def _build_xb_Q_bins(
         xb_distances_flat = xb_distances_flat.at[:, 0].set(5.0)
         xb_distances_flat = xb_distances_flat.at[:, 1].set(lattice_spacing)
 
-    # Get permissiveness from nearest binding sites
-    xb_nearest_bs = state.thick.xb_nearest_bs
-    tm_states = state.thin.tm_states
-    n_mono = topology.n_mono
-
-    if xb_nearest_bs is not None:
-        xb_nearest_bs_flat = xb_nearest_bs.reshape(-1)
-        thin_indices = topology.xb_to_thin_id
-        mono_indices = jnp.clip(xb_nearest_bs_flat, 0, n_mono - 1)
-        # The gate is the tropomyosin UNIT that covers the nearest monomer.
-        nearest_tm_states = tm_states[thin_indices,
-                                      topology.mono_tm[thin_indices, mono_indices]]
-        # xb_valid gate: XBs with no real geometric thin-filament partner this
-        # crown (continuous-formula miss) must never see permissiveness>0 —
-        # their nearest_tm_states was read from an arbitrary remapped site
-        # (thin_idx/thin_face forced to (0,0)), not a real target. Forcing
-        # permissiveness to 0 routes them through the ap=0 Q-bin block, where
-        # r01 (the only entry rate into a bound state) is exactly 0 for every
-        # bin position — a hard gate, not a distance-decay approximation.
-        permissiveness = (nearest_tm_states == 3).astype(jnp.float32) * topology.xb_valid.astype(jnp.float32)
-        thin_pos = monomer_axial(state.thin.displacement, topology, z_line)
-        # The hiding line is the TIP of the thin filaments: the farthest any
-        # monomer reaches past the M-line.
-        hiding_line = jnp.maximum(0.0, -jnp.min(thin_pos))
-        screened = thin_pos[thin_indices, mono_indices] < hiding_line
-    else:
-        permissiveness = jnp.ones(n_xb_total) * 0.5
-        screened = jnp.zeros(n_xb_total, dtype=bool)
+    # The gate: position of the unit under the bound (or nearest) monomer.
+    position = xb_gate_position(state, topology)
+    thin_indices = topology.xb_to_thin_id
+    mono_indices = jnp.clip(state.thick.xb_nearest_bs.reshape(-1), 0, topology.n_mono - 1)
+    thin_pos = monomer_axial(state.thin.displacement, topology, z_line)
+    # The hiding line is the TIP of the thin filaments: the farthest any
+    # monomer reaches past the M-line. Screening scales r01 only, so it is read
+    # at the nearest monomer, the one an unbound head would bind.
+    hiding_line = jnp.maximum(0.0, -jnp.min(thin_pos))
+    screened = thin_pos[thin_indices, mono_indices] < hiding_line
 
     ca_conc = 10.0 ** (-pCa)
     n_bins = topology.xb_bin_centers.shape[0]   # static integer known to XLA
@@ -1257,16 +1163,15 @@ def _build_xb_Q_bins(
     ])
     springs_grid = jnp.broadcast_to(spring_vec, (n_bins, 12))  # (n_bins, 12)
 
-    # Q matrices at each bin position: closed, open, open-but-screened
+    # Q matrices at each bin position, one block per (attach, stroke, access):
+    # blocked, closed, closed-screened, open, open-screened.
     ones = jnp.ones(n_bins)
-    Q_ap0 = xb_rate_matrix(dist_grid, d, springs_grid, jnp.zeros(n_bins), ones,
-                           ca_conc, constants.temp_celsius, constants)
-    Q_ap1 = xb_rate_matrix(dist_grid, d, springs_grid, ones, ones,
-                           ca_conc, constants.temp_celsius, constants)
-    Q_scr = xb_rate_matrix(dist_grid, d, springs_grid, ones,
-                           ones * (1.0 - constants.thin_thin_overlap_screening),
-                           ca_conc, constants.temp_celsius, constants)
-    Q_bins = jnp.concatenate([Q_ap0, Q_ap1, Q_scr], axis=0)  # (3*n_bins, 6, 6)
+    scr = 1.0 - constants.thin_thin_overlap_screening
+    Q_bins = jnp.concatenate([
+        xb_rate_matrix(dist_grid, d, springs_grid, a * ones, st * ones, acc * ones,
+                       ca_conc, constants.temp_celsius, constants)
+        for a, st, acc in ((0.0, 0.0, 1.0), (1.0, 0.0, 1.0), (1.0, 0.0, scr),
+                           (1.0, 1.0, 1.0), (1.0, 1.0, scr))], axis=0)  # (5*n_bins, 6, 6)
 
     # Assign each XB to a bin. The edges are uniform (a linspace), so the bin is
     # arithmetic, not a binary search: ~30x cheaper on GPU at 25,600 heads.
@@ -1275,9 +1180,9 @@ def _build_xb_Q_bins(
     bin_idx = jnp.floor((x_axial - edges[0]) * (n_bins / (edges[-1] - edges[0]))).astype(jnp.int32)
     bin_idx = jnp.clip(bin_idx, 0, n_bins - 1)
 
-    ap    = permissiveness.astype(jnp.int32)                       # 0 or 1
-    block = ap * (1 + screened.astype(jnp.int32))                  # 0, 1 or 2
-    key   = block * n_bins + bin_idx                               # in [0, 3*n_bins)
+    block = jnp.where(position == 0, 0,
+                      2 * position - 1 + screened.astype(jnp.int32))  # 0..4
+    key   = block * n_bins + bin_idx                               # in [0, 5*n_bins)
 
     return Q_bins, key
 
@@ -1317,7 +1222,7 @@ def _xb_Q_resolved(
             is the mathematically correct blend. For mode=='explicit', extra is
             a (n_xb_total,) INT label array and the populations stay stacked so
             each head can select its own afterwards. The gather key is shared
-            across populations (it depends on geometry/permissiveness, not
+            across populations (it depends on geometry and the gate, not
             rates).
 
     Returns:
@@ -1328,7 +1233,7 @@ def _xb_Q_resolved(
     mode, constants_k, extra = _populations(xb_subpop, constants)
     built = [_build_xb_Q_bins(state, ck, topology, pCa, z_line, lattice_spacing)
              for ck in constants_k]
-    key = built[0][1]  # shared across populations (geometry/permissiveness only)
+    key = built[0][1]  # shared across populations (geometry and gate only)
 
     if mode == 'mean_field':
         return _blend(extra, [b[0] for b in built]), key, None
@@ -1501,10 +1406,9 @@ def xb_rest_states(state: 'State',
     """Draw every head from the stationary distribution of its own rate matrix
     at rest: pCa 9, tropomyosin blocked.
 
-    run() starts from relaxed muscle. On a freshly realised state every
-    tropomyosin unit is 0, so every head gathers from the ap=0 block of the
-    same binned generator the scan uses, where attachment (r01) is exactly 0 and
-    r43 is structurally 0. The detached states {0 DRX, 4 Free_2, 5 SRX} are then
+    run() starts from relaxed muscle. Every head gathers from the BLOCKED block
+    of the same binned generator the scan uses (rest is evaluated with every
+    unit blocked), where attachment (r01) is exactly 0 and r43 is structurally 0. The detached states {0 DRX, 4 Free_2, 5 SRX} are then
     a closed class and the bound states get no inflow, so the resting occupancy
     is pi Q_c = 0, sum(pi) = 1 on that 3x3 block, and exactly 0 bound. Solving
     the block rather than the full 6x6 matters: at strained bins Tight_1's exit
@@ -1541,6 +1445,48 @@ def xb_rest_states(state: 'State',
         xb_states=drawn.astype(jnp.int8).reshape(xb_states.shape)))
 
 
+def tm_rest_states(state: 'State',
+                   constants: 'DynamicParams',
+                   topology: 'SarcTopology',
+                   rng_key: jax.random.PRNGKey,
+                   tm_subpop=None) -> 'State':
+    """Draw every tropomyosin unit from the stationary distribution of its own
+    uncoupled generator at rest: pCa 9, J = 0, no heads.
+
+    The six-state unit is not all-blocked at rest: the Ca-free equilibria put a
+    measurable share closed and open (cardiac more than skeletal). Drawing that
+    share directly removes a settling transient for the units themselves; the
+    chain coupling and the heads then settle in the scan. Call AFTER
+    xb_rest_states, which is evaluated on all-blocked units. A unit in a
+    subpopulation draws from its own population's generator.
+
+    Args:
+        state: State with heads at rest and no head bound
+        constants: DynamicParams
+        topology: SarcTopology
+        rng_key: key for this draw
+        tm_subpop: see thin_transitions
+
+    Returns:
+        state with thin.tm_states drawn from rest
+    """
+    mode, constants_k, extra = _populations(tm_subpop, constants)
+    # n_lock = 0: one block; slot 0, where the field is exp(0) at J = 0 for
+    # every slot anyway.
+    Q_k = [_compute_unique_tm_Q_matrices(10.0 ** (-REST_PCA), ck.copy(tm_J=0.0), 0)[0]
+           for ck in constants_k]
+    Q = _blend(extra, Q_k)[None] if mode == 'mean_field' else jnp.stack(Q_k)  # (K, 6, 6)
+    A = jnp.swapaxes(Q, -1, -2).at[..., -1, :].set(1.0)
+    b = jnp.zeros(Q.shape[:-1]).at[..., -1].set(1.0)
+    pi = jnp.linalg.solve(A, b[..., None])[..., 0]                       # (K, 6)
+    n = topology.n_thin * topology.n_tm
+    pi_unit = pi[jnp.zeros(n, jnp.int32) if mode == 'mean_field' else extra]
+    u = jax.random.uniform(rng_key, shape=(n,))
+    drawn = jnp.argmax(u[:, None] < jnp.cumsum(pi_unit, axis=1), axis=1)
+    return state._replace(thin=state.thin._replace(
+        tm_states=drawn.astype(jnp.int8).reshape(topology.n_thin, topology.n_tm)))
+
+
 def thick_transitions(state: 'State',
                      bins: XBBins,
                      topology: 'SarcTopology',
@@ -1561,8 +1507,8 @@ def thick_transitions(state: 'State',
     works and what it costs in accuracy. The bins are built by `kinetics_step`
     and passed in, because the metrics path reads the same ones.
 
-    Heads flagged invalid by topology.xb_valid are held at permissiveness 0
-    throughout, so they can never enter a bound state and never claim a site.
+    Heads flagged invalid by topology.xb_valid read a blocked gate throughout,
+    so they can never enter a bound state and never claim a site.
 
     Args:
         state: Current State
@@ -1592,27 +1538,15 @@ def thick_transitions(state: 'State',
     # Get probability vectors — index directly into P_all using current state
     prob_vectors = jax.vmap(lambda P, s: P[s])(P_all, current_states)  # (n_xb_total, 6)
 
-    # Get permissiveness and binding info (needed for binding logic below)
+    # Binding info (needed for binding logic below). A binding head is unbound,
+    # so its gate is the unit under its nearest monomer; weak attachment needs
+    # that unit closed or open. Invalid heads read blocked (xb_gate_position).
     xb_nearest_bs = state.thick.xb_nearest_bs
-    tm_states = state.thin.tm_states
     n_thin, n_mono = topology.n_thin, topology.n_mono
-
-    if xb_nearest_bs is not None:
-        xb_nearest_bs_flat = xb_nearest_bs.reshape(-1)
-        thin_indices = topology.xb_to_thin_id
-        mono_indices = jnp.clip(xb_nearest_bs_flat, 0, n_mono - 1)
-        # The gate is the tropomyosin UNIT that covers the nearest monomer.
-        nearest_tm_states = tm_states[thin_indices,
-                                      topology.mono_tm[thin_indices, mono_indices]]
-        # xb_valid gate (see matching comment in _build_xb_Q_bins): geometrically
-        # invalid XBs must never be treated as permissive, or they could bind at
-        # an arbitrary remapped site below.
-        permissiveness = (nearest_tm_states == 3).astype(jnp.float32) * topology.xb_valid.astype(jnp.float32)
-    else:
-        permissiveness = jnp.ones(n_xb_total) * 0.5
-        xb_nearest_bs_flat = jnp.full(n_xb_total, -1)
-        thin_indices = topology.xb_to_thin_id
-        mono_indices = jnp.zeros(n_xb_total, dtype=jnp.int32)
+    xb_nearest_bs_flat = xb_nearest_bs.reshape(-1)
+    thin_indices = topology.xb_to_thin_id
+    mono_indices = jnp.clip(xb_nearest_bs_flat, 0, n_mono - 1)
+    attach = xb_gate_position(state, topology) >= 1
 
     # Sample new states
     if random_values is None:
@@ -1641,93 +1575,89 @@ def thick_transitions(state: 'State',
     xb_bound_to_flat = state.thick.xb_bound_to.reshape(-1)
     thin_bound_to_flat = state.thin.bound_to.reshape(-1)
 
-    if xb_nearest_bs is not None:
-        # ====================================================================
-        # THE TWO BINDING RECORDS MUST AGREE, AND SCATTERS ARE WHERE THEY STOP
-        # ====================================================================
-        # An attachment is recorded twice — `xb_bound_to[h]` names the site,
-        # `thin.bound_to[t, i]` names the head — and nothing reconciles them
-        # afterwards. Both writes below therefore have to be collision-free by
-        # construction, because `.at[].set()` with duplicate indices picks a
-        # winner nondeterministically.
-        # thin.bound_to is per CANDIDATE; every nearest site is a candidate.
-        n_cand = topology.n_cand
-        n_cand_total = n_thin * n_cand
-        xb_indices_arr = jnp.arange(n_xb_total)
-        site_flat = thin_indices * n_cand + topology.mono_cand[thin_indices, mono_indices]
+    # ====================================================================
+    # THE TWO BINDING RECORDS MUST AGREE, AND SCATTERS ARE WHERE THEY STOP
+    # ====================================================================
+    # An attachment is recorded twice — `xb_bound_to[h]` names the site,
+    # `thin.bound_to[t, i]` names the head — and nothing reconciles them
+    # afterwards. Both writes below therefore have to be collision-free by
+    # construction, because `.at[].set()` with duplicate indices picks a
+    # winner nondeterministically.
+    # thin.bound_to is per CANDIDATE; every nearest site is a candidate.
+    n_cand = topology.n_cand
+    n_cand_total = n_thin * n_cand
+    xb_indices_arr = jnp.arange(n_xb_total)
+    site_flat = thin_indices * n_cand + topology.mono_cand[thin_indices, mono_indices]
 
-        nearest_site_occupied = thin_bound_to_flat[site_flat] >= 0
-        can_bind = is_binding & (permissiveness > 0.5) & (~nearest_site_occupied)
+    nearest_site_occupied = thin_bound_to_flat[site_flat] >= 0
+    can_bind = is_binding & attach & (~nearest_site_occupied)
 
-        # ARBITRATION. `can_bind` is read against the occupancy at the START of
-        # the step, so two heads whose nearest site is the same free site BOTH
-        # pass it — and exactly one of them may have it. Scatter-MIN over head
-        # index picks the lowest, deterministically; the loser reverts below, so
-        # two heads can never share a site. Non-binders are sent past the end and dropped, so they can never win
-        # and never touch the array. Dropping rather than writing a sentinel
-        # also keeps them off the few sites they would otherwise pile onto
-        # (invalid heads all name thin 0), which is the slow path for a GPU scatter.
-        winner = jnp.full(n_cand_total, n_xb_total, jnp.int32).at[
-            jnp.where(can_bind, site_flat, n_cand_total)].min(xb_indices_arr)
-        won = can_bind & (winner[site_flat] == xb_indices_arr)
+    # ARBITRATION. `can_bind` is read against the occupancy at the START of
+    # the step, so two heads whose nearest site is the same free site BOTH
+    # pass it — and exactly one of them may have it. Scatter-MIN over head
+    # index picks the lowest, deterministically; the loser reverts below, so
+    # two heads can never share a site. Non-binders are sent past the end and dropped, so they can never win
+    # and never touch the array. Dropping rather than writing a sentinel
+    # also keeps them off the few sites they would otherwise pile onto
+    # (invalid heads all name thin 0), which is the slow path for a GPU scatter.
+    winner = jnp.full(n_cand_total, n_xb_total, jnp.int32).at[
+        jnp.where(can_bind, site_flat, n_cand_total)].min(xb_indices_arr)
+    won = can_bind & (winner[site_flat] == xb_indices_arr)
 
-        new_xb_bound_to_flat = jnp.where(
-            won,
-            xb_nearest_bs_flat,
-            jnp.where(
-                is_unbinding,
-                -1,
-                xb_bound_to_flat
-            )
+    new_xb_bound_to_flat = jnp.where(
+        won,
+        xb_nearest_bs_flat,
+        jnp.where(
+            is_unbinding,
+            -1,
+            xb_bound_to_flat
         )
+    )
 
-        # STEP 1: clear the sites of heads that unbound.
-        # Scatter-MAX of a FLAG, not gather-modify-scatter. Every UNBOUND head
-        # clips to site 0 of its thin filament, so under the old
-        # `.at[].set()` all of them wrote the stale value back at that one
-        # index and could clobber the -1 written by a head genuinely unbinding
-        # from site 0 — leaving the site naming a head whose own record was
-        # already cleared. A flag cannot be clobbered that way: a head
-        # contributing 0 cannot lower a raised flag. Same idiom as the closure
-        # tear in thin_transitions, and one scatter rather than a gather and a
-        # scatter.
-        really_unbinding = is_unbinding & (xb_bound_to_flat >= 0)
-        old_thin_indices = topology.xb_to_thin_id
-        # Only heads really unbinding scatter; the rest are sent past the end and
-        # dropped (left in place, every unbound head lands on monomer 0 of its thin).
-        old_site_flat = (old_thin_indices * n_cand + jnp.maximum(
-            topology.mono_cand[old_thin_indices, jnp.clip(xb_bound_to_flat, 0, n_mono - 1)], 0))
-        clear_site = jnp.zeros(n_cand_total, jnp.int32).at[
-            jnp.where(really_unbinding, old_site_flat, n_cand_total)].max(1) == 1
-        new_thin_bound_to_flat = jnp.where(clear_site, -1, thin_bound_to_flat)
+    # STEP 1: clear the sites of heads that unbound.
+    # Scatter-MAX of a FLAG, not gather-modify-scatter. Every UNBOUND head
+    # clips to site 0 of its thin filament, so under the old
+    # `.at[].set()` all of them wrote the stale value back at that one
+    # index and could clobber the -1 written by a head genuinely unbinding
+    # from site 0 — leaving the site naming a head whose own record was
+    # already cleared. A flag cannot be clobbered that way: a head
+    # contributing 0 cannot lower a raised flag. Same idiom as the closure
+    # tear in thin_transitions, and one scatter rather than a gather and a
+    # scatter.
+    really_unbinding = is_unbinding & (xb_bound_to_flat >= 0)
+    old_thin_indices = topology.xb_to_thin_id
+    # Only heads really unbinding scatter; the rest are sent past the end and
+    # dropped (left in place, every unbound head lands on monomer 0 of its thin).
+    old_site_flat = (old_thin_indices * n_cand + jnp.maximum(
+        topology.mono_cand[old_thin_indices, jnp.clip(xb_bound_to_flat, 0, n_mono - 1)], 0))
+    clear_site = jnp.zeros(n_cand_total, jnp.int32).at[
+        jnp.where(really_unbinding, old_site_flat, n_cand_total)].max(1) == 1
+    new_thin_bound_to_flat = jnp.where(clear_site, -1, thin_bound_to_flat)
 
-        # STEP 2: record the winners. `winner` is already a per-SITE array, so
-        # this is an elementwise select rather than a second scatter, and the
-        # two writes cannot conflict: a site occupied at the start of the step
-        # fails `can_bind` for every head, so no site is both cleared and won.
-        new_thin_bound_to_flat = jnp.where(winner < n_xb_total, winner,
-                                           new_thin_bound_to_flat)
+    # STEP 2: record the winners. `winner` is already a per-SITE array, so
+    # this is an elementwise select rather than a second scatter, and the
+    # two writes cannot conflict: a site occupied at the start of the step
+    # fails `can_bind` for every head, so no site is both cleared and won.
+    new_thin_bound_to_flat = jnp.where(winner < n_xb_total, winner,
+                                       new_thin_bound_to_flat)
 
-        new_xb_bound_to = new_xb_bound_to_flat.reshape(n_thick, n_crowns, n_xb_per_crown)
-        new_thin_bound_to = new_thin_bound_to_flat.reshape(n_thin, n_cand)
+    new_xb_bound_to = new_xb_bound_to_flat.reshape(n_thick, n_crowns, n_xb_per_crown)
+    new_thin_bound_to = new_thin_bound_to_flat.reshape(n_thin, n_cand)
 
-        # Binding failed — the site was taken before the step, or another head
-        # won it during the step.
-        #
-        # >>> THIS IS A FLUX THAT IS NOT IN Q, AND IT IS NOT SMALL. A head sent
-        #     back here did not follow its own generator: it is placed in DRX
-        #     regardless of which bound state it sampled (8x8, dt = 1 ms: 1-5% of
-        #     heads that sampled a bound state from 0/4/5 cardiac, 5-7%
-        #     skeletal). ANY METRIC THAT READS P OR Q AS THE TRUTH ABOUT THE STEP
-        #     must say why that gap does not reach it. For atp_expected the
-        #     exposure is bounded: heads in mid states 0/4/5 contribute < 0.6% of
-        #     the 3 -> 4 count, and only the reverted subset of those is
-        #     misattributed (~0.002% cardiac, ~0.04% skeletal).
-        new_states_flat = jnp.where(is_binding & (~won), 0, new_states_flat)
-        new_xb_states = new_states_flat.reshape(n_thick, n_crowns, n_xb_per_crown).astype(jnp.int8)
-    else:
-        new_xb_bound_to = state.thick.xb_bound_to
-        new_thin_bound_to = state.thin.bound_to
+    # Binding failed — the site was taken before the step, or another head
+    # won it during the step.
+    #
+    # >>> THIS IS A FLUX THAT IS NOT IN Q, AND IT IS NOT SMALL. A head sent
+    #     back here did not follow its own generator: it is placed in DRX
+    #     regardless of which bound state it sampled (8x8, dt = 1 ms: 1-5% of
+    #     heads that sampled a bound state from 0/4/5 cardiac, 5-7%
+    #     skeletal). ANY METRIC THAT READS P OR Q AS THE TRUTH ABOUT THE STEP
+    #     must say why that gap does not reach it. For atp_expected the
+    #     exposure is bounded: heads in mid states 0/4/5 contribute < 0.6% of
+    #     the 3 -> 4 count, and only the reverted subset of those is
+    #     misattributed (~0.002% cardiac, ~0.04% skeletal).
+    new_states_flat = jnp.where(is_binding & (~won), 0, new_states_flat)
+    new_xb_states = new_states_flat.reshape(n_thick, n_crowns, n_xb_per_crown).astype(jnp.int8)
 
     # Update state
     new_thick = state.thick._replace(

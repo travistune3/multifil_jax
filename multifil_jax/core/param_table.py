@@ -169,7 +169,7 @@ row('thin_node_spacing', 'static', 'nm',
     skeletal=P(12.0, 'G', 'thin backbone node grid (resolution)'),
     cardiac_beta=inh('skeletal'), cardiac_alpha=inh('cardiac_beta'), insect=inh('skeletal'))
 row('tm_monomers_per_unit', 'static', '-',
-    skeletal=P(None, 'G', 'None = one Tm unit per binding candidate'),
+    skeletal=P(7, 'M', 'one tropomyosin spans 7 actins (McKillop & Geeves 1993; SG2003 38 nm)'),
     cardiac_beta=inh('skeletal'), cardiac_alpha=inh('cardiac_beta'), insect=inh('skeletal'))
 row('n_xb_bins', 'static', '-',
     skeletal=P(200, 'G', 'axial-distance bins for the rate matrices'),
@@ -278,43 +278,66 @@ row('xb_g_k_tight_1', 'dynamic', 'pN/nm',
 # =============================================================================
 # THIN FILAMENT REGULATION (dynamic)
 # =============================================================================
-row('tm_k_01', 'dynamic', '1/(M ms)',
-    skeletal=P(100000.0, 'G', 'Ca on-rate to the regulatory site, 1e8 /M/s',
-               lo=10000.0, hi=1000000.0, source=BG),
-    cardiac_beta=P(80000.0, 'M', 'cardiac Ca on-rate, 8e7 /M/s', lo=50000.0, hi=600000.0,
-                   source=BC),
+# Six-state unit: (blocked, closed, open) x (Ca-free, Ca-bound). Position equilibria are
+# Ca-conditional (McKillop & Geeves 1993; Maytum et al. 2003); the Ca affinity at closed and
+# open is FORCED by the two cycle constraints (transitions.tm_ca_affinity_ratios).
+row('tm_Keq_unblock_noca', 'dynamic', '-',
+    skeletal=P(0.3, 'M', 'K_B -Ca, closed/blocked: McKillop & Geeves 1993 p.693 (Maytum 2003: 0.5)',
+               lo=0.1, hi=0.5),
+    cardiac_beta=P(0.7, 'M', 'K_B -Ca, cardiac Tn hybrid filament: Maytum 2003', lo=0.5, hi=0.7),
     cardiac_alpha=inh('cardiac_beta'), insect=inh('skeletal'))
-row('tm_k_12', 'dynamic', '1/ms',
-    skeletal=P(1.0, 'G', 'blocked -> closed; no source'),
-    cardiac_beta=P(0.5, 'G', 'half the (unsourced) skeletal value'),
+row('tm_Keq_unblock_ca', 'dynamic', '-',
+    skeletal=P(16.0, 'M', 'K_B +Ca: a LOWER BOUND (">= 16", McKillop & Geeves 1993 p.693)',
+               lo=10.0, hi=100.0),
+    cardiac_beta=P(16.0, 'M', 'K_B +Ca: Maytum 2003 "> 10" (bound); 16 as skeletal', lo=10.0,
+                   hi=100.0),
     cardiac_alpha=inh('cardiac_beta'), insect=inh('skeletal'))
-row('tm_k_23', 'dynamic', '1/ms',
-    skeletal=P(0.1, 'G', 'closed -> open', lo=0.01, hi=1.0, source=BG),
-    cardiac_beta=inh('skeletal'), cardiac_alpha=inh('cardiac_beta'), insect=inh('skeletal'))
-row('tm_k_30', 'dynamic', '1/ms',
-    skeletal=P(0.2, 'G', 'cycle close (Ca off)'),
-    cardiac_beta=P(0.04, 'M', 'cardiac Ca off-rate, 40 /s', lo=0.02, hi=0.3, source=BC),
+row('tm_Keq_swing_noca', 'dynamic', '-',
+    skeletal=P(0.09, 'M', 'K_T -Ca, open/closed: McKillop & Geeves 1993 p.693 (Maytum: 0.02)',
+               lo=0.01, hi=0.2),
+    cardiac_beta=P(0.12, 'M', 'K_T -Ca, cardiac Tn hybrid filament: Maytum 2003'),
     cardiac_alpha=inh('cardiac_beta'), insect=inh('skeletal'))
-row('tm_Keq_01', 'dynamic', '1/M',
-    skeletal=P(500000.0, 'G', 'Kd 2 uM regulatory site'),
-    cardiac_beta=P(750000.0, 'G', 'Kd 1.33 uM', lo=200000.0, hi=1.2e6, source=BC),
+row('tm_Keq_swing_ca', 'dynamic', '-',
+    skeletal=P(0.25, 'M', 'K_T +Ca: McKillop & Geeves 1993 p.693 (Maytum: 0.12)', lo=0.1, hi=0.6),
+    cardiac_beta=P(0.13, 'M', 'K_T +Ca, cardiac Tn hybrid filament: Maytum 2003 (Ca-insensitive)'),
     cardiac_alpha=inh('cardiac_beta'), insect=inh('skeletal'))
-row('tm_Keq_12', 'dynamic', '-',
-    skeletal=P(130.0, 'G', 'blocked -> closed equilibrium', lo=13.0, hi=1300.0, source=BG),
+row('tm_k_unblock', 'dynamic', '1/ms',
+    skeletal=P(0.5, 'M', 'blocked -> closed ~500 /s: Shitaka 2004 (skeletal Tn, 20 C, low salt)'),
+    cardiac_beta=P(0.5, 'G', 'borrowed from skeletal Tn (Shitaka 2004); no cardiac rate on disk'),
+    cardiac_alpha=inh('cardiac_beta'), insect=inh('skeletal'))
+row('tm_k_swing', 'dynamic', '1/ms',
+    skeletal=P(0.1, 'G', 'closed -> open; no measured rate, Geeves & Lehrer 1994 bound only '
+               'the sum k+T + k-T', lo=0.01, hi=1.0,
+               source=BG),
     cardiac_beta=inh('skeletal'), cardiac_alpha=inh('cardiac_beta'), insect=inh('skeletal'))
-row('tm_Keq_23', 'dynamic', '-',
-    skeletal=P(0.1, 'M', 'closed -> open equilibrium (-Ca)', lo=0.01, hi=1.0, source=BG),
+row('tm_Keq_ca', 'dynamic', '1/M',
+    skeletal=P(500000.0, 'G', 'Ca affinity of a BLOCKED unit; carried (Kd 2 uM). One Ca bit '
+               'lumps the two skeletal regulatory sites'),
+    cardiac_beta=P(750000.0, 'M', 'in-filament, no myosin: 2.1e5 (Davis 2007, 15 C) to 1.35e6 '
+                   '(Pinto 2011, 21 C)', lo=200000.0, hi=1.4e6),
+    cardiac_alpha=inh('cardiac_beta'), insect=inh('skeletal'))
+row('tm_k_ca_on', 'dynamic', '1/(M ms)',
+    skeletal=P(100000.0, 'M', 'Ca on-rate ~1e8 /M/s (Robertson 1981, derived)'),
+    cardiac_beta=P(80000.0, 'I', '8e7 /M/s: koff at blocked 107 /s, in-filament 96-139 /s '
+                   '(Davis 2007, Pinto 2011)'),
+    cardiac_alpha=inh('cardiac_beta'), insect=inh('skeletal'))
+row('tm_alpha_ca', 'dynamic', '-',
+    skeletal=P(0.0, 'G', 'share of the position-Ca linkage on the on-rate; 0 = all on the '
+               'off-rate, as the off-rate slowing in rigor (Davis 2007, Pinto 2011)',
+               lo=0.0, hi=1.0, scale='linear'),
     cardiac_beta=inh('skeletal'), cardiac_alpha=inh('cardiac_beta'), insect=inh('skeletal'))
-row('tm_J_C', 'dynamic', 'kT',
-    skeletal=P(0.0, 'I', 'Ising coupling to closed neighbours; inert'),
-    cardiac_beta=inh('skeletal'), cardiac_alpha=inh('cardiac_beta'), insect=inh('skeletal'))
-row('tm_J_M', 'dynamic', 'kT',
-    skeletal=P(2.70, 'F', 'Ising coupling to open neighbours'),
-    cardiac_beta=inh('skeletal'),
-    cardiac_alpha=inh('cardiac_beta', lo=0.0, hi=5.0, scale='linear'),
-    insect=inh('skeletal'))
+row('tm_J', 'dynamic', 'kT',
+    skeletal=P(0.874, 'I', 'PROXY: bare-chain correlation sum x 7 = 11 actins at pCa 4.5, '
+               'Geeves & Lehrer 1994 apparent unit 10-12 (range = 10 and 12)',
+               lo=0.716, hi=1.009, scale='linear'),
+    cardiac_beta=P(1.116, 'I', 'PROXY as skeletal, on the cardiac rows (range = 10 and 12 actins)',
+                   lo=0.937, hi=1.260, scale='linear'),
+    cardiac_alpha=inh('cardiac_beta'), insect=inh('skeletal'))
 row('xb_tm_K2', 'dynamic', '-',
-    skeletal=P(79.0, 'M', 'finite crossbridge lock, per head (1+K2)^n'),
+    skeletal=P(79.0, 'M', 'per STRONG head (1+K2)^n; McKillop & Geeves 1993 Pi-anion row '
+               '(ADP 18, rigor ~200). Lower K2 makes isometric tension cost '
+               'Ca-dependent; measured Ca-independent (de Tombe & Stienen 2007)',
+               lo=18.0, hi=241.0),
     cardiac_beta=inh('skeletal'), cardiac_alpha=inh('cardiac_beta'), insect=inh('skeletal'))
 row('thin_thin_overlap_screening', 'dynamic', '-',
     skeletal=P(1.0, 'G', 'double-overlap blocking of attachment, 0-1'),

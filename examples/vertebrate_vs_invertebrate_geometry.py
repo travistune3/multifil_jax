@@ -209,7 +209,7 @@ for name, res in results.items():
     # n_bound is not a metric: bound heads are Loose + Tight_1 + Tight_2.
     bound = steady(act.metrics['n_xb_loose'] + act.metrics['n_xb_tight_1']
                    + act.metrics['n_xb_tight_2'])
-    tm_open = steady(act.metrics['frac_tm_state_3_overlap'])
+    tm_open = steady(act.metrics['frac_tm_open_overlap'])
     max_resid = float(np.asarray(res.metrics['solver_residual']).max())
 
     active = force_total - force_passive

@@ -7,28 +7,28 @@ of "how fast does this step happen, and what does it depend on" lives.
 
 Rates are in ms^-1 (a value of 0.6 means 600 s^-1). Energies are in kT.
 
-THE TROPOMYOSIN CYCLE (4 states)
---------------------------------
-Tropomyosin is a coiled-coil that lies in the groove of the actin helix,
-physically covering the sites myosin needs to bind. Calcium binding to troponin
-lets it move aside. The model resolves that into four states:
+THE TROPOMYOSIN UNIT (6 states: position x calcium)
+---------------------------------------------------
+Tropomyosin lies in the groove of the actin helix, covering the sites myosin
+needs. A unit is in one of three POSITIONS (McKillop & Geeves 1993), and its
+troponin either has calcium bound or not:
 
-    0  Ca-free, blocking      no calcium on troponin, sites covered
-    1  Ca-bound, blocking     calcium bound, tropomyosin has not yet moved
-    2  closed                 tropomyosin shifted, sites still not accessible
-    3  open (permissive)      sites exposed; myosin may bind here
+    state = 2*position + has_calcium      position = state >> 1
+    0 blocked        1 blocked + Ca       nothing binds
+    2 closed         3 closed + Ca        weak attachment only
+    4 open           5 open + Ca          the weak -> strong step too
 
-States 1-2-3 are the classical blocked/closed/open picture (McKillop & Geeves
-1993); state 0 splits out the calcium-binding step so calcium concentration
-enters as a genuine rate rather than a switch. Only state 3 permits binding.
-
-The cycle closes 3 -> 0 rather than running backwards through 1: calcium
-dissociates from the open state directly. A unit with crossbridges attached is
-biased towards state 3 — the bound heads hold tropomyosin out of the way, which
-is why crossbridge binding is self-reinforcing. That lock is a RATE: the
-generator builder divides k_30 and k_32 by (1 + xb_tm_K2)^n for n bound heads
-(see transitions._compute_unique_tm_Q_matrices); the functions below return the
-unlocked rates.
+Two kinds of edge, never mixed. POSITION edges (blocked <-> closed <-> open,
+no blocked <-> open) at each calcium level, with that level's equilibrium; the
+Ising field and the crossbridge lock act here only. CALCIUM edges, one per
+position. Calcium does not drive the switch, it biases it: every position
+equilibrium is Ca-conditional, so detailed balance FORCES the calcium affinity
+at closed and open (tm_ca_affinity_ratios) — calcium binds more tightly the
+further the unit is open, which is the measured linkage (strong heads slow Ca
+release). A unit with strong heads is biased towards open by (1 + xb_tm_K2)^n
+on its exits from open, and a unit holding any head cannot enter blocked (see
+transitions._compute_unique_tm_Q_matrices); the functions below return the
+unmodified rates.
 
 THE CROSSBRIDGE CYCLE (6 states)
 --------------------------------
@@ -229,171 +229,58 @@ import jax.numpy as jnp
 # TROPOMYOSIN RATE FUNCTIONS
 # =============================================================================
 
-def tm_rate_01(ca_conc, k_01_base, mod):
-    """Rate 0->1: calcium binds troponin C.
+def tm_ca_affinity_ratios(Keq_unblock_noca, Keq_unblock_ca, Keq_swing_noca, Keq_swing_ca):
+    """Calcium affinity at (blocked, closed, open), relative to blocked: (3,).
 
-    The only step in the whole model that reads calcium concentration directly.
-    Because it is second-order (rate proportional to [Ca2+]), the rate constant
-    carries units of M^-1 ms^-1 while the rate itself comes out in ms^-1.
+    NOT free parameters. Six states and seven edges leave two cycles
+    (blocked-closed and closed-open, each with and without Ca), and detailed
+    balance around each fixes one ratio:
 
-    Everything downstream of this — how steeply force rises with calcium, how
-    fast a twitch relaxes — is emergent from this step plus cooperativity plus
-    the SRX gate. There is no direct pCa-to-force mapping anywhere.
+        K_ca(closed) / K_ca(blocked) = K_B(+Ca) / K_B(-Ca)
+        K_ca(open)   / K_ca(closed)  = K_T(+Ca) / K_T(-Ca)
 
-    Args:
-        ca_conc: Calcium concentration (M), i.e. 10**(-pCa)
-        k_01_base: Second-order rate constant (M^-1 ms^-1) - params.tm_k_01
-        mod: Cooperativity multiplier, exp(+h/2) on the Ising path (1.0 = none)
-
-    Returns:
-        Rate k_01 (ms^-1)
+    So calcium enters the unit only as tm_Keq_ca * [Ca]: scaling the blocked
+    affinity is indistinguishable from scaling [Ca].
     """
-    return k_01_base * ca_conc * mod
+    r_closed = Keq_unblock_ca / Keq_unblock_noca
+    return jnp.stack([jnp.ones_like(r_closed), r_closed,
+                      r_closed * Keq_swing_ca / Keq_swing_noca])
 
 
-def tm_rate_10(k_01_base, Keq_01, mod):
-    """Rate 1->0: calcium dissociates from troponin C.
+def tm_rate_ca_on(ca_conc, k_on, ratio, alpha):
+    """Calcium binds troponin at a position: k_on * ratio^alpha * [Ca] (ms^-1).
 
-    Fixed by detailed balance rather than being an independent parameter:
-    k_10 = k_01_base / Keq_01. Note that k_01_base is used here WITHOUT the
-    calcium concentration, so Keq_01 has units of M^-1 and the ratio comes out
-    as a first-order rate — this is the standard association/dissociation pair,
-    not an approximation.
-
-    Args:
-        k_01_base: Second-order forward rate constant (M^-1 ms^-1)
-        Keq_01: Association equilibrium constant (M^-1)
-        mod: Cooperativity multiplier, exp(-h/2) on the Ising path (1.0 = none).
-            The reverse of what tm_rate_01 receives, so the pair shifts Keq_01
-            by exactly exp(h) and detailed balance survives.
-
-    Returns:
-        Rate k_10 (ms^-1)
+    The only step that reads calcium. alpha in [0, 1] splits the position
+    linkage (ratio, from tm_ca_affinity_ratios) between on- and off-rate;
+    detailed balance fixes only their quotient. alpha = 0 puts all of it on
+    the off-rate, the measured form: strong heads slow calcium release.
     """
-    return (k_01_base / Keq_01) * mod
+    return k_on * ratio ** alpha * ca_conc
 
 
-def tm_rate_12(k_12_base, mod):
-    """Rate 1->2: tropomyosin shifts from blocking to closed.
+def tm_rate_ca_off(k_on, ratio, alpha, Keq_ca):
+    """Calcium leaves troponin at a position: k_on * ratio^alpha / (Keq_ca * ratio).
 
-    The mechanical consequence of calcium binding: troponin's grip on
-    tropomyosin loosens and the strand rolls toward the actin groove. Sites are
-    still not open for binding after this step — that is 2->3.
-
-    Args:
-        k_12_base: Rate constant (ms^-1) - params.tm_k_12.
-                   NO MEASURED RATE SOURCE EXISTS for this step. Geeves &
-                   Lehrer 1994's one rate statement (k+T + k-T >> 500 s^-1) is a
-                   ONE-SIDED bound on the closed<->open step, i.e. tm_rate_23,
-                   not this one. The EQUILIBRIUM is constrained --
-                   McKillop & Geeves 1993 K_B = [closed]/[blocked] = 0.3 without
-                   Ca2+ and >=16 with Ca2+ -- see params.tm_Keq_12.
-        mod: Cooperativity multiplier, exp(+h/2) on the Ising path (1.0 = none)
-
-    Returns:
-        Rate k_12 (ms^-1)
+    Detailed balance against tm_rate_ca_on; Keq_ca is the BLOCKED affinity
+    (params.tm_Keq_ca), ratio the position's affinity relative to it.
     """
-    return k_12_base * mod
+    return k_on * ratio ** alpha / (Keq_ca * ratio)
 
 
-def tm_rate_21(k_12_base, Keq_12, mod):
-    """Rate 2->1: tropomyosin rolls back to the blocking position.
+def tm_rate_forward(k):
+    """A forward position step (blocked -> closed, or closed -> open), ms^-1.
 
-    Detailed balance: k_21 = k_12_base / Keq_12.
-
-    Args:
-        k_12_base: Forward rate constant (ms^-1)
-        Keq_12: Equilibrium constant (dimensionless)
-        mod: Cooperativity multiplier, exp(-h/2) on the Ising path (1.0 = none)
-
-    Returns:
-        Rate k_21 (ms^-1)
+    The base rate; the Ising field multiplies it in the generator builder.
+    tm_k_unblock: blocked -> closed ~500 /s on a Ca jump (Shitaka 2004, skeletal
+    Tn). tm_k_swing: closed -> open, no measured rate; Geeves & Lehrer 1994 bound only
+    the sum k+T + k-T, which is fast enough not to limit anything.
     """
-    return (k_12_base / Keq_12) * mod
+    return k
 
 
-def tm_rate_23(k_23_base, mod):
-    """Rate 2->3: tropomyosin opens, exposing the binding site.
-
-    The step that actually gates myosin. Sites in state 3 are the only ones a
-    crossbridge can attach to (see xb_rate_01's permissiveness argument).
-
-    This is the transition Geeves & Lehrer 1994 (Biophys J 67:273 p.277) actually
-    measured. They report only that the switch is in RAPID EQUILIBRIUM:
-    k+T + k-T >> 500 s^-1, a one-sided bound on the SUM of this rate and its
-    reverse. The model's pair (100 + 1000 = 1100 s^-1) satisfies it. Because only
-    the sum and the ratio (tm_Keq_23) are constrained, both rates may be scaled
-    together without contradicting anything measured -- a genuine free direction.
-    Conditions: rabbit skeletal, reconstituted Tm.Tn.actin + S1, pH 7.0, 20 C.
-
-    Args:
-        k_23_base: Rate constant (ms^-1) - params.tm_k_23
-        mod: Cooperativity multiplier, exp(+h/2) on the Ising path (1.0 = none)
-
-    Returns:
-        Rate k_23 (ms^-1)
-    """
-    return k_23_base * mod
-
-
-def tm_rate_32(k_23_base, Keq_23, mod):
-    """Rate 3->2: tropomyosin closes again.
-
-    Detailed balance against tm_rate_23. Note Keq_23 < 1 at rest, so the closed
-    state is favoured in the absence of calcium — the open state is the
-    excursion, not the resting condition.
-
-    There is no crossbridge gate here. A site with a head attached cannot close
-    underneath it, but that lock is applied downstream as a probability-vector
-    override rather than as a factor on this rate; see the module docstring.
-
-    Args:
-        k_23_base: Forward rate constant (ms^-1)
-        Keq_23: Equilibrium constant (dimensionless)
-        mod: Cooperativity multiplier, exp(-h/2) on the Ising path (1.0 = none)
-
-    Returns:
-        Rate k_32 (ms^-1)
-    """
-    return (k_23_base / Keq_23) * mod
-
-
-def tm_rate_30(k_30_base):
-    """Rate 3->0: calcium dissociates directly from the open state.
-
-    This is what closes the tropomyosin cycle. Rather than retracing 3->2->1->0,
-    the model lets an open site drop straight back to Ca-free-and-blocking,
-    which makes the four states a cycle rather than a reversible chain.
-
-    Consequences worth being aware of:
-      - Relaxation kinetics are governed largely by this rate, not by the
-        forward path. For cardiac muscle it is the slowest TM step.
-      - No experiment measures a "3->0" transition; this step is a modelling
-        device collapsing "Ca2+ leaves" and "Tm re-blocks" into one irreversible
-        event. The measurable proxy is the Ca2+ off-rate from an ASSEMBLED thin
-        filament: Davis 2007 gives 105 s^-1 cardiac / 85 s^-1 skeletal in
-        filament (vs 42.5 / 7.8 s^-1 for isolated troponin), Pinto 2011 gives
-        95.8 s^-1 cardiac. Both presets currently sit outside that band -- cardiac
-        low (40 s^-1, the isolated-protein value), skeletal high (200 s^-1,
-        unsourced) -- and in the OPPOSITE isoform order to the measurements.
-      - Because it is one-way, this step is where the TM cycle stops obeying
-        detailed balance. That is deliberate, but it means cooperativity must
-        NOT be applied here: boosting the cycle-closing step along with the
-        forward steps produces runaway anti-cooperative behaviour rather than
-        sharper activation. Hence the missing ``mod`` argument — alone among the
-        TM rates, this one cannot be modulated, which makes the mistake
-        unrepresentable rather than merely warned against.
-      - A bound crossbridge prevents the site from deactivating through this
-        step, but that lock lives in the probability-vector override downstream,
-        not here; see the module docstring.
-
-    Args:
-        k_30_base: Rate constant (ms^-1) - params.tm_k_30
-
-    Returns:
-        Rate k_30 (ms^-1)
-    """
-    return k_30_base
+def tm_rate_reverse(k, Keq):
+    """The reverse position step: k / Keq at this calcium level (detailed balance)."""
+    return k / Keq
 
 
 # =============================================================================
@@ -403,12 +290,13 @@ def tm_rate_30(k_30_base):
 def xb_rate_01(permissiveness, r01_coeff, E_weak):
     """Rate 0->1: DRX head attaches weakly to actin.
 
-    The gateway into the force-producing cycle, and the only crossbridge rate
-    that tropomyosin gates directly. Two factors multiply:
+    The gateway into the force-producing cycle. Tropomyosin gates it, and
+    gates r12 separately (see xb_rate_matrix). Two factors multiply:
 
-      permissiveness  1 if the target site's tropomyosin is open (state 3),
-                      0 otherwise — a hard gate, so a head cannot bind a
-                      covered site at any strain.
+      attach          1 if the target unit is closed or open, 0 if blocked —
+                      a hard gate, so a head cannot bind a blocked site at any
+                      strain. The caller multiplies it in; this function is
+                      also evaluated ungated (1.0) for detailed balance.
       exp(-E_weak)    Boltzmann penalty for the elastic energy the head must
                       store to reach this site in its weak configuration.
                       Heads far from their unstrained geometry bind
@@ -423,7 +311,7 @@ def xb_rate_01(permissiveness, r01_coeff, E_weak):
     their weakly-bound state's free-energy minimum at x = 7.5 nm.
 
     Args:
-        permissiveness: 0 or 1, whether the target site is open (from TM state)
+        permissiveness: 0 or 1, the attach gate (1.0 for the ungated rate)
         r01_coeff: Pre-exponential binding coefficient (ms^-1) - params.xb_r01_coeff.
                    [G] 305.99 is inherited from an earlier parameterization of
                    this model, where it arose as the product of a binding rate
@@ -462,12 +350,10 @@ def xb_rate_10(r01, U_DRX, U_loose):
     strain range and the naive product overflows float32.
 
     The +0.005 floor inside the logarithm keeps the rate finite where r01 is
-    exactly zero, which happens for every head facing a covered site
-    (permissiveness = 0). Without it those heads would produce log(0) = -inf and
-    poison the rate matrix. The floor has no physical effect: tropomyosin
-    closure DETACHES every bound head in the same timestep (kernels/transitions.thin_transitions,
-    which runs before thick_transitions), so no state-1 head is ever at a
-    covered site when this rate is evaluated.
+    exactly zero. The caller passes the UNGATED r01 (a steric block stops a
+    head arriving, not one leaving), so r01 is zero only where exp(-E_weak)
+    underflows, far outside the binding window; the floor keeps log(0) = -inf
+    out of the rate matrix there.
 
     DO NOT "SIMPLIFY" THIS FUNCTION. Because the rate is analytically constant,
     the log-space form, the floor and the 10000 ms^-1 cap all look removable.

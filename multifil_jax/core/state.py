@@ -54,7 +54,7 @@ rest with no load the residual is now exactly zero.
 STATE INDEX CONVENTIONS
 -----------------------
 Crossbridges use 0-5 (0 DRX, 1 Loose, 2 Tight_1, 3 Tight_2, 4 Free_2, 5 SRX)
-and tropomyosin 0-3 (0 Ca-free blocking, 1 Ca-bound blocking, 2 closed, 3 open).
+and tropomyosin 0-5 (2 * position + has_calcium; position 0 blocked, 1 closed, 2 open).
 Both are stored as int8 — with hundreds of thousands of units these arrays are
 large, and 8 bits is ample for six states. Beware that jnp.argmax returns int32,
 so every sampling site must cast back explicitly on assignment or the arrays
@@ -102,11 +102,12 @@ class ThinState(NamedTuple):
 
     All arrays have leading dimension n_thin (number of thin filaments).
     Spring constant in Constants (Tier 2); structure in Topology.
-    permissiveness is derived on-demand: (tm_states == 3).astype(float32)
+    the crossbridge gates are derived on demand from the unit position
+    (kernels.transitions.tm_position)
     """
     displacement: jnp.ndarray    # (n_thin, n_nodes) NODE offset from rest;
                                  # absolute = z_line - topology.node_offsets + this
-    tm_states: jnp.ndarray       # (n_thin, n_tm) tropomyosin UNIT states (0-3), int8
+    tm_states: jnp.ndarray       # (n_thin, n_tm) tropomyosin UNIT states (0-5), int8
     bound_to: jnp.ndarray        # (n_thin, n_cand) XB bound to this CANDIDATE (-1 if unbound)
 
 
@@ -325,8 +326,9 @@ def realize_state(
 
     Returns a State NamedTuple with NO embedded params/geometry/constants.
     These are passed separately to kernels. Every head starts in state 0 and
-    every tropomyosin unit in state 0; run() then draws the heads from their
-    resting distribution (kernels.transitions.xb_rest_states).
+    every tropomyosin unit in state 0; run() then draws the heads and then the
+    units from their resting distributions (kernels.transitions.xb_rest_states,
+    tm_rest_states).
 
     Args:
         topology: SarcTopology (SarcTopology) from SarcTopology.create()

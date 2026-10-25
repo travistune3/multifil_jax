@@ -168,7 +168,7 @@ print(result.summary())
 - `z_line` is the M-line-to-Z-disc distance in nm; `dt` is in ms.
 
 Every simulation **starts relaxed**: each head is drawn from its resting
-distribution at pCa 9, and tropomyosin starts blocked. A run at pCa 4.5 is
+distribution at pCa 9, and so is every Tm unit. A run at pCa 4.5 is
 therefore a step activation from rest, and needs no settling period.
 
 Anything malformed — an unknown keyword, an array where a list is meant, a
@@ -240,7 +240,7 @@ r = run(topo, dynamic, pCa=4.5, **drv,
 
 # several fields drawn jointly: a candidate list
 ens = sample_params(dynamic, 64, seed=0, vary='GF')    # every ranged G or F row
-ens = sample_params(dynamic, 64, seed=0, vary=['xb_r12_coeff', 'tm_J_M'])
+ens = sample_params(dynamic, 64, seed=0, vary=['xb_r12_coeff', 'tm_J'])
 r = run(topo, ens, pCa=4.5, **drv)
 ```
 
@@ -323,12 +323,13 @@ one in detail.
 | `lattice_spacing` | the spacing actually used — the solved value under dynamic LS |
 | `n_xb_drx`, `n_xb_loose`, `n_xb_tight_1`, `n_xb_tight_2`, `n_xb_free_2`, `n_xb_srx` | heads in each state (table below) |
 | `force_xb_loose`, `force_xb_tight_1`, `force_xb_tight_2` | axial crossbridge force by bound state, pN |
-| `n_tm_state_0` … `n_tm_state_3` | Tm units in each state |
-| `frac_tm_state_2_overlap`, `frac_tm_state_3_overlap`, `n_overlap_sites` | Tm fractions over sites a head can reach |
+| `n_tm_state_0` … `n_tm_state_5` | Tm units in each state (§10) |
+| `frac_tm_closed_overlap`, `frac_tm_open_overlap`, `n_overlap_sites` | closed / open Tm fractions over sites a head can reach |
 | `atp_expected` | expected ATP used this step — **use this for ATP** |
 | `atp_consumed` | realised count of ATP-consuming detachments |
 | `newly_bound` | heads that attached this step |
 | `closure_detach_free`, `closure_detach_atp` | heads torn off by closing Tm: free (weak) / one ATP each (strong) |
+| `n_xb_loose_closed` | weak heads sitting on closed Tm units |
 | `xb_detach_free`, `xb_give_up`, `atp_net_pi_release`, `atp_net_hydrolysis` | cycle fluxes for checking the ATP books |
 | `thick_displace_*`, `thin_displace_*` | mean/max/min/std node displacement, nm |
 | `thick_energy_first_avg`, `titin_energy_avg`, `titin_energy_delta_avg` | stored elastic energy, pN·nm |
@@ -362,7 +363,7 @@ comparing geometries.
 | bound heads | `n_xb_loose + n_xb_tight_1 + n_xb_tight_2` |
 | fraction of heads in a state | count / `result.topology_config['total_xbs']` |
 | fraction of Tm units in a state | count / (`n_thin × n_tm` from `topology_config`) |
-| available Tm in the overlap zone | `frac_tm_state_2_overlap + frac_tm_state_3_overlap` |
+| available Tm in the overlap zone | `frac_tm_closed_overlap + frac_tm_open_overlap` |
 | ATP from cycling alone | `atp_expected − closure_detach_atp` |
 | change in first-spring energy | `np.diff(thick_energy_first_avg, axis=-1)` |
 | external work at the Z-line | see below |
@@ -429,15 +430,14 @@ host RAM. See [INSTALL.md](INSTALL.md) for sizing.
    reach past the M-line (the *hiding line*), sites are still found but their
    attachment rate is scaled by `1 − thin_thin_overlap_screening`.
 2. **Tropomyosin** (`thin_transitions`). Each Tm unit samples its next state
-   from a 4-state Markov chain (§10). Bound heads bias their unit towards open.
-   If tropomyosin closes over a bound head anyway, the head is torn off: a weak
-   head returns to DRX for free, and a strong head goes to Free_2 and is charged
-   one ATP.
+   from a 6-state Markov chain (§10). Strong heads bias their unit towards
+   open. A unit that leaves open anyway tears its strong heads to Free_2, one
+   ATP each; a unit that enters blocked tears its weak heads to DRX, free.
 3. **Crossbridges** (`thick_transitions`). Each head samples its next state
-   from a 6-state chain. Rates depend on its distance to its site and whether
-   that site is open. The rates are evaluated on a grid of distance bins (three
-   blocks: closed, open, open-but-screened) and exponentiated once, and each
-   head gathers its own row.
+   from a 6-state chain. Rates depend on its distance to its site and the
+   position of the site's Tm unit. The rates are evaluated on a grid of distance
+   bins (five blocks: blocked, closed, closed-screened, open, open-screened) and
+   exponentiated once, and each head gathers its own row.
 4. **Mechanics** (`solve_equilibrium`). Newton–CG moves every filament node
    until net force vanishes. The iteration caps are `static.n_newton_steps` and
    `static.n_cg_steps`.
@@ -459,29 +459,34 @@ Every rate law, with its form and source, is in
 
 ## 10. Tropomyosin cooperativity
 
-Force rises far more steeply with calcium than independent calcium binding
-allows (Hill coefficient around 3–4). In the model, neighbouring Tm units are
-coupled as a **symmetric Ising chain**. Each unit looks at its two neighbours
-along its own strand (`topo.tm_prev_neighbor`, `topo.tm_next_neighbor`) and
-feels a local field:
+Each Tm unit is in one of three **positions** — blocked, closed, open — with
+or without calcium on its troponin: six states, `state = 2 × position +
+has_calcium`.
 
-```
-h = J_C × (open neighbours) + J_M × (crossbridge-bound neighbours)
-    − 0.5 × (J_C + J_M) × (closed neighbours)
-```
+| position | states | crossbridges |
+|---|---|---|
+| blocked | 0, 1 | nothing binds |
+| closed | 2, 3 | weak attachment (`r01`) only |
+| open | 4, 5 | weak attachment and the weak → strong step (`r12`) |
 
-Forward rates are multiplied by `exp(+h/2)` and reverses by `exp(−h/2)`, so the
-equilibrium shifts by exactly `exp(h)` and detailed balance holds. The one-way
-cycle-closing step 3 → 0 has no modifier.
+The position equilibria depend on calcium (`tm_Keq_unblock_*`,
+`tm_Keq_swing_*`), and detailed balance then fixes the calcium affinity at
+closed and open: calcium binds more tightly the further the unit is open. Every
+cycle obeys detailed balance.
 
-- `tm_J_M` (kT) sets the emergent steepness of the force–pCa curve.
-- `tm_J_C` (kT) has little effect.
-- `xb_tm_K2` sets how strongly a bound head holds its unit open: n heads divide
-  the unit's exits from the open state by `(1 + K2)^n`. `jnp.inf` is a hard
-  lock.
+Force rises far more steeply with calcium than independent units allow. Units
+along a strand are coupled as a **symmetric Ising chain on position**. Each
+position has a weight W = −1, 0, +1 (blocked, closed, open); a unit's field is
+`h = tm_J × ΣW(its two neighbours)`, and a position step s → t is multiplied by
+`exp((W(t) − W(s)) × h/2)`, so every equilibrium shifts by the Boltzmann factor.
+Calcium edges stay within one position and are untouched.
 
-The Tm states are 0 Ca-free blocking, 1 Ca-bound blocking, 2 closed, 3 open;
-only state 3 permits binding.
+- `tm_J` (kT) sets the emergent steepness of the force–pCa curve.
+- `xb_tm_K2` sets how strongly a **strong** head (Tight_1, Tight_2) holds its
+  unit open: n strong heads divide the unit's exits from open by `(1 + K2)^n`.
+  Weak heads do not lock. `jnp.inf` is a hard lock.
+- A unit that leaves open tears its strong heads to Free_2 (one ATP each); a
+  unit that enters blocked tears its weak heads to DRX (free).
 
 ---
 

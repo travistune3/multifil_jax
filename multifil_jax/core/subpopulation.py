@@ -213,7 +213,7 @@ def _c_zone_masks(topology, lo_nm: float, hi_nm: float, z_line, scales: Dict[str
         (topology.n_thick, topology.n_crowns, topology.n_xb_per_crown),
     ).reshape(-1)
 
-    has_tm = any(f.startswith("tm_") for f in scales)
+    has_tm = any(f.startswith("tm_") or f == "xb_tm_K2" for f in scales)
     if has_tm:
         if z_line is None:
             raise ValueError("Subpopulation.c_zone with tm_* scales needs z_line: a "

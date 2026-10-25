@@ -186,7 +186,7 @@ class SarcTopology:
             unit's axial position in position-based metrics and masks
         thick_starts: (n_thick,) - crown level start offset (1..n_xb_per_crown)
         thin_starts: (n_thin,) - helical twist start offset (0-25)
-        eye_4, eye_6: identities for the TM / XB matrix exponentials
+        eye_6: identity for the TM and XB matrix exponentials (both 6 states)
         xb_bin_edges, xb_bin_centers: crossbridge strain bins
     """
 
@@ -204,7 +204,7 @@ class SarcTopology:
         'mono_offsets', 'mono_angle', 'mono_strand', 'mono_node', 'mono_xi', 'mono_tm',
         'node_offsets', 'node_rests',
         'tm_chains', 'tm_prev_neighbor', 'tm_next_neighbor', 'tm_rep_mono',
-        'eye_4', 'eye_6', 'xb_bin_edges', 'xb_bin_centers',
+        'eye_6', 'xb_bin_edges', 'xb_bin_centers',
     )
     __slots__ = _AUX + _CHILDREN
 
@@ -484,7 +484,6 @@ class SarcTopology:
             crown_rests=jnp.asarray(crown_rests),
             thick_starts=jnp.asarray(thick_starts_arr),
             thin_starts=jnp.asarray(thin_starts_arr),
-            eye_4=jnp.eye(4, dtype=jnp.float32),
             eye_6=jnp.eye(6, dtype=jnp.float32),
             xb_bin_edges=bin_edges,
             xb_bin_centers=bin_centers,

@@ -50,22 +50,20 @@ if TYPE_CHECKING:
 # kernels/rate_functions.py is the source of truth for what each transition
 # physically is.
 _XB_TRANSITION_PAIRS = (
-    (0, 1), (1, 0),   # weak attachment (Tm-gated) / weak detachment
-    (1, 2), (2, 1),   # Pi release + the larger part of the lever swing / reverse
+    (0, 1), (1, 0),   # weak attachment (gated: closed or open) / weak detachment
+    (1, 2), (2, 1),   # Pi release + the larger lever swing (gated: open) / reverse
     (2, 3), (3, 2),   # AM.ADP isomerization, the smaller part of the swing / reverse
     (3, 4), (4, 3),   # ADP release and detachment / reverse (structurally zero)
     (4, 0), (0, 4),   # recovery stroke / reverse
     (0, 5), (5, 0),   # SRX sequestration / Ca-dependent recruitment
 )
 
-# Elementary tropomyosin transitions. States: 0 Ca-free blocking,
-# 1 Ca-bound blocking, 2 closed, 3 open. Note 3->0 exists but 0->3 does not:
-# the cycle closes by calcium dissociating from the open state.
+# Elementary tropomyosin transitions. States: 2 * position + has_calcium,
+# position 0 blocked, 1 closed, 2 open. No blocked <-> open edge.
 _TM_TRANSITION_PAIRS = (
-    (0, 1), (1, 0),   # calcium binds / dissociates
-    (1, 2), (2, 1),   # tropomyosin shifts to closed / back to blocking
-    (2, 3), (3, 2),   # opens / closes
-    (3, 0),           # cycle closes: calcium leaves the open state
+    (0, 1), (1, 0), (2, 3), (3, 2), (4, 5), (5, 4),   # calcium on / off, per position
+    (0, 2), (2, 0), (1, 3), (3, 1),                   # unblock / reblock, -Ca and +Ca
+    (2, 4), (4, 2), (3, 5), (5, 3),                   # open / close, -Ca and +Ca
 )
 
 
@@ -88,7 +86,8 @@ def count_transitions(old_state: 'State', new_state: 'State') -> Dict[str, int]:
 
     and likewise 'tm_trans_*'. State indices are 0-based throughout
     (0 DRX, 1 Loose, 2 Tight_1, 3 Tight_2, 4 Free_2, 5 SRX for crossbridges;
-    0 Ca-free blocking, 1 Ca-bound blocking, 2 closed, 3 open for tropomyosin).
+    2 * position + has_calcium for tropomyosin, position 0 blocked, 1 closed,
+    2 open).
 
     THESE ARE NET CHANGES OVER THE STEP, NOT EVENT COUNTS. A unit that passes
     through an intermediate state within one timestep is classified by where it

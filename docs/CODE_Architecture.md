@@ -79,9 +79,10 @@ vmapped argument.
 **Every simulation starts relaxed.** `realize_state` builds the structural state
 (tropomyosin blocked, no head bound) and the equilibrium is solved on it. Then
 `transitions.xb_rest_states` draws every head from the stationary distribution of
-its own generator at pCa 9 with attachment gated off. The detached states
-{0 DRX, 4 Free_2, 5 SRX} form a closed class, so the draw solves `πQ = 0` on that
-3×3 block. A run whose first pCa is not 9 is therefore a step from rest, and no
+its own generator at pCa 9 on blocked units, where attachment is zero. The
+detached states {0 DRX, 4 Free_2, 5 SRX} form a closed class, so the draw solves
+`πQ = 0` on that 3×3 block. `transitions.tm_rest_states` then draws every Tm unit
+from its own uncoupled generator at pCa 9. A run whose first pCa is not 9 is therefore a step from rest, and no
 settling time is needed.
 
 **Scan carry** is `(state, rng_key, current_ls)`. The third element is the
@@ -189,7 +190,7 @@ once, in `_AUX` / `_CHILDREN`.
 | Monomers | `n_mono`, `mono_offsets`, `mono_node`, `mono_xi`, `mono_tm` | every actin; `monomer_axial` interpolates node displacements, and the XB reaction scatters back with the same weights |
 | Binding candidates | `n_cand`, `cand_mono`, `mono_cand`, `face_to_monomers`, `xb_to_mono_indices` | monomers a head can reach; `thin.bound_to` is indexed by candidate |
 | Mechanical nodes | `n_nodes`, `node_offsets` | an even grid every `static.thin_node_spacing` nm; segment stiffness from `thin_EA` via `core.state.thin_segment_k` (the only EA→k conversion) |
-| Tropomyosin units | `n_tm`, `tm_chains`, `tm_prev_neighbor`, `tm_next_neighbor`, `tm_rep_mono` | `static.tm_monomers_per_unit = None` gives one unit per candidate |
+| Tropomyosin units | `n_tm`, `tm_chains`, `tm_prev_neighbor`, `tm_next_neighbor`, `tm_rep_mono` | one unit per `static.tm_monomers_per_unit` actins; `None` gives one unit per candidate |
 
 **Geometry.** `actin_geometry='vertebrate'` gives 1 thick : 2 thin and 3 faces
 per thin; `'invertebrate'` gives 1:3 and 2 faces. `crown_offsets` are
@@ -221,30 +222,38 @@ invalid rather than clamped.
 
 ### Tropomyosin — `transitions.thin_transitions`
 
-- A 4-state chain (0 Ca-free blocking, 1 Ca-bound blocking, 2 closed, 3 open)
-  with symmetric Ising coupling to the two same-strand neighbours:
-  `h = J_C·n_2 + J_M·n_3 − ½(J_C + J_M)·n_closed`. Forward rates get `exp(+h/2)`
-  and reverses `exp(−h/2)`; `k_30` takes no modifier.
-- Rates depend only on `(n_2, n_3, n_closed)` (27 configurations) and the number
-  of heads bound on the unit (0…`tm_max_heads`), so
-  `27 × (tm_max_heads + 1)` matrices serve every unit. They come from
-  `_compute_unique_tm_Q_matrices`, are exponentiated in one batch, and each unit
-  gathers its row.
-- **The crossbridge lock is a rate.** With n heads bound, `k_30` and `k_32` are
-  divided by `(1 + xb_tm_K2)^n` inside Q, which reproduces the equilibrium ratio
-  at any `dt`. `xb_tm_K2 = jnp.inf` gives the hard lock exactly.
-- With a finite lock, tropomyosin can close over a bound head; the head detaches
-  (`torn`). A Loose head goes to DRX and owes nothing; a Tight_1/Tight_2 head goes
-  to Free_2 and is charged one ATP.
+- A 6-state unit, `state = 2·position + has_calcium` (position 0 blocked,
+  1 closed, 2 open; `tm_position`). Position edges blocked ↔ closed ↔ open at each
+  calcium level, calcium edges at each position, no blocked ↔ open edge; the
+  calcium affinities at closed and open are forced by detailed balance
+  (`rate_functions.tm_ca_affinity_ratios`).
+- Symmetric Ising coupling on position to the two same-strand neighbours:
+  weights W = (−1, 0, +1), `h = tm_J·ΣW(neighbours)`, and a position step s → t
+  gets `exp((W(t) − W(s))·h/2)`. Calcium edges get exp(0) = 1.
+- Rates depend only on the neighbour composition `(n_blocked, n_closed, n_open)`
+  (27 configurations) and the number of STRONG heads bound on the unit
+  (0…`tm_max_heads`), so `27 × (tm_max_heads + 1)` 6×6 matrices serve every unit.
+  They come from `_compute_unique_tm_Q_matrices`, are exponentiated in one batch,
+  and each unit gathers its row.
+- **The crossbridge lock is a rate.** With n strong heads bound, the exits from
+  open (4 → 2, 5 → 3) are divided by `(1 + xb_tm_K2)^n` inside Q, which
+  reproduces the equilibrium ratio at any `dt`. Weak heads do not lock.
+  `xb_tm_K2 = jnp.inf` gives the hard lock exactly.
+- **Tears** (`torn`): a unit that leaves open tears its Tight_1/Tight_2 heads to
+  Free_2, charged one ATP; a unit that enters blocked tears its Loose heads to
+  DRX, owing nothing. A Loose head on a unit that only closes stays bound.
 
 ### Crossbridges — `transitions.xb_binned_generator` + `thick_transitions`
 
 - Rates depend on the head's axial distance to its target and the target's
-  block, so `_build_xb_Q_bins` builds `3 × n_xb_bins` 6×6 generators: closed,
-  open, and open-but-screened (the thin–thin double-overlap zone, where `r01` is
-  scaled by `1 − thin_thin_overlap_screening`). Each head's key is its bin plus
-  its block, a function of geometry, permissiveness and the hiding line, never of
-  rates.
+  block, so `_build_xb_Q_bins` builds `5 × n_xb_bins` 6×6 generators: blocked,
+  closed, closed-screened, open, open-screened (screened = the thin–thin
+  double-overlap zone, where `r01` is scaled by `1 − thin_thin_overlap_screening`).
+  Two gates: `attach` (closed or open) multiplies `r01`, `stroke` (open) multiplies
+  `r12`; each reverse rate uses its ungated forward rate. A bound head reads the
+  unit under its bound monomer, an unbound head the unit under its nearest
+  (`xb_gate_position`). Each head's key is its bin plus its block, a function of
+  geometry, the gate and the hiding line, never of rates.
 - `_xb_Q_resolved` applies subpopulations (`mean_field` blends generators,
   `explicit` stacks them). It takes no exponentials, so sampling and metrics
   share one physics.
@@ -254,7 +263,7 @@ invalid rather than clamped.
 - `thick_transitions` samples from `P`, then updates both binding records.
   Same-step collisions on one site are resolved by scatter-min over head index;
   the loser returns to DRX.
-- Invalid heads are forced into the closed block, where `r01` is exactly zero.
+- Invalid heads are forced into the blocked block, where `r01` is exactly zero.
 - Every rate law lives in `kernels/rate_functions.py`, one function per
   transition; the builders only assemble.
 
@@ -321,9 +330,9 @@ each group.
 | Protocol & solver | `axial_force`, `solver_residual`, `solver_residual_norm`, `solver_tolerance`, `lattice_spacing`, `newton_iters` |
 | XB counts | `n_xb_drx`, `n_xb_loose`, `n_xb_tight_1`, `n_xb_tight_2`, `n_xb_free_2`, `n_xb_srx` |
 | XB force by state | `force_xb_loose`, `force_xb_tight_1`, `force_xb_tight_2` |
-| TM counts | `n_tm_state_0` … `n_tm_state_3` |
-| TM overlap zone | `frac_tm_state_2_overlap`, `frac_tm_state_3_overlap`, `n_overlap_sites` |
-| Events | `atp_consumed`, `newly_bound`, `closure_detach_free`, `closure_detach_atp` |
+| TM counts | `n_tm_state_0` … `n_tm_state_5` |
+| TM overlap zone | `frac_tm_closed_overlap`, `frac_tm_open_overlap`, `n_overlap_sites` |
+| Events | `atp_consumed`, `newly_bound`, `closure_detach_free`, `closure_detach_atp`, `n_xb_loose_closed` |
 | Displacement | `thick_displace_{mean,max,min,std}`, `thin_displace_{mean,max,min,std}` |
 | Energy | `thick_energy_first_avg`, `titin_energy_avg`, `titin_energy_delta_avg` |
 | Work | `xb_work_on_filaments` |
@@ -350,7 +359,7 @@ key):
 | fraction of heads in a state | count / `topology.total_xbs` |
 | fraction of Tm units in a state | count / (`n_thin × n_tm`) |
 | bound heads | `n_xb_loose + n_xb_tight_1 + n_xb_tight_2` |
-| available Tm in the overlap zone | `frac_tm_state_2_overlap + frac_tm_state_3_overlap` |
+| available Tm in the overlap zone | `frac_tm_closed_overlap + frac_tm_open_overlap` |
 | ATP from the 3→4 route alone | `atp_expected − closure_detach_atp` |
 | external work at the z-line | `−0.5·(F[..., :-1] + F[..., 1:]) · diff(z)` |
 | work per ATP over a window | `sum(xb_work_on_filaments) / sum(atp_expected)` — never per step |

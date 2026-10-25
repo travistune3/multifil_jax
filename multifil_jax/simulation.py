@@ -85,7 +85,7 @@ from multifil_jax.kernels.solver import build_prefactored_preconditioner
 from multifil_jax.core.sarc_geometry import SarcTopology
 from multifil_jax.kernels.geometry import update_nearest_neighbors
 from multifil_jax.kernels.solver import solve_equilibrium
-from multifil_jax.kernels.transitions import xb_rest_states
+from multifil_jax.kernels.transitions import xb_rest_states, tm_rest_states
 from multifil_jax.kernels.forces import axial_force_at_mline
 from multifil_jax.timestep import timestep
 from multifil_jax.metrics_fn import compute_all_metrics
@@ -471,7 +471,7 @@ def _resolve_subpopulation(subpopulation, topology, total_batch, flat_idx,
     field_set = set()
     for sp in subpops:
         field_set |= set(sp.scaled_fields())
-    bad = [f for f in field_set if not (f.startswith('xb_') or f.startswith('tm_'))]
+    bad = [f for f in field_set if not f.startswith(('xb_', 'tm_'))]
     if bad:
         raise ValueError(
             f"Subpopulation scales must be xb_* or tm_* fields; got {sorted(bad)}"
@@ -600,20 +600,24 @@ def _run_sim_kernel(
             for k in range(scale_matrix.shape[0])
         ]
 
-        def _pops(prefix, mask):
-            if not any(f.startswith(prefix) for f in scaled_field_names):
+        def _pops(reads, mask):
+            if not any(reads(f) for f in scaled_field_names):
                 return None
             if subpop_mode == 'mean_field':
                 return ('mean_field', constants_k, subpop['fractions'])
             return ('explicit', constants_k, subpop[mask])
 
-        xb_subpop, tm_subpop = _pops('xb_', 'xb_mask'), _pops('tm_', 'tm_mask')
+        # xb_tm_K2 is the lock, a tropomyosin rate: thin_transitions reads it.
+        xb_subpop = _pops(lambda f: f.startswith('xb_'), 'xb_mask')
+        tm_subpop = _pops(lambda f: f.startswith('tm_') or f == 'xb_tm_K2', 'tm_mask')
 
         # Start relaxed: every head drawn from its own resting distribution. The
         # draw has its own stream, folded off the sim's key, so the scan's key
         # is untouched.
         state = xb_rest_states(state, constants, topology, z_trace[0], ls_trace[0],
                                jax.random.fold_in(b.rng_keys, 0), xb_subpop)
+        state = tm_rest_states(state, constants, topology,
+                               jax.random.fold_in(b.rng_keys, 1), tm_subpop)
 
         def scan_fn(carry, inputs):
             old_state, k, current_ls = carry

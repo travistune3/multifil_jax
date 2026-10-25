@@ -86,13 +86,15 @@ TWO WAYS OUT OF THE CYCLE COST NOTHING, AND BOTH ARE REPORTED SEPARATELY.
   not for work loops, which also makes `atp_consumed` unusable as an ATP figure
   during lengthening.
 
-  A weak closure tear. Tropomyosin closing over a Loose head returns it to DRX
-  still primed, owing nothing. `closure_detach_free` counts those.
+  A weak closure tear. A unit entering blocked returns its Loose heads to DRX
+  still primed, owing nothing. `closure_detach_free` counts those. A Loose head
+  on a unit that only closes is NOT torn: closed units bind weak heads.
+  `n_xb_loose_closed` counts the weak heads sitting on closed units.
 
-A STRONG CLOSURE TEAR DOES COST ONE, and is counted by `closure_detach_atp`.
-Tropomyosin closing over a Tight_1 or Tight_2 head sends it to Free_2, because
-it has already released its phosphate and swung its lever; returning it to DRX
-(= M.ADP.Pi) would hand back that phosphate for free.
+A STRONG CLOSURE TEAR COSTS ONE, and is counted by `closure_detach_atp`. A unit
+leaving the open position tears its Tight_1 and Tight_2 heads to Free_2,
+because they have already released phosphate and swung the lever; returning
+them to DRX (= M.ADP.Pi) would hand back that phosphate for free.
 
 THE CLOSURE CHARGE IS A REALISED COUNT, not an expectation. The tear is fully
 observed and its charge is deterministic given it; an expectation would bill
@@ -113,7 +115,8 @@ import jax.numpy as jnp
 from typing import Dict, TYPE_CHECKING
 
 from multifil_jax.kernels.forces import xb_axial_force_by_state, xb_axial_work
-from multifil_jax.kernels.transitions import xb_expected_crossings
+from multifil_jax.kernels.transitions import (xb_expected_crossings, xb_gate_position,
+                                              tm_position, N_TM_STATES)
 from multifil_jax.core.state import (Drivers, MetricsDict,
                                      thick_axial, monomer_axial)
 
@@ -130,7 +133,7 @@ def compute_overlap_tm_fractions(
 ) -> Dict[str, jnp.ndarray]:
     """Tropomyosin activation restricted to sites a crossbridge could reach.
 
-    THE PROBLEM THIS SOLVES. An all-site activated fraction — `n_tm_state_3`
+    THE PROBLEM THIS SOLVES. An all-site activated fraction — `n_tm_state_4 + 5`
     over every tropomyosin site on every thin filament — averages over sites
     that can never host a crossbridge no matter how activated they are:
 
@@ -162,9 +165,10 @@ def compute_overlap_tm_fractions(
     filaments to different axial positions.
 
     Returns a dict with:
-      - frac_tm_state_2_overlap: Ca-open fraction. Responds earlier than
-        state 3 and is the more direct readout of cooperative propagation.
-      - frac_tm_state_3_overlap: fully open, crossbridge-bindable fraction.
+      - frac_tm_closed_overlap: fraction in the CLOSED position (either Ca
+        level): weak attachment allowed, the stroke not.
+      - frac_tm_open_overlap: fraction in the OPEN position (either Ca level):
+        the weak -> strong step allowed.
       - n_overlap_sites: the denominator, worth checking when a result surprises
         you — it should change with sarcomere length and filament geometry, and
         should NOT change with calcium.
@@ -186,15 +190,13 @@ def compute_overlap_tm_fractions(
     overlap_mask = in_reach & visible
 
     n_overlap_sites = jnp.sum(overlap_mask).astype(jnp.float32)
-    is_state_2 = (tm_states == 2) & overlap_mask
-    is_state_3 = (tm_states == 3) & overlap_mask
-
-    n_state_2 = jnp.sum(is_state_2).astype(jnp.float32)
-    n_state_3 = jnp.sum(is_state_3).astype(jnp.float32)
+    pos = tm_position(tm_states)
+    n_closed = jnp.sum((pos == 1) & overlap_mask).astype(jnp.float32)
+    n_open = jnp.sum((pos == 2) & overlap_mask).astype(jnp.float32)
 
     return {
-        'frac_tm_state_2_overlap': n_state_2 / n_overlap_sites,
-        'frac_tm_state_3_overlap': n_state_3 / n_overlap_sites,
+        'frac_tm_closed_overlap': n_closed / n_overlap_sites,
+        'frac_tm_open_overlap': n_open / n_overlap_sites,
         'n_overlap_sites': n_overlap_sites,
     }
 
@@ -283,10 +285,8 @@ def compute_all_metrics(
     # ========================================================================
     # TROPOMYOSIN STATE COUNTS
     # ========================================================================
-    n_tm_0 = jnp.sum(new_tm == 0).astype(jnp.float32)
-    n_tm_1 = jnp.sum(new_tm == 1).astype(jnp.float32)
-    n_tm_2 = jnp.sum(new_tm == 2).astype(jnp.float32)
-    n_tm_3 = jnp.sum(new_tm == 3).astype(jnp.float32)
+    # state = 2 * position + has_calcium (0/1 blocked, 2/3 closed, 4/5 open)
+    n_tm = [jnp.sum(new_tm == k).astype(jnp.float32) for k in range(N_TM_STATES)]
     overlap_tm_fractions = compute_overlap_tm_fractions(new_state, topology, z_line)
 
     # ========================================================================
@@ -299,7 +299,7 @@ def compute_all_metrics(
     # (which happens in thin_transitions) with the cycle.
     #
     # No closure mask is needed and none is applied. A head torn off by
-    # tropomyosin is already out of state 3 in `mid_xb`, because the tear
+    # tropomyosin is already out of Tight_2 in `mid_xb`, because the tear
     # happened in thin_transitions, one phase earlier.
     #
     # CLOSURE TEARS, SPLIT BY WHAT THE HEAD HAD ALREADY SPENT. thin_transitions
@@ -310,6 +310,11 @@ def compute_all_metrics(
     # is unambiguous.
     n_tear_strong = jnp.sum(trace.torn & (mid_xb == 4)).astype(jnp.float32)
     n_tear_weak = jnp.sum(trace.torn).astype(jnp.float32) - n_tear_strong
+
+    # Weak heads on CLOSED units: the population the attach/stroke gate split
+    # creates (closed units bind weak heads but stop the stroke).
+    n_loose_closed = jnp.sum((new_xb.reshape(-1) == 1)
+                             & (xb_gate_position(new_state, topology) == 1)).astype(jnp.float32)
 
     # Counts XBs that visited state 4 (Free_2) this timestep, including those
     # that continued to state 0 within the same timestep. The 3 -> 2 -> 1 -> 0
@@ -469,15 +474,12 @@ def compute_all_metrics(
         'force_xb_tight_2': f_xb_tight_2,
 
         # TM state counts
-        'n_tm_state_0': n_tm_0,
-        'n_tm_state_1': n_tm_1,
-        'n_tm_state_2': n_tm_2,
-        'n_tm_state_3': n_tm_3,
+        **{f'n_tm_state_{k}': n_tm[k] for k in range(N_TM_STATES)},
 
         # TM occupancy over sites a crossbridge could actually reach. All-site
         # fractions: divide the counts above by n_thin * n_tm.
-        'frac_tm_state_2_overlap': overlap_tm_fractions['frac_tm_state_2_overlap'],
-        'frac_tm_state_3_overlap': overlap_tm_fractions['frac_tm_state_3_overlap'],
+        'frac_tm_closed_overlap': overlap_tm_fractions['frac_tm_closed_overlap'],
+        'frac_tm_open_overlap': overlap_tm_fractions['frac_tm_open_overlap'],
         'n_overlap_sites': overlap_tm_fractions['n_overlap_sites'],
 
         # Transition events
@@ -485,12 +487,14 @@ def compute_all_metrics(
         'newly_bound': newly_bound,
 
         # Heads tropomyosin tore off this step, split by what they had spent.
-        # `closure_detach_free` is free; each `closure_detach_atp` is one ATP,
-        # already included in atp_consumed and atp_expected. Both are
-        # identically zero when xb_tm_K2 is jnp.inf (the hard lock makes closure
-        # over a bound head unreachable).
+        # `closure_detach_free` (weak heads on a unit entering blocked) is free;
+        # each `closure_detach_atp` (strong heads on a unit leaving open) is one
+        # ATP, already included in atp_consumed and atp_expected. The second is
+        # identically zero when xb_tm_K2 is jnp.inf.
         'closure_detach_free': n_tear_weak,
         'closure_detach_atp': n_tear_strong,
+        # Weak heads on closed units (end of step).
+        'n_xb_loose_closed': n_loose_closed,
 
         # Displacement statistics
         'thick_displace_mean': jnp.mean(thick_displace_flat),
