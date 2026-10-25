@@ -246,9 +246,11 @@ invalid rather than clamped.
 ### Crossbridges — `transitions.xb_binned_generator` + `thick_transitions`
 
 - Rates depend on the head's axial distance to its target and the target's
-  block, so `_build_xb_Q_bins` builds `5 × n_xb_bins` 6×6 generators: blocked,
+  block, so `_build_xb_Q_bins` builds one blocked 6×6 generator plus `4 × n_xb_bins`:
   closed, closed-screened, open, open-screened (screened = the thin–thin
   double-overlap zone, where `r01` is scaled by `1 − thin_thin_overlap_screening`).
+  Blocked needs only one: nothing binds there and the unbound rows do not depend on
+  distance, and no bound head ever reads a blocked unit (it is torn first).
   Two gates: `attach` (closed or open) multiplies `r01`, `stroke` (open) multiplies
   `r12`; each reverse rate uses its ungated forward rate. A bound head reads the
   unit under its bound monomer, an unbound head the unit under its nearest

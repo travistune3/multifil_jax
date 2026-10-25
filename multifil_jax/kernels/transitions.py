@@ -44,8 +44,8 @@ matrices than there are units.
   Crossbridges (thick_transitions): rates depend on the head's axial distance to
     its target (continuous) and on the target unit's block: blocked, closed,
     closed but screened by thin-thin overlap, open, open but screened. The
-    continuous axis is discretized into n_xb_bins bins, giving 5 * n_xb_bins
-    matrices regardless of lattice size.
+    continuous axis is discretized into n_xb_bins bins, giving 1 + 4 * n_xb_bins
+    matrices regardless of lattice size (blocked needs only one).
     Heads then gather the row for their own bin. Bin resolution is a genuine
     accuracy/cost tradeoff, controlled by StaticParams.n_xb_bins / xb_bin_lo /
     xb_bin_hi.
@@ -116,6 +116,16 @@ PADE6_B = jnp.array([
 # MATRIX EXPONENTIAL (6th order Pade with scaling/squaring - OPTIMIZED)
 # ============================================================================
 
+def _matmul(X: jnp.ndarray, Y: jnp.ndarray) -> jnp.ndarray:
+    """Batched X @ Y over the last two axes, as an elementwise multiply-sum.
+
+    For 6x6 matrices this is what XLA fuses into one elementwise loop, in plain
+    float32. An einsum is lowered to a batched GEMM instead, whose 128x128 tile
+    is almost entirely padding at n = 6, and which may run in TF32.
+    """
+    return jnp.sum(X[..., :, :, None] * Y[..., None, :, :], axis=-2)
+
+
 def expm_pade6_batch(
     A_batch: jnp.ndarray,
     identity: jnp.ndarray,
@@ -144,7 +154,8 @@ def expm_pade6_batch(
     matrices that still need it, selecting with jnp.where. That covers
     ||A|| up to 2^18 ~ 2.6e5, comfortably beyond any physiological rate times a
     sensible timestep. The unused iterations cost a predictable few percent, and
-    buy full fusion across the batch.
+    buy full fusion across the batch. (The observed max s is 16 at dt = 1 ms and
+    12 at dt = 0.1; a loop to the batch's max s instead runs slower, not faster.)
 
     NUMERICAL SAFEGUARDS. Rows are renormalized to sum to 1 afterwards, since
     float32 rounding through many squarings leaves them slightly off, and a row
@@ -187,13 +198,13 @@ def expm_pade6_batch(
     sums to 1 at every t, so every row of INT_0^1 exp(Qu)du sums to 1 as well —
     it is a mixture of stochastic matrices over the unit interval.
 
-    WHY THE INTEGRAL GETS ITS OWN fori_loop, AND WHY ITS MATMULS ARE PINNED TO
-    precision=HIGHEST. A loop body holding two einsums is lowered by XLA to the
-    TF32 tensor-core GEMM on some GPUs, and TF32's 10-bit mantissa compounds over
-    the 16 squarings the stiffest bins need (r12 reaches 1e4 /ms, so ||Q*dt||
-    reaches 2e4 on a matrix whose entries span 1e-20 to 1). A separate loop keeps
-    the probability path byte-for-byte identical to the with_integral=False path,
-    at the cost of 18 extra matmuls for a second copy of E.
+    EVERY PRODUCT IS AN ELEMENTWISE MULTIPLY-SUM (_matmul), NOT AN einsum. The
+    batch is thousands of 6x6 matrices. As an einsum, XLA may hand a product to a
+    batched cuBLAS GEMM, padding each 6x6 into a 128x128 tile, and in TF32. TF32's
+    10-bit mantissa compounds over the 16 squarings the stiffest bins need (r12
+    reaches 1e4 /ms, so ||Q*dt|| reaches 2e4 on a matrix whose entries span 1e-20
+    to 1). The multiply-sum fuses into elementwise loops in plain float32, so
+    with_integral doubles E and J together in ONE loop.
 
     ACCURACY against float64 on settled Q_bins (8x8, dt = 1 ms): phi1*dt is good
     to ~3e-4, slightly better than the probabilities it ships beside (~7e-4), and
@@ -209,7 +220,7 @@ def expm_pade6_batch(
             rather than built with jnp.eye(n) inside, which would make XLA
             materialize a fresh copy per batch element under vmap.
         with_integral: also return phi1(A). Static — it changes the returned
-            pytree, so flipping it recompiles. The 4x4 tropomyosin call sites
+            pytree, so flipping it recompiles. The tropomyosin call sites
             leave it off and pay nothing.
 
     Returns:
@@ -229,68 +240,50 @@ def expm_pade6_batch(
 
     # Step 4: Compute matrix powers (vectorized)
     I = identity
-    A2 = jnp.einsum('...ij,...jk->...ik', A_scaled, A_scaled)
-    A4 = jnp.einsum('...ij,...jk->...ik', A2, A2)
-    A6 = jnp.einsum('...ij,...jk->...ik', A4, A2)
+    A2 = _matmul(A_scaled, A_scaled)
+    A4 = _matmul(A2, A2)
+    A6 = _matmul(A4, A2)
 
     # Step 5: Compute U and V for Pade approximant
     b = PADE6_B
 
     # U = A * (b1*I + b3*A2 + b5*A4)
     inner = b[1]*I + b[3]*A2 + b[5]*A4
-    U = jnp.einsum('...ij,...jk->...ik', A_scaled, inner)
+    U = _matmul(A_scaled, inner)
 
     # V = b0*I + b2*A2 + b4*A4 + b6*A6
     V = b[0]*I + b[2]*A2 + b[4]*A4 + b[6]*A6
 
-    # Step 6: Solve (V - U) @ R = (V + U)
-    # `pade` is exp(A / 2^s), kept because the integral's loop (step 9) needs
-    # its own copy of E to double alongside J.
+    # Step 6: Solve (V - U) @ R = (V + U); `pade` is exp(A / 2^s)
     pade = jnp.linalg.solve(V - U, V + U)
-    result = pade
 
-    # Step 7: Square s times using fori_loop for XLA fusion
-    # Handles ||A|| up to 2^18 = 262144; 2 extra no-op iters for typical norms
-    def _square_step(i, result):
-        should_square = i < s
-        squared = jnp.einsum('...ij,...jk->...ik', result, result)
-        return jnp.where(should_square[:, None, None], squared, result)
-
-    result = jax.lax.fori_loop(0, 18, _square_step, result)
-
-    # Step 8: Row normalization (fix float32 drift)
-    row_sums = jnp.sum(result, axis=2, keepdims=True)
-    result = result / row_sums
-
-    # Guard against NaN
-    result = jnp.where(jnp.isnan(result), 1.0/n, result)
+    def _normalize(M):
+        # Step 8: Row normalization (fix float32 drift), and guard against NaN
+        M = M / jnp.sum(M, axis=2, keepdims=True)
+        return jnp.where(jnp.isnan(M), 1.0/n, M)
 
     if not with_integral:
-        return result
+        # Step 7: Square s times using fori_loop for XLA fusion
+        # Handles ||A|| up to 2^18 = 262144; 2 extra no-op iters for typical norms
+        def _square_step(i, result):
+            return jnp.where((i < s)[:, None, None], _matmul(result, result), result)
 
-    # Step 9 (optional): the occupancy-time integral phi1(A), by the same
-    # scaling-and-squaring one level at a time. Its own loop, at HIGHEST
-    # precision — see the docstring for why neither is negotiable.
-    HI = jax.lax.Precision.HIGHEST
+        return _normalize(jax.lax.fori_loop(0, 18, _square_step, pade))
+
+    # Step 7 with the occupancy-time integral phi1(A): E and J doubled together,
+    # one level at a time (see the docstring).
     phi_even = I + A2/6.0 + A4/120.0 + A6/5040.0
     phi_odd_inner = I/2.0 + A2/24.0 + A4/720.0
-    J = phi_even + jnp.einsum('...ij,...jk->...ik', A_scaled, phi_odd_inner,
-                              precision=HI)
+    J = phi_even + _matmul(A_scaled, phi_odd_inner)
 
     def _double_step(i, carry):
         E, Jc = carry
-        should = i < s
-        J_dbl = 0.5 * (Jc + jnp.einsum('...ij,...jk->...ik', E, Jc, precision=HI))
-        E_sq = jnp.einsum('...ij,...jk->...ik', E, E, precision=HI)
-        return (jnp.where(should[:, None, None], E_sq, E),
-                jnp.where(should[:, None, None], J_dbl, Jc))
+        should = (i < s)[:, None, None]
+        return (jnp.where(should, _matmul(E, E), E),
+                jnp.where(should, 0.5 * (Jc + _matmul(E, Jc)), Jc))
 
-    _, J = jax.lax.fori_loop(0, 18, _double_step, (pade, J))
-
-    J = J / jnp.sum(J, axis=2, keepdims=True)
-    J = jnp.where(jnp.isnan(J), 1.0/n, J)
-
-    return result, J
+    E, J = jax.lax.fori_loop(0, 18, _double_step, (pade, J))
+    return _normalize(E), _normalize(J)
 
 
 # ============================================================================
@@ -1069,12 +1062,19 @@ def _build_xb_Q_bins(
     whether the target lies in the thin-thin double-overlap zone (binary).
     Rather than build a rate matrix per head, build them on a grid:
 
-        n_xb_bins axial positions x 5 blocks
+        1 blocked matrix + n_xb_bins axial positions x 4 blocks
 
-    laid out as blocked, closed, closed-screened, open, open-screened. A
-    blocked site binds at no rate, screened or not, so it needs one block.
+    laid out as blocked, then closed, closed-screened, open, open-screened.
     Each head is then assigned the index of the cell it falls in, and gathers
     from there.
+
+    WHY BLOCKED IS ONE MATRIX. A blocked site binds at no rate, screened or
+    not, and the rates out of the unbound states (r04, r40, r05, r50) do not
+    depend on distance, so rows {0, 4, 5} of a blocked matrix are the same at
+    every bin. No bound head ever reads a blocked unit: thin_transitions tears
+    a weak head when its unit enters blocked, and a strong head when its unit
+    leaves open. So rows 1-3 of the blocked matrix are never used, and one
+    matrix serves every blocked head.
 
     THE HIDING LINE. Every thin filament has the same length, so when the
     half-sarcomere is shorter than the thin filament, the thin filaments pass
@@ -1095,9 +1095,9 @@ def _build_xb_Q_bins(
 
     THE xb_valid GATE. Heads with no real geometric partner carry a placeholder
     target index, so the tropomyosin state they read is meaningless. They are
-    forced to blocked, the block where the attachment rate r01 is exactly zero
-    at every bin position. This is a hard gate, not a distance penalty: such a
-    head can never bind, at any strain.
+    forced to blocked, where the attachment rate r01 is exactly zero. This is
+    a hard gate, not a distance penalty: such a head can never bind, at any
+    strain.
 
     RETURNING Q RATHER THAN P is deliberate. The gather key depends only on
     geometry and the gate, never on the rate constants, so it is shared
@@ -1115,7 +1115,7 @@ def _build_xb_Q_bins(
         lattice_spacing: this step's (pre-solve) lattice spacing, nm
 
     Returns:
-        Q_bins: (5 * n_bins, 6, 6) rate matrices: blocked, closed,
+        Q_bins: (1 + 4 * n_bins, 6, 6) rate matrices: blocked, then closed,
             closed-screened, open, open-screened
         key: (n_xb_total,) index into Q_bins for each crossbridge
     """
@@ -1164,14 +1164,21 @@ def _build_xb_Q_bins(
     springs_grid = jnp.broadcast_to(spring_vec, (n_bins, 12))  # (n_bins, 12)
 
     # Q matrices at each bin position, one block per (attach, stroke, access):
-    # blocked, closed, closed-screened, open, open-screened.
+    # closed, closed-screened, open, open-screened. Blocked is ONE matrix, read
+    # at the middle bin: with nothing able to attach, its unbound rows {0, 4, 5}
+    # are distance-free, and no bound head ever reads a blocked unit (see the
+    # docstring), so its rows 1-3 are never used.
     ones = jnp.ones(n_bins)
     scr = 1.0 - constants.thin_thin_overlap_screening
-    Q_bins = jnp.concatenate([
+    mid = slice(n_bins // 2, n_bins // 2 + 1)
+    Q_blocked = xb_rate_matrix(dist_grid[mid], d, springs_grid[mid], jnp.zeros(1),
+                               jnp.zeros(1), jnp.ones(1), ca_conc, constants.temp_celsius,
+                               constants)
+    Q_bins = jnp.concatenate([Q_blocked] + [
         xb_rate_matrix(dist_grid, d, springs_grid, a * ones, st * ones, acc * ones,
                        ca_conc, constants.temp_celsius, constants)
-        for a, st, acc in ((0.0, 0.0, 1.0), (1.0, 0.0, 1.0), (1.0, 0.0, scr),
-                           (1.0, 1.0, 1.0), (1.0, 1.0, scr))], axis=0)  # (5*n_bins, 6, 6)
+        for a, st, acc in ((1.0, 0.0, 1.0), (1.0, 0.0, scr),
+                           (1.0, 1.0, 1.0), (1.0, 1.0, scr))], axis=0)  # (1 + 4*n_bins, 6, 6)
 
     # Assign each XB to a bin. The edges are uniform (a linspace), so the bin is
     # arithmetic, not a binary search: ~30x cheaper on GPU at 25,600 heads.
@@ -1180,9 +1187,8 @@ def _build_xb_Q_bins(
     bin_idx = jnp.floor((x_axial - edges[0]) * (n_bins / (edges[-1] - edges[0]))).astype(jnp.int32)
     bin_idx = jnp.clip(bin_idx, 0, n_bins - 1)
 
-    block = jnp.where(position == 0, 0,
-                      2 * position - 1 + screened.astype(jnp.int32))  # 0..4
-    key   = block * n_bins + bin_idx                               # in [0, 5*n_bins)
+    block = 2 * position - 2 + screened.astype(jnp.int32)         # 0..3 when not blocked
+    key   = jnp.where(position == 0, 0, 1 + block * n_bins + bin_idx)  # in [0, 1 + 4*n_bins)
 
     return Q_bins, key
 
@@ -1305,14 +1311,14 @@ def xb_binned_generator(
 ) -> XBBins:
     """Build the step's crossbridge generator and exponentiate it, once.
 
-    Evaluates 3 * n_xb_bins matrix exponentials instead of one per head — on the
+    Evaluates 1 + 4 * n_xb_bins matrix exponentials instead of one per head — on the
     distance grid rather than per head, so the cost does not grow with lattice
     size. Bin resolution is a genuine accuracy/cost tradeoff; see
     _build_xb_Q_bins and StaticParams.n_xb_bins / xb_bin_lo / xb_bin_hi.
 
-    The occupancy-time integral G rides along for ~5% more wall than P alone
-    (measured, 400 matrices), which is what lets the metrics path drop its own
-    second exponential entirely.
+    The occupancy-time integral G comes out of the same squaring loop as P,
+    which is what lets the metrics path drop its own second exponential
+    entirely.
 
     Args:
         state: Current State NamedTuple
