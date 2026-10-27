@@ -201,6 +201,13 @@ def compute_overlap_tm_fractions(
     }
 
 
+def _titin_energy(x, a, b):
+    """Stored energy of one titin at extension x = L - titin_rest: the integral of
+    forces.titin_tension, zero at and below slack."""
+    xs = jnp.maximum(x, 0.0)
+    return a * (jnp.expm1(b * xs) / b - xs - 0.5 * b * xs**2)
+
+
 def compute_all_metrics(
     old_state: 'State',
     new_state: 'State',
@@ -355,14 +362,14 @@ def compute_all_metrics(
     axial_dist_new = z_line - thick_tip_new
     titin_length_new = jnp.sqrt(axial_dist_new**2 + lattice_spacing**2)
     extension_new = titin_length_new - L0_tit
-    titin_energy_new = (a_tit / b_tit) * (jnp.exp(b_tit * extension_new) - 1.0)
+    titin_energy_new = _titin_energy(extension_new, a_tit, b_tit)
     titin_energy_avg = jnp.mean(titin_energy_new)
 
     thick_tip_old = thick_axial(old_state.thick.displacement, topology)[:, -1]
     axial_dist_old = z_line - thick_tip_old
     titin_length_old = jnp.sqrt(axial_dist_old**2 + lattice_spacing**2)
     extension_old = titin_length_old - L0_tit
-    titin_energy_old = (a_tit / b_tit) * (jnp.exp(b_tit * extension_old) - 1.0)
+    titin_energy_old = _titin_energy(extension_old, a_tit, b_tit)
     titin_energy_delta_avg = jnp.mean(titin_energy_new - titin_energy_old)
 
     # ========================================================================

@@ -263,7 +263,6 @@ def validate_forces_numerical(state: 'State', constants: 'DynamicParams',
     rows = jnp.arange(n_thin)[:, None]
 
     n_titin_per_thick = topology.static.n_titin_per_thick
-    titin_a_over_b = constants.titin_a / constants.titin_b
 
     def compute_total_energy(u_flat):
         """Total potential energy: backbone springs, crossbridges, and titin.
@@ -324,14 +323,16 @@ def validate_forces_numerical(state: 'State', constants: 'DynamicParams',
         ))
 
         # Titin energy at each thick filament tip. The force law is
-        # F = a*exp(b*(L - rest)), so its potential is (a/b)*exp(b*(L - rest)),
-        # with L the true 3D tether length. Always positive and always
-        # attractive, so no one-sided clamp is needed in the energy.
+        # F = a*(exp(b*x) - 1 - b*x) for x = L - rest > 0, else 0, so its potential
+        # is a*((exp(b*x) - 1)/b - x - b*x^2/2) above slack and 0 below, with L the
+        # true 3D tether length.
         axial = z_line - pt[:, -1]
         L = jnp.sqrt(axial ** 2 + d ** 2)
+        tb = constants.titin_b
+        xt = jnp.maximum(L - constants.titin_rest, 0.0)
         titin_energy = jnp.sum(
-            n_titin_per_thick * (titin_a_over_b) * jnp.exp(
-                constants.titin_b * (L - constants.titin_rest))
+            n_titin_per_thick * constants.titin_a * ((jnp.exp(tb * xt) - 1.0) / tb
+                                                     - xt - 0.5 * tb * xt ** 2)
         )
 
         return thick_energy + thin_energy + xb_energy + titin_energy

@@ -79,6 +79,18 @@ if TYPE_CHECKING:
 # THICK FILAMENT PASSIVE FORCES (with Titin)
 # ============================================================================
 
+def titin_tension(L, a, b, rest):
+    """Tension of one titin molecule at 3D length L (pN).
+
+    F = a * (exp(b x) - 1 - b x) for x = L - rest > 0, else 0. `rest` is the slack
+    length: force AND stiffness are zero there, so the solver's Jacobian stays
+    continuous, and a tether cannot push, so it is zero below slack. Near slack
+    F ~ a b^2 x^2 / 2; far above it, F ~ a exp(b x).
+    """
+    bx = jnp.clip(b * jnp.maximum(L - rest, 0.0), 0.0, 100.0)
+    return a * (jnp.expm1(bx) - bx)
+
+
 def compute_thick_passive_forces_single(
     u: jnp.ndarray,
     offsets: jnp.ndarray,
@@ -102,11 +114,10 @@ def compute_thick_passive_forces_single(
     everywhere except at its ends, as it should.
 
     TITIN acts only on the LAST crown, the filament tip, because that is where
-    it attaches. It is a one-sided exponential spring reaching diagonally to the
+    it attaches. It is a one-sided slack spring reaching diagonally to the
     Z-disc: its length is sqrt(axial^2 + lattice_spacing^2), and only the axial
-    component enters here. It pulls the tip toward the Z-line, and it is
-    one-sided — compression produces no force, since a protein tether cannot
-    push.
+    component enters here. It pulls the tip toward the Z-line above its slack
+    length and is exactly zero below it (titin_tension).
 
     COORDINATES ARE DISPLACEMENTS. `u` is each crown's offset from its rest
     position, so the backbone law needs no rest lengths: `crown_offsets` is the
@@ -122,8 +133,8 @@ def compute_thick_passive_forces_single(
         z_line: Z-line position (nm), the far anchor for titin
         lattice_spacing: Radial thick-to-thin distance (nm), the other leg of
             titin's diagonal
-        titin_a, titin_b, titin_rest: Exponential spring parameters,
-            F = titin_a * exp(titin_b * (L - titin_rest))
+        titin_a, titin_b, titin_rest: slack-law parameters (titin_tension);
+            titin_rest is the slack length
         n_titin: Titin molecules per thick filament
             (StaticParams.n_titin_per_thick); scales passive force linearly.
 
@@ -141,11 +152,7 @@ def compute_thick_passive_forces_single(
     # Total titin length (Pythagorean theorem)
     titin_length = jnp.sqrt(axial_dist**2 + lattice_spacing**2)
 
-    # Exponential force (with clipping for numerical stability)
-    exp_arg = titin_b * (titin_length - titin_rest)
-    exp_arg = jnp.clip(exp_arg, -100.0, 100.0)
-    titin_force_total = titin_a * jnp.exp(exp_arg)
-    titin_force_total = jnp.maximum(titin_force_total, 0.0)
+    titin_force_total = titin_tension(titin_length, titin_a, titin_b, titin_rest)
 
     # Axial component
     cos_angle = jnp.where(titin_length > 0, axial_dist / titin_length, 0.0)
@@ -866,8 +873,8 @@ def _titin_radial_force_total(
     titin_length = jnp.sqrt(axial_dist**2 + lattice_spacing**2)
     titin_length_safe = jnp.where(titin_length > 1e-10, titin_length, 1e-10)
 
-    exp_arg = jnp.clip(constants.titin_b * (titin_length - constants.titin_rest), -100.0, 100.0)
-    titin_force = jnp.maximum(constants.titin_a * jnp.exp(exp_arg), 0.0)
+    titin_force = titin_tension(titin_length, constants.titin_a, constants.titin_b,
+                                constants.titin_rest)
 
     sin_angle = lattice_spacing / titin_length_safe
     titin_radial_per_thick = n_titin * titin_force * sin_angle

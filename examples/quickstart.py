@@ -103,11 +103,11 @@ print(f"result_2d.sel(z_line=1100.0) shape: {sliced_z.axial_force.shape}")  # (3
 # 5. PARAMETER SWEEP — any DynamicParams field as a keyword:
 #    scalar = override, list = sweep axis
 # ===========================================================================
-print("\n5. Parameter sweep (thick_k list, titin_a override)")
+print("\n5. Parameter sweep (thick_k list, titin_rest override)")
 print("-" * 50)
 
 result_param = run(topo, dynamic, pCa=4.5, duration_ms=100,
-                   thick_k=[5000.0, 7500.0, 10000.0], titin_a=50.0, verbose=True, **DRV)
+                   thick_k=[5000.0, 7500.0, 10000.0], titin_rest=200.0, verbose=True, **DRV)
 
 print(f"Shape: {result_param.axial_force.shape}")  # (3, 1, 100)
 mean_forces = [float(result_param.axial_force[i].mean()) for i in range(3)]

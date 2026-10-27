@@ -86,12 +86,14 @@ row('z0', 'driver', 'nm',
     skeletal=P(900.0, 'G', 'short for skeletal (SL 1.8 um); working range 1000-1300'),
     cardiac_beta=P(950.0, 'I', 'SL 1.9 um, the length d0 was set for'),
     cardiac_alpha=inh('cardiac_beta'),
-    insect=inh('skeletal'))
+    insect=P(1545.0, 'G', 'thick tip (1493.5 nm) + slack I-segment (titin_rest), SL 3.09 um; '
+             'no SL measured for this thick-filament length'))
 row('d0', 'driver', 'nm',
     skeletal=P(14.0, 'I', 'd = (2/3) d10 - radii; d10 40.5 nm at SL 1.9 um'),
     cardiac_beta=P(10.3, 'G', 'intact-lattice gap for the crossbridge geometry set'),
     cardiac_alpha=inh('cardiac_beta'),
-    insect=inh('skeletal'))
+    insect=P(14.0, 'G', 'skeletal value, no insect d10 found; thin sits midway between two '
+             'thick filaments here, so d = d10 / sqrt(3) - radii'))
 
 # =============================================================================
 # STRUCTURE (static) — array shapes and compile-time geometry
@@ -207,21 +209,30 @@ row('thin_EA', 'dynamic', 'pN',
     skeletal=P(66000.0, 'I', 'axial rigidity; whole filament ~61 pN/nm'),
     cardiac_beta=inh('skeletal'), cardiac_alpha=inh('cardiac_beta'), insect=inh('skeletal'))
 row('titin_a', 'dynamic', 'pN',
-    skeletal=P(43.0, 'I', 'N2A exponential prefactor per molecule'),
-    cardiac_beta=P(55.0, 'I', 'N2B stiffer than N2A', lo=20.0, hi=150.0, source=BC),
+    skeletal=P(16.6, 'I', 'slack law fit to rabbit psoas passive tension, Granzier & Wang 1993 '
+               'Fig 7B (180 mM, 22 C), per thick filament at fraction 1; trades off with titin_b'),
+    cardiac_beta=P(0.045, 'I', 'slack law fit to rat trabecula passive tension, Park-Holohan 2021 '
+                   'Fig 3B (26 C, 3% dextran), per thick filament with their 0.6 x 0.56e15 m^-2'),
     cardiac_alpha=inh('cardiac_beta'),
-    insect=P(40.0, 'G', 'kettin/projectin; kept near the vertebrate values'))
+    insect=P(10328.0, 'I', 'quadratic limit a b^2/2 fit to Lethocerus IFM passive tension, Granzier '
+             '& Wang 1993 Fig 6A (6% stretch), per thick filament at fraction 1 and the insect '
+             'lattice (3.96e14 m^-2); set by titin_b'))
 row('titin_b', 'dynamic', '1/nm',
-    skeletal=P(0.004, 'G', 'exponential steepness (a swept value, not a measurement)'),
-    cardiac_beta=P(0.008, 'G', '8 um^-1, interpolated', lo=0.003, hi=0.02, source=BC),
+    skeletal=P(0.0024, 'I', 'psoas fit with titin_a (Granzier & Wang 1993 Fig 7B); poorly '
+               'identified alone (curve ~quadratic over SL 2.2-3.1 um)'),
+    cardiac_beta=P(0.023, 'I', 'Park-Holohan 2021 Fig 3B fit with titin_a (0.018-0.024 for slack '
+                   'SL 1.85-2.0 um)'),
     cardiac_alpha=inh('cardiac_beta'),
-    insect=P(0.025, 'I', 'derived from two converging chains'))
+    insect=P(0.001, 'G', 'not identifiable: IFM data are fit by the quadratic limit; a small '
+             'value keeps the law in that regime'))
 row('titin_rest', 'dynamic', 'nm',
-    skeletal=P(215.0, 'I', 'exponent offset (slack length)'),
-    cardiac_beta=P(140.0, 'I', 'slack at SL 1.85 um', lo=100.0, hi=200.0, scale='linear',
-                   source=BC),
+    skeletal=P(213.0, 'I', 'slack titin length: psoas slack SL 2.00 um (Granzier & Wang 1993 '
+               'Table 2) on this geometry; their own I segment l0 0.20 um'),
+    cardiac_beta=P(163.0, 'G', 'slack titin length at SL 1.9 um on this geometry; Park-Holohan '
+                   'data fit any slack SL 1.85-2.05 equally'),
     cardiac_alpha=inh('cardiac_beta'),
-    insect=P(50.0, 'G', 'IFM I-band length, unverified'))
+    insect=P(50.0, 'I', 'IFM slack I segment 0.05 um, taken from White 1983 by Granzier & '
+             'Wang 1993 (p. 2150)'))
 
 # =============================================================================
 # CROSSBRIDGE SPRINGS (dynamic)

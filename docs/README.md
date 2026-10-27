@@ -165,7 +165,11 @@ print(result.summary())
 - The three **drivers** (`pCa`, `z_line`, `lattice_spacing`), `dt` and
   `duration_ms` are required keywords. Drivers must be finite.
 - `pCa` is −log10[Ca²⁺]: 9 is relaxed, 4.5 is near-saturating.
-- `z_line` is the M-line-to-Z-disc distance in nm; `dt` is in ms.
+- `z_line` is the M-line-to-Z-disc distance in nm; `dt` is in ms. Every `z_line`
+  value must exceed the thick-filament tip (`max(topology.crown_offsets)`), or
+  `run()` raises before compiling.
+- A sim whose solve does not converge is still returned; `run()` warns and names
+  it, and `solver_residual_norm` > 1 marks its steps.
 
 Every simulation **starts relaxed**: each head is drawn from its resting
 distribution at pCa 9, and so is every Tm unit. A run at pCa 4.5 is
@@ -202,7 +206,7 @@ the rest of the preset is kept:
 r = run(topo, dynamic, pCa=4.5, **drv,
         thick_k=[5000.0, 7500.0, 10000.0],   # sweep axis
         thin_EA=[48000.0, 66000.0],          # second axis, crossed
-        titin_a=50.0)                        # override, no axis
+        titin_rest=200.0)                    # override, no axis
 # (3, 2, 1, 1000)
 ```
 
@@ -534,7 +538,7 @@ In dynamic mode, three radial forces balance:
 - the radial component of every bound crossbridge, from the same two-spring law
   as the axial force; under strong activation this usually pulls filaments
   together;
-- titin's radial component, which also pulls inward.
+- titin's radial component, which also pulls inward above its slack length.
 
 `d` is solved jointly with the filament positions in one Newton system.
 `K_lat` is per thick filament (pN/nm); `run()` scales it by the filament count,

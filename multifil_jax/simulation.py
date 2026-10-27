@@ -840,6 +840,15 @@ def run(
                 raise ValueError(f"{name} array length {arr.shape[0]} != n_steps {n_steps}")
             waveform_tables[name] = jnp.asarray(_as_trace(value))[None, :]
 
+    # The Z-line must lie beyond the thick-filament tip: titin spans that gap, and
+    # with the tip past the Z-disc there is no physical equilibrium to solve for.
+    tip = float(np.max(topology.crown_offsets))
+    z_min = min(float(np.min(np.asarray(v, dtype=float)))
+                for v in (z_line if isinstance(z_line, list) else [z_line]))
+    if z_min <= tip:
+        raise ValueError(f"z_line {z_min:g} nm is at or inside the thick-filament tip "
+                         f"({tip:g} nm from the M-line); every z_line must exceed it")
+
     # 2. K_lat / nu — per-sim scalars (never traces).
     for name, v in (('K_lat', K_lat), ('nu', nu)):
         if isinstance(v, list):
@@ -1031,12 +1040,22 @@ def run(
         max_residual = float(jnp.max(reshaped_metrics['solver_residual']))
         max_norm = float(jnp.max(reshaped_metrics['solver_residual_norm']))
     if max_norm > 1.0:
+        # Name the failing sims; the result is returned whole, so no work is lost.
+        per_sim = np.asarray(reshaped_metrics['solver_residual_norm']).max(axis=-1)
+        bad = np.argwhere(per_sim > 1.0)
+        names = axis_names[:-1]
+        def _label(idx):
+            return ', '.join(
+                f"{n}={coords[n][i]:g}" if np.ndim(coords[n][i]) == 0 else f"{n}[{i}]"
+                for n, i in zip(names, idx))
+        shown = '; '.join(_label(idx) for idx in bad[:10])
+        more = f"; ... {len(bad) - 10} more" if len(bad) > 10 else ""
         import warnings
         warnings.warn(
-            f"Solver did not converge everywhere: max normalized residual "
-            f"{max_norm:.3g} > 1 (max raw residual {max_residual:.4g} pN). "
-            f"Tune DynamicParams.solver_rtol/solver_atol, or raise "
-            f"StaticParams.n_newton_steps."
+            f"Solver did not converge in {len(bad)} of {per_sim.size} sims (max normalized "
+            f"residual {max_norm:.3g} > 1, max raw {max_residual:.4g} pN): {shown}{more}. "
+            f"Their results are in the returned arrays; solver_residual_norm marks them per step. "
+            f"Tune DynamicParams.solver_rtol/solver_atol, or raise StaticParams.n_newton_steps."
         )
 
     if verbose:
