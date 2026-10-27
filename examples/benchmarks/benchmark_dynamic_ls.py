@@ -65,8 +65,8 @@ def run_section_a(dur, reps, seed):
     # Two kernels: fixed LS and dynamic LS (K_lat is traced so rigid/soft share one kernel)
     configs = [
         ("Fixed LS",               lambda: run(topo, dynamic, **common)),
-        ("Dynamic LS (K_lat=500)", lambda: run(topo, dynamic, K_lat=500., nu=0.5, **common)),
-        ("Dynamic LS (K_lat=5.0)", lambda: run(topo, dynamic, K_lat=5.0, nu=0.5, **common)),
+        ("Dynamic LS (K_lat=500)", lambda: run(topo, dynamic, lattice='dynamic', K_lat=500., nu=0.5, **common)),
+        ("Dynamic LS (K_lat=5.0)", lambda: run(topo, dynamic, lattice='dynamic', K_lat=5.0, nu=0.5, **common)),
     ]
 
     print(f"{'Config':<28} {'1st call (s)':>12} {'ms/step':>8} {'Resid_max':>10} {'Force mean':>11}")
@@ -139,7 +139,7 @@ def run_section_b(dur, seed):
         common = dict(
             duration_ms=dur, dt=1.0,
             pCa=4.5, z_line=1100.0, lattice_spacing=d0,
-            K_lat=K_LAT, nu=NU,
+            lattice='dynamic', K_lat=K_LAT, nu=NU,
             replicates=1, rng_seed=seed,
         )
 

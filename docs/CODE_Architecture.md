@@ -52,13 +52,14 @@ anything compiles:
   list"); so does a `StaticParams` field, an unknown name, an empty list, or a
   field kwarg on a params list whose members differ in that field.
 - Drivers: a scalar is constant, a list is a sweep axis, an array of length
-  `n_steps` is a time course. `K_lat` and `nu` take a scalar or a list.
+  `n_steps` is a time course. `lattice` picks the spacing mode; `K_lat` and
+  `nu` are ordinary fields.
 - Every list is **crossed** with every other. Axis order: `z_line`, `pCa`,
-  `lattice_spacing`, `K_lat`, `nu`, `candidates`, field lists (kwarg order),
+  `lattice_spacing`, `candidates`, field lists (kwarg order),
   `subpopulation`, then `replicates` and `time`.
 
 **SimBatch.** `run()` packs every per-sim input into one `SimBatch` NamedTuple
-(`params, z, pCa, ls, K_lat, nu, rng_keys, subpop`), each leaf carrying a
+(`params, z, pCa, ls, rng_keys, subpop`), each leaf carrying a
 leading batch axis. Padding, minibatch chunking and trimming are each a single
 `tree_map` over it, so no per-sim input can be missed by one of them.
 
@@ -72,7 +73,7 @@ leading batch axis. Padding, minibatch chunking and trimming are each a single
 **`_run_sim_kernel`** is the one `@jax.jit` in the package. Static arguments are
 `dt`, `unroll`, `is_dynamic_ls`, the solver caps (read from `topology.static`),
 `subpop_mode` and `scaled_field_names`; changing any of them recompiles.
-Parameter values, driver values, `K_lat`, `nu` and subpopulation scales and
+Parameter values (`K_lat` and `nu` included), driver values and subpopulation scales and
 masks are traced, so they do not. The topology enters by closure, not as a
 vmapped argument.
 
@@ -310,11 +311,11 @@ lattice-spacing modes; `K_lat is None` selects fixed spacing at trace time.
 
 ### Lattice-spacing modes
 
-| `K_lat` | `nu` | Mode |
+| `run(lattice=...)` | Reads | Mode |
 |---|---|---|
-| `None` | 0 | fixed spacing |
-| `None` | > 0 | Poisson: `poisson_spacing(d0, z0, z, nu, static.filament_radii_sum)` computed as a time course before the scan |
-| > 0 | any | dynamic: `d` solved from radial force balance every step |
+| `'fixed'` | — | fixed spacing |
+| `'poisson'` | `nu` | `poisson_spacing(d0, z0, z, nu, static.filament_radii_sum)` computed as a time course before the scan |
+| `'dynamic'` | `K_lat`, `nu` | `d` solved from radial force balance every step, about the Poisson reference |
 
 `is_dynamic_ls` is static, so the two solver paths compile separately.
 

@@ -264,8 +264,8 @@ r = run(topo, dynamic, pCa=pCa_trace, z_line=z0, lattice_spacing=d0,
 Scalars, lists and time courses can be mixed across different arguments.
 
 **Axis order is fixed**, not the order you typed: `z_line`, `pCa`,
-`lattice_spacing`, `K_lat`, `nu`, `candidates`, field keywords (in keyword
-order), `subpopulation`, then `replicates`, then `time`. Read
+`lattice_spacing`, `candidates`, field keywords (in keyword order, `K_lat` and
+`nu` among them), `subpopulation`, then `replicates`, then `time`. Read
 `result._axis_names` rather than assuming, and select by value with `.sel()`.
 
 ---
@@ -282,7 +282,7 @@ order), `subpopulation`, then `replicates`, then `time`. Read
 | `result.z_line`, `result.pCa`, `result.lattice_spacing` | the driver traces applied (`lattice_spacing` is the prescribed d0; the solved value is a metric) |
 | `result._axis_names`, `result.coords` | axis layout, and the values along each sweep axis |
 | `result.grid_shape`, `result.dt` | shape without time; the timestep |
-| `result.topology_config` | the topology's integer sizes (`n_thick`, `total_xbs`, `n_tm`, …) and `K_lat` / `nu` when used |
+| `result.topology_config` | the topology's integer sizes (`n_thick`, `total_xbs`, `n_tm`, …) |
 | `result.metadata` | `master_seed`, and `candidates` when a params list was passed |
 
 | Method | Does |
@@ -400,7 +400,7 @@ Tension cost is the same: `sum(atp_expected) / sum(active force)` over the windo
 ## 8. Recompilation and batching
 
 **Free to vary (same compiled kernel):** any `DynamicParams` value; driver
-values; `K_lat` and `nu` values; replicates; subpopulation fractions, scales
+values; replicates; subpopulation fractions, scales
 and masks.
 
 **Recompiles:** the topology (lattice size or any `StaticParams` field,
@@ -523,14 +523,19 @@ must share one seed. See `examples/subpopulation.py`.
 
 ## 12. Lattice spacing
 
-The spacing between thick and thin filaments is a driver by default. Two other
-modes make it follow length or force:
+The spacing between thick and thin filaments is a driver by default.
+`run(..., lattice=...)` picks one of three modes:
 
 | Call | Mode |
 |---|---|
-| `run(..., lattice_spacing=d0)` | fixed |
-| `run(..., nu=0.5)` | Poisson: the spacing follows `z_line` as a prescribed time course, `poisson_spacing(d0, z0, z, nu, static.filament_radii_sum)` (the centre-to-centre spacing scales as `(z0/z)^nu`) |
-| `run(..., K_lat=5.0, nu=0.5)` | dynamic: the spacing is solved every step from radial force balance; `lattice_spacing` is the reference |
+| `run(..., lattice_spacing=d0)` | `'fixed'` (the default): the spacing as given |
+| `run(..., lattice='poisson')` | the spacing follows `z_line` as a prescribed time course, `poisson_spacing(d0, z0, z, nu, static.filament_radii_sum)` (the centre-to-centre spacing scales as `(z0/z)^nu`) |
+| `run(..., lattice='dynamic')` | the spacing is solved every step from radial force balance about that Poisson reference |
+
+`K_lat` and `nu` are `DynamicParams` fields with table values, so they are
+overridden, swept or drawn like any other field:
+`run(..., lattice='dynamic', K_lat=[50.0, 85.0, 200.0])`. Fixed mode reads
+neither, Poisson reads `nu`, dynamic reads both.
 
 In dynamic mode, three radial forces balance:
 

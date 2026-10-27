@@ -1,6 +1,6 @@
 """Dynamic Lattice Spacing Example
 
-Demonstrates run(..., K_lat=..., nu=...) — lattice spacing (d) as an emergent DOF
+Demonstrates run(..., lattice='dynamic') — lattice spacing (d) as an emergent DOF
 solved from radial force balance rather than prescribed as a driver.
 
 Four panels:
@@ -36,6 +36,7 @@ Z0 = 1100.0  # nm — reference z-line (skeletal SL ~2.2 µm)
 NU = 0.5     # Poisson exponent
 DT = 1.0     # ms timestep
 
+# K_lat and nu are DynamicParams fields (table: K_lat 85, nu 0.5); overridden here.
 # K_lat is per-filament stiffness (pN/nm per thick filament).
 # run() multiplies by n_thick internally so d_deviation is
 # lattice-size-independent. For a 2x2 topology (n_thick=4), K_lat_eff = K_lat * 4.
@@ -63,6 +64,7 @@ result_dyn1 = run(
     pCa=jnp.array(pCa_trace1),
     z_line=Z0,
     lattice_spacing=D0,
+    lattice='dynamic',
     K_lat=5.0,
     nu=NU,
     replicates=1,
@@ -134,6 +136,7 @@ for k in K_lat_values:
         pCa=jnp.array(pCa_trace3),
         z_line=Z0,
         lattice_spacing=D0,
+        lattice='dynamic',
         K_lat=k,
         nu=NU,
         replicates=1,
@@ -175,6 +178,7 @@ result_ramp = run(
     pCa=pCa4,
     z_line=jnp.array(z_trace4),
     lattice_spacing=D0,
+    lattice='dynamic',
     K_lat=5.0,
     nu=NU,
     replicates=1,

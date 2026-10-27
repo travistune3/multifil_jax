@@ -235,6 +235,21 @@ row('titin_rest', 'dynamic', 'nm',
              'Wang 1993 (p. 2150)'))
 
 # =============================================================================
+# LATTICE (dynamic) — read by run(lattice='poisson' | 'dynamic')
+# =============================================================================
+row('K_lat', 'dynamic', 'pN/nm',
+    skeletal=P(85.0, 'I', 'passive radial stiffness per thick filament: slope of Xu 1993 Fig 6A '
+               'curve a at d10 40.5 nm (this d0) x 1.5 (d = 2/3 d10 - radii); skinned rabbit '
+               'psoas, 5-7 C. Stiffens under compression: 57 at d10 44.8, 200 at 35.4',
+               lo=57.0, hi=200.0, scale='linear'),
+    cardiac_beta=inh('skeletal'), cardiac_alpha=inh('cardiac_beta'), insect=inh('skeletal'))
+row('nu', 'dynamic', '-',
+    skeletal=P(0.5, 'G', 'constant lattice volume, as measured for intact myocardium'),
+    cardiac_beta=P(0.5, 'I', 'constant lattice volume: intact relaxed rat trabeculae are '
+                   '"consistent with the constant volume hypothesis" (Irving 2000 p. H2571)'),
+    cardiac_alpha=inh('cardiac_beta'), insect=inh('skeletal'))
+
+# =============================================================================
 # CROSSBRIDGE SPRINGS (dynamic)
 # =============================================================================
 row('xb_c_rest_weak', 'dynamic', 'rad',

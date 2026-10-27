@@ -34,8 +34,8 @@ sweeps, trace sweeps, lattice-stiffness sweeps, parameter-field sweeps and
 candidate lists uniformly, instead of a special case for each.
 
 Result arrays come back shaped (sweep_1, ..., sweep_N, replicates, time). Sweep
-axes appear in a FIXED order — z_line, pCa, lattice_spacing, K_lat, nu, then
-the params candidates, then parameter-field lists (in keyword order), then
+axes appear in a FIXED order — z_line, pCa, lattice_spacing, then the params
+candidates, then parameter-field lists (in keyword order), then
 subpopulation — NOT the order the caller passed them. Select with
 .sel(name=value) rather than by axis position.
 
@@ -49,11 +49,11 @@ padded simulations is not.
 
 WHAT TRIGGERS RECOMPILATION
 ---------------------------
-Free: any DynamicParams value, the number of replicates, K_lat and nu, and the
-number of sweep points within a bucket.
+Free: any DynamicParams value (K_lat and nu included), the number of
+replicates, and the number of sweep points within a bucket.
 
 Not free: the topology (it defines every array shape), StaticParams solver
-settings, the duration, switching between fixed and dynamic lattice spacing, and
+settings, the duration, switching to or from lattice='dynamic', and
 the SHAPE of a subpopulation configuration — though not its values.
 
 Usage:
@@ -121,8 +121,7 @@ class SimulationResult:
         name: Simulation/experiment name
         _axis_names: List: ['pCa', 'thick_k', 'replicates', 'time']
         coords: Dict: {'pCa': [...], 'thick_k': [...], ...}
-        topology_config: the topology's structural integers (+ K_lat / nu in
-            dynamic-LS mode)
+        topology_config: the topology's structural integers
 
     Every derived result (mean, std, indexing, sel, stack) is built by _map,
     which applies ONE function to every metric and the three driver traces and
@@ -512,8 +511,6 @@ class SimBatch(NamedTuple):
     Fields:
         params: DynamicParams, every field (batch,)
         z, pCa, ls: (batch, n_steps) driver traces
-        K_lat: (batch,) lattice stiffness, already x n_thick (dynamic LS only)
-        nu: (batch,) Poisson exponent
         rng_keys: (batch, 2) one PRNG key per simulation
         subpop: dict of per-sim subpopulation arrays (see _resolve_subpopulation)
     """
@@ -521,8 +518,6 @@ class SimBatch(NamedTuple):
     z: jnp.ndarray
     pCa: jnp.ndarray
     ls: jnp.ndarray
-    K_lat: jnp.ndarray
-    nu: jnp.ndarray
     rng_keys: jnp.ndarray
     subpop: object
 
@@ -579,7 +574,9 @@ def _run_sim_kernel(
     def run_single_sim(state, b):
         """Run simulation with scan inside vmap. b is one simulation's SimBatch."""
         constants, z_trace, pCa_trace, ls_trace = b.params, b.z, b.pCa, b.ls
-        K_lat_val, nu_val, subpop = b.K_lat, b.nu, b.subpop
+        subpop = b.subpop
+        # K_lat is per thick filament; the radial row sums over all of them.
+        K_lat_val, nu_val = constants.K_lat * topology.n_thick, constants.nu
         n_thick, n_crowns = state.thick.displacement.shape
         n_thin, n_nodes = state.thin.displacement.shape
         precond_params = build_preconditioner_params(
@@ -725,8 +722,7 @@ def run(
     lattice_spacing: Union[float, List[float], jnp.ndarray],
     dt: float,
     duration_ms: float,
-    K_lat: Union[float, List[float], None] = None,
-    nu: Union[float, List[float]] = 0.0,
+    lattice: str = 'fixed',
     replicates: int = 1,
     rng_seed: int = 0,
     unroll: int = 1,
@@ -754,11 +750,13 @@ def run(
             list = sweep axis, 1-D array of length n_steps = time course. In
             dynamic LS mode lattice_spacing is the reference d0 and initial guess.
         dt: timestep (ms). duration_ms: run length (ms). Both required.
-        K_lat: lattice stiffness per thick filament (pN/nm), scalar or list.
-            None = fixed (or Poisson) lattice spacing. Scaled by n_thick inside.
-        nu: Poisson exponent on the centre-to-centre spacing (see
-            core.params.poisson_spacing), scalar or list. With K_lat None and
-            nu > 0 the spacing follows z_line.
+        lattice: how the spacing is set. 'fixed': lattice_spacing as given.
+            'poisson': lattice_spacing (scalar or list) is the spacing at the
+            first z_line and follows z_line with exponent `nu`
+            (core.params.poisson_spacing). 'dynamic': solved each step from
+            radial force balance with stiffness `K_lat` per thick filament,
+            about the Poisson reference. K_lat and nu are DynamicParams fields:
+            override or sweep them like any other.
         replicates: independent stochastic repeats per grid point.
         rng_seed: base seed. unroll: scan unroll factor.
         minibatch_size: "auto", None (no chunking) or an int, snapped down to a
@@ -799,7 +797,9 @@ def run(
     static = topology.static
     n_steps = int(duration_ms / dt)
     topology = jax.device_put(topology)
-    is_dynamic_ls = K_lat is not None
+    if lattice not in ('fixed', 'poisson', 'dynamic'):
+        raise ValueError(f"lattice must be 'fixed', 'poisson' or 'dynamic', got {lattice!r}")
+    is_dynamic_ls = lattice == 'dynamic'
 
     # =========================================================================
     # Every sweepable input keeps a small table of its possible values; the
@@ -849,14 +849,7 @@ def run(
         raise ValueError(f"z_line {z_min:g} nm is at or inside the thick-filament tip "
                          f"({tip:g} nm from the M-line); every z_line must exceed it")
 
-    # 2. K_lat / nu — per-sim scalars (never traces).
-    for name, v in (('K_lat', K_lat), ('nu', nu)):
-        if isinstance(v, list):
-            if not v:
-                raise ValueError(f"{name} sweep list is empty")
-            sweep_axes.append((name, list(v)))
-
-    # 3. Params: the candidates axis, then one axis per field list.
+    # 2. Params: the candidates axis, then one axis per field list.
     if isinstance(params, list):
         sweep_axes.append(('candidates', list(range(len(plist)))))
         for name in DYNAMIC_FIELDS:
@@ -868,7 +861,7 @@ def run(
         param_tables[name] = jnp.asarray(values, jnp.float32)
         param_axis[name] = name
 
-    # 4. Subpopulation list = a candidate-style axis; at most one of those.
+    # 3. Subpopulation list = a candidate-style axis; at most one of those.
     if isinstance(subpopulation, list):
         if isinstance(params, list):
             raise ValueError("Cannot sweep a params list and a subpopulation list "
@@ -897,8 +890,7 @@ def run(
     if verbose:
         print(f"Grid shape: {grid_shape}, axes: {axis_names}, "
               f"batch_size: {batch_size}, total: {total_batch}")
-        if is_dynamic_ls:
-            print(f"Dynamic LS: K_lat={K_lat}, nu={nu}")
+        print(f"Lattice: {lattice}")
 
     # Materialize waveforms → (total_batch, n_steps).
     def _waveform(name):
@@ -911,32 +903,6 @@ def run(
     pCa_batched = _waveform('pCa')
     ls_batched = _waveform('lattice_spacing')
 
-    # K_lat / nu batched scalars (total_batch,).
-    if isinstance(K_lat, list):
-        K_lat_batched = jnp.asarray(K_lat, jnp.float32)[flat_idx['K_lat']]
-    elif is_dynamic_ls:
-        K_lat_batched = jnp.full(total_batch, float(K_lat))
-    else:
-        K_lat_batched = jnp.zeros(total_batch)
-
-    if isinstance(nu, list):
-        nu_batched = jnp.asarray(nu, jnp.float32)[flat_idx['nu']]
-    else:
-        nu_batched = jnp.full(total_batch, float(nu))
-
-    if is_dynamic_ls:
-        K_lat_batched = K_lat_batched * topology.n_thick
-
-    # Poisson pre-computation (K_lat=None, nu>0): scale LS from its own d0.
-    ls_is_trace = (not isinstance(lattice_spacing, list)
-                   and np.asarray(lattice_spacing).ndim > 0)
-    has_nonzero_nu = (any(v != 0.0 for v in nu) if isinstance(nu, list)
-                      else float(nu) != 0.0)
-    if not is_dynamic_ls and not ls_is_trace and has_nonzero_nu:
-        ls_batched = poisson_spacing(ls_batched[:, 0:1], z_batched[:, 0:1],
-                                     z_batched, nu_batched[:, None],
-                                     static.filament_radii_sum)
-
     # Batched DynamicParams — one lookup per field; unswept fields from params.
     base = plist[0]
 
@@ -948,6 +914,17 @@ def run(
     batched_params = DynamicParams(muscle_class=None,
                                    **{name: _param(name) for name in DYNAMIC_FIELDS})
 
+    if is_dynamic_ls and not bool(jnp.all(batched_params.K_lat > 0)):
+        raise ValueError("lattice='dynamic' needs K_lat > 0 in every sim")
+    # Poisson: the spacing follows z_line from its value at the first step.
+    if lattice == 'poisson':
+        if not isinstance(lattice_spacing, list) and np.asarray(lattice_spacing).ndim > 0:
+            raise ValueError("lattice='poisson' sets the spacing from z_line; pass "
+                             "lattice_spacing as a scalar or a list, not a time course")
+        ls_batched = poisson_spacing(ls_batched[:, 0:1], z_batched[:, 0:1],
+                                     z_batched, batched_params.nu[:, None],
+                                     static.filament_radii_sum)
+
     # Subpopulation resolution → two static args + per-sim batched arrays.
     subpop_mode, scaled_field_names, subpop_arrays = _resolve_subpopulation(
         subpopulation, topology, total_batch, flat_idx,
@@ -956,7 +933,6 @@ def run(
 
     batch = SimBatch(
         params=batched_params, z=z_batched, pCa=pCa_batched, ls=ls_batched,
-        K_lat=K_lat_batched, nu=nu_batched,
         rng_keys=jax.random.split(jax.random.PRNGKey(rng_seed), total_batch),
         subpop=subpop_arrays)
 
@@ -1064,11 +1040,6 @@ def run(
               f"(normalized {max_norm:.4f})")
 
     topology_config = {name: getattr(topology, name) for name in topology._AUX}
-    if is_dynamic_ls:
-        topology_config['K_lat'] = K_lat
-        topology_config['K_lat_eff'] = (float(K_lat * topology.n_thick) if not isinstance(K_lat, list)
-                                        else [float(k * topology.n_thick) for k in K_lat])
-        topology_config['nu'] = nu
 
     metadata = {'master_seed': rng_seed}
     if isinstance(params, list):
