@@ -1497,7 +1497,9 @@ def thick_transitions(state: 'State',
                      bins: XBBins,
                      topology: 'SarcTopology',
                      rng_key: jax.random.PRNGKey,
-                     random_values: Optional[jnp.ndarray] = None):
+                     random_values: Optional[jnp.ndarray] = None,
+                     *,
+                     srx_release: jnp.ndarray):
     """Advance every crossbridge one timestep, and update what it is bound to.
 
     Two things happen here, and the second is easy to overlook: heads sample new
@@ -1516,6 +1518,13 @@ def thick_transitions(state: 'State',
     Heads flagged invalid by topology.xb_valid read a blocked gate throughout,
     so they can never enter a bound state and never claim a site.
 
+    Backbone stress is a second, independent exit from SRX (xb_rate_50_stress):
+    an SRX head leaves for DRX with probability p, else follows its own row, so
+    its row becomes (1 - p) P[5] + p e_DRX. p = 0 leaves the row exactly as it
+    was. The step's G, and so the ATP metrics, do not see this exit; it carries
+    no ATP. Nor does the relaxed start (xb_rest_states), which is exact while
+    the backbone is unloaded.
+
     Args:
         state: Current State
         bins: XBBins for this step, from xb_binned_generator(). Carries the
@@ -1523,6 +1532,9 @@ def thick_transitions(state: 'State',
         topology: SarcTopology with xb_to_thin_id, xb_valid, eye_6
         rng_key: JAX random key for sampling
         random_values: Optional pre-drawn uniforms, for deterministic testing
+        srx_release: (n_thick, n_crowns) probability that backbone stress
+            releases an SRX head on that crown this step; one value per crown,
+            independent draws per head
 
     Returns:
         new_state: State with updated xb_states, xb_bound_to, and thin bound_to
@@ -1543,6 +1555,9 @@ def thick_transitions(state: 'State',
 
     # Get probability vectors — index directly into P_all using current state
     prob_vectors = jax.vmap(lambda P, s: P[s])(P_all, current_states)  # (n_xb_total, 6)
+    p = jnp.broadcast_to(srx_release[:, :, None], xb_states.shape).reshape(-1, 1)
+    prob_vectors = jnp.where((current_states == 5)[:, None],
+                             (1.0 - p) * prob_vectors + p * topology.eye_6[0], prob_vectors)
 
     # Binding info (needed for binding logic below). A binding head is unbound,
     # so its gate is the unit under its nearest monomer; weak attachment needs

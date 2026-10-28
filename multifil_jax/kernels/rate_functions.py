@@ -76,7 +76,8 @@ steps, of 5.6 and 4.6 nm. This model sits between them: two force-bearing
 states with a lopsided split.
 
 SRX is not part of that cycle — it is a reserve. Heads parked in SRX have very
-low ATPase and cannot bind at all; calcium recruits them out (xb_rate_50).
+low ATPase and cannot bind at all; calcium recruits them out (xb_rate_50), and
+so does backbone tension at their crown (xb_rate_50_stress).
 This gives the thick filament its own activation mechanism, separate from
 tropomyosin's, and it is a large part of why force rises so steeply with
 calcium. The model's SRX is deeper than the single-tier SRX/DRX equilibrium used
@@ -772,6 +773,29 @@ def xb_rate_50(ca_conc, k0, kmax, b, ca50):
         Rate r50 (ms^-1)
     """
     return k0 + ((kmax - k0) * ca_conc**b) / (ca50**b + ca_conc**b)
+
+
+def xb_rate_50_stress(tension, k_force):
+    """Rate 5->0 added by backbone stress: an SRX head on a loaded crown is released.
+
+    A second, independent exit from SRX, on top of xb_rate_50. It is linear in
+    the tension the backbone carries at the head's own crown and has no
+    threshold or ceiling. This is the form of Lewalle et al. 2024 Biophys J
+    123:2996 (Eq. 5, k1 = k10 (1 + kforce Ftotal): "Ftotal is the total
+    tension in the sarcomere, and kforce is a constant", p.2999) and of Mann et
+    al. 2020 Biomech Model Mechanobiol 19:2683 (J1, linear in passive plus
+    active stress). Both apply it to the whole filament; here each crown reads
+    its own segment. Compression releases nothing.
+
+    Args:
+        tension: Backbone tension on the M-line side of each crown (pN).
+        k_force: Release rate per pN of tension (ms^-1 pN^-1) -
+            params.xb_srx_k_force. [G] 0 = off; no measured value.
+
+    Returns:
+        Rate (ms^-1), shaped like tension.
+    """
+    return k_force * jnp.maximum(tension, 0.0)
 
 
 def xb_rate_05(r05_rate):

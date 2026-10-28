@@ -264,6 +264,10 @@ invalid rather than clamped.
   `XBBins(Q, P, G, key, labels)`, where `P = exp(Q·dt)` and
   `G = ∫₀^dt exp(Qt)dt` (computed alongside P in the same scaling-and-squaring).
 - `thick_transitions` samples from `P`, then updates both binding records.
+  An SRX head's row first takes the backbone-stress exit: `kinetics_step` computes,
+  per crown, the release probability from the tension on that crown's M-line side
+  (`rate_functions.xb_rate_50_stress`), and the row becomes `(1 − p)·P[5] + p·e_DRX`.
+  `G` does not see this exit.
   Same-step collisions on one site are resolved by scatter-min over head index;
   the loser returns to DRX.
 - Invalid heads are forced into the blocked block, where `r01` is exactly zero.

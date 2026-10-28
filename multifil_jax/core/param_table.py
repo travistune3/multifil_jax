@@ -444,6 +444,11 @@ row('xb_srx_b', 'dynamic', '-',
 row('xb_srx_ca50', 'dynamic', 'M',
     skeletal=P(1e-6, 'G', 'half recruitment at pCa 6 (Assumed)'),
     cardiac_beta=inh('skeletal', lo=3e-7, hi=3e-6), cardiac_alpha=inh('cardiac_beta'), insect=inh('skeletal'))
+row('xb_srx_k_force', 'dynamic', '1/(ms pN)',
+    skeletal=P(0.0, 'G', 'SRX -> DRX release per pN of crown backbone tension; linear form of '
+               'Lewalle 2024 / Mann 2020, value Assumed (0 = off)', lo=0.0, hi=3e-2,
+               scale='linear'),
+    cardiac_beta=inh('skeletal'), cardiac_alpha=inh('cardiac_beta'), insect=inh('skeletal'))
 row('temp_celsius', 'dynamic', 'C',
     skeletal=P(26.15, 'G', 'sets kT only; rates are not temperature-scaled'),
     cardiac_beta=inh('skeletal'), cardiac_alpha=inh('cardiac_beta'), insect=inh('skeletal'))

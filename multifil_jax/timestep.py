@@ -52,6 +52,7 @@ from typing import Tuple, Optional, TYPE_CHECKING
 from multifil_jax.kernels.geometry import update_nearest_neighbors
 from multifil_jax.kernels.transitions import (thin_transitions, thick_transitions,
                                               xb_binned_generator)
+from multifil_jax.kernels.rate_functions import xb_rate_50_stress
 from multifil_jax.kernels.solver import solve_equilibrium
 from multifil_jax.core.state import Drivers, KineticsTrace
 
@@ -105,6 +106,12 @@ def kinetics_step(state: 'State',
         THE TRACE IS A WITHIN-STEP VALUE. It holds a whole State, so it must
         never be put in a scan carry or a scan output.
     """
+    # SRX release by backbone stress reads the force-balanced state carried in:
+    # the tension in the backbone segment on each crown's M-line side.
+    u = state.thick.displacement
+    tension = jnp.diff(u, axis=1, prepend=jnp.zeros_like(u[:, :1])) * constants.thick_k
+    srx_release = -jnp.expm1(-xb_rate_50_stress(tension, constants.xb_srx_k_force) * dt)
+
     # Step 1: Update nearest binding sites using topology
     state = update_nearest_neighbors(state, topology, drivers.z_line,
                                      drivers.lattice_spacing)
@@ -132,7 +139,7 @@ def kinetics_step(state: 'State',
 
     # Step 4: Thick filament transitions
     rng_key, thick_key = jax.random.split(rng_key)
-    state = thick_transitions(state, bins, topology, thick_key)
+    state = thick_transitions(state, bins, topology, thick_key, srx_release=srx_release)
 
     return state, rng_key, trace
 

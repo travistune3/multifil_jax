@@ -455,7 +455,8 @@ kinetics, so they describe the step that actually happened.
 configuration (a globular spring and an angular converter spring). Most of the
 working stroke is on 1 → 2, with a smaller second swing on 2 → 3. Detachment
 (3 → 4) is load-dependent and, at the shipped values, a catch bond: resisting
-load slows it. SRX is a reserve outside the cycle that calcium recruits from.
+load slows it. SRX is a reserve outside the cycle. Calcium recruits from it, and
+so does backbone tension at the head's own crown (`xb_srx_k_force`, 0 = off).
 Every rate law, with its form and source, is in
 `multifil_jax/kernels/rate_functions.py`.
 
