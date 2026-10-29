@@ -153,9 +153,6 @@ row('crown_face_wiggle_deg', 'static', 'deg',
 row('n_titin_per_thick', 'static', '-',
     skeletal=P(6, 'M', 'six titin molecules per vertebrate thick filament'),
     cardiac_beta=inh('skeletal'), cardiac_alpha=inh('cardiac_beta'), insect=inh('skeletal'))
-row('xb_head_reach', 'static', 'nm',
-    skeletal=P(13.0, 'G', 'axial reach of S1 from its crown (binding search, overlap zone)'),
-    cardiac_beta=inh('skeletal'), cardiac_alpha=inh('cardiac_beta'), insect=inh('skeletal'))
 row('filament_radii_sum', 'static', 'nm',
     skeletal=P(13.0, 'M', 'thick + thin radius (8 + 5): surface gap <-> centre spacing'),
     cardiac_beta=inh('skeletal'), cardiac_alpha=inh('cardiac_beta'), insect=inh('skeletal'))

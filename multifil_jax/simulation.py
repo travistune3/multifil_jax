@@ -563,7 +563,7 @@ def _run_sim_kernel(
         first sample of the z_line trace.
         """
         state = realize_state(topology, constants, z0, pCa0, ls0)
-        state = update_nearest_neighbors(state, topology, z0, ls0)
+        state = update_nearest_neighbors(state, topology, z0, ls0, constants)
         state, _residual, _, _, _, _ = solve_equilibrium(
             state, constants, topology, z0, ls0,
             n_cg_steps=n_cg_steps,

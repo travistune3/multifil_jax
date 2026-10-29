@@ -112,9 +112,9 @@ def kinetics_step(state: 'State',
     tension = jnp.diff(u, axis=1, prepend=jnp.zeros_like(u[:, :1])) * constants.thick_k
     srx_release = -jnp.expm1(-xb_rate_50_stress(tension, constants.xb_srx_k_force) * dt)
 
-    # Step 1: Update nearest binding sites using topology
+    # Step 1: Update each head's offered binding site
     state = update_nearest_neighbors(state, topology, drivers.z_line,
-                                     drivers.lattice_spacing)
+                                     drivers.lattice_spacing, constants)
 
     # Step 2: Thin filament transitions. Neighbour states are counted inside
     # thin_transitions from the current tm_states, so there is nothing to

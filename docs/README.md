@@ -427,9 +427,10 @@ host RAM. See [INSTALL.md](INSTALL.md) for sizing.
 
 `timestep()` (`multifil_jax/timestep.py`) runs four steps:
 
-1. **Nearest sites** (`update_nearest_neighbors`). Each head finds its nearest
-   binding candidate. The search uses the head position (crown +
-   `xb_head_reach`); the stored distance is from the crown. Sites that have
+1. **Offered sites** (`update_nearest_neighbors`). Each head is offered one
+   binding candidate: the one where the weak-bound head would have the lowest
+   elastic energy at the current lattice spacing (the highest attachment
+   rate). The stored distance is from the crown. Sites that have
    crossed the M-line are masked out. Where the opposite half's thin filaments
    reach past the M-line (the *hiding line*), sites are still found but their
    attachment rate is scaled by `1 − thin_thin_overlap_screening`.

@@ -2,7 +2,7 @@
 Crossbridge-to-binding-site geometry.
 
 Every timestep, after the filaments have moved, each myosin head has to work out
-where its nearest available actin binding site now is and how far away it is.
+which actin binding site it is offered now and how far away it is.
 Those distances are what make the kinetics mechanosensitive: the rate functions
 in rate_functions.py read them to decide how readily a head binds, strokes, or
 detaches. This module computes them.
@@ -21,14 +21,19 @@ to be one batched gather across every crossbridge in the lattice, instead of a
 ragged per-head loop that GPUs handle badly. Padding entries are masked out by
 comparing against each head's real candidate count.
 
-TWO GEOMETRIC SUBTLETIES
-------------------------
-The myosin head reaches. It projects roughly 13 nm axially from the crown it
-sits on, so the SEARCH for the nearest site uses the reaching head position —
-but the DISTANCE that gets stored, and that the rate functions consume, is
-measured from the crown base, because that is where the two-spring element is
-anchored. Using the same position for both would be wrong in opposite
-directions.
+WHICH CANDIDATE IS OFFERED
+--------------------------
+A detached head is offered ONE candidate: the one where it would sit at the
+lowest weak-state elastic energy if it bound there, at the current lattice
+spacing. That is the candidate with the highest attachment rate, since r01
+carries exp(-E_weak). It is the site nearest the weak head's axial zero-force
+point, which moves with lattice spacing: radial compression pushes it out past
+the rest projection g_rest_weak*cos(c_rest_weak). A fixed reach would offer
+sites short of (or past) that point, and the first heads to bind would carry a
+net axial force before any of them strokes.
+
+Distances are measured from the crown base, where the two-spring element is
+anchored.
 
 Sites at or past the M-line are excluded outright. As filaments slide, thin
 filament sites can pass the M-line into the opposite half-sarcomere, and a head
@@ -55,6 +60,7 @@ import jax.numpy as jnp
 from typing import Dict, Tuple, TYPE_CHECKING
 
 from multifil_jax.core.state import thick_axial, monomer_axial
+from multifil_jax.kernels.forces import xb_elastic_energy, xb_geometry
 
 if TYPE_CHECKING:
     from multifil_jax.core.sarc_geometry import SarcTopology
@@ -64,16 +70,19 @@ if TYPE_CHECKING:
 # FIXED-WIDTH NEAREST NEIGHBOR SEARCH (OPTIMIZED FOR GPU)
 # ============================================================================
 
-def find_nearest_binding_sites_fixed_width(
-    xb_positions: jnp.ndarray,
+def find_binding_sites_fixed_width(
+    xb_base_positions: jnp.ndarray,
     bs_positions: jnp.ndarray,
     xb_to_thin_id: jnp.ndarray,
     xb_to_mono_indices: jnp.ndarray,
     n_mono_per_face_flat: jnp.ndarray,
+    lattice_spacing,
+    constants,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Find each crossbridge's nearest reachable binding site.
+    """Find each crossbridge's lowest-energy reachable binding site.
 
-    One batched gather over the fixed-width candidate lists, then an argmin.
+    One batched gather over the fixed-width candidate lists, then an argmin of
+    the weak-state elastic energy each candidate would give the head.
     Two masks are applied before the argmin, and both matter:
 
       count mask    padding entries beyond a head's real candidate count are
@@ -84,26 +93,24 @@ def find_nearest_binding_sites_fixed_width(
                     thin-thin double-overlap zone stay candidates; their
                     screening is a rate, applied in _build_xb_Q_bins
 
-    Masked candidates are set to infinite distance rather than removed, keeping
+    Masked candidates are set to infinite energy rather than removed, keeping
     the array shape static for XLA. If every candidate is masked the argmin
     still returns an index; such heads are gated out elsewhere by xb_valid or by
     their target's permissiveness.
 
-    Positions passed in should be the REACHING head positions (crown base plus
-    the head's axial reach), not the crown bases — see the module docstring.
-
     Args:
-        xb_positions: (n_xb,) axial positions of crossbridges
+        xb_base_positions: (n_xb,) axial positions of the crowns (spring anchors)
         bs_positions: (n_thin, n_mono) axial positions of candidate monomers
         xb_to_thin_id: (n_xb,) target thin filament for each XB
         xb_to_mono_indices: (n_xb, max_mono_per_face) FIXED-WIDTH site indices
         n_mono_per_face_flat: (n_xb,) pre-gathered valid counts per XB
+        lattice_spacing: radial offset (nm)
+        constants: DynamicParams; reads the xb_*_weak spring rows
 
     Returns:
         nearest_thin_idx: (n_xb,) which thin filament
         nearest_site_idx: (n_xb,) which site on that thin filament
     """
-    n_xb = xb_positions.shape[0]
     max_mono_per_face = xb_to_mono_indices.shape[1]
 
     # Unified Gather: bs_positions[thin_id, mono_indices] for ALL XBs at once
@@ -114,18 +121,18 @@ def find_nearest_binding_sites_fixed_width(
         xb_to_thin_id, xb_to_mono_indices
     )  # (n_xb, max_mono_per_face)
 
-    # Compute distances for ALL sites in fixed-width window
-    # Shape: (n_xb, max_mono_per_face)
-    distances = jnp.abs(face_bs_positions - xb_positions[:, None])
+    # Weak-state energy the head would have at EVERY candidate: (n_xb, max_mono_per_face)
+    r, theta, _, _ = xb_geometry(face_bs_positions - xb_base_positions[:, None], lattice_spacing)
+    energy = xb_elastic_energy(r, theta, constants.xb_g_k_weak, constants.xb_g_rest_weak,
+                               constants.xb_c_k_weak, constants.xb_c_rest_weak)
 
     # Mask: (1) beyond valid site count, (2) site is behind M-line (position <= 0)
     count_mask = jnp.arange(max_mono_per_face) < n_mono_per_face_flat[:, None]
     visible_mask = face_bs_positions > 0.0
     valid_mask = count_mask & visible_mask
-    masked_distances = jnp.where(valid_mask, distances, jnp.inf)
+    masked_energy = jnp.where(valid_mask, energy, jnp.inf)
 
-    # Find argmin across fixed-width dimension (fully parallelized)
-    min_local_idx = jnp.argmin(masked_distances, axis=1)  # (n_xb,)
+    min_local_idx = jnp.argmin(masked_energy, axis=1)  # (n_xb,)
 
     # Gather actual site indices
     nearest_site_idx = jnp.take_along_axis(
@@ -148,16 +155,11 @@ def calculate_xb_to_bs_distances(xb_base_positions: jnp.ndarray,
 
     Returns the pair the two-spring model needs: the axial offset along the
     filament, and the radial separation, which is just the current lattice
-    spacing since thick and thin filaments run parallel.
-
-    Measured from the CROWN BASE, deliberately not from the reaching head
-    position used to find the site. The crown is where the head's springs are
-    anchored, so it is the correct origin for a strain; the 13 nm reach is a
-    property of the head's rest geometry and is already accounted for in the
-    spring rest lengths.
+    spacing since thick and thin filaments run parallel. Measured from the
+    CROWN BASE, where the head's springs are anchored.
 
     Args:
-        xb_base_positions: (n_xb,) XB base (crown) axial positions WITHOUT +13 offset
+        xb_base_positions: (n_xb,) XB base (crown) axial positions
         bs_positions: (n_thin, n_mono) BS axial positions
         nearest_thin: (n_xb,) which thin filament
         nearest_site: (n_xb,) which site
@@ -165,12 +167,6 @@ def calculate_xb_to_bs_distances(xb_base_positions: jnp.ndarray,
 
     Returns:
         distances: (n_xb, 2) array of (axial, radial) distances
-
-    Note:
-        The +13 nm offset is used when FINDING the nearest binding site
-        (to account for the myosin head reaching out), but NOT when
-        calculating the distance TO that binding site. The distance is
-        measured from the crown base position (xb.axial_location in original).
     """
 
     n_xb = xb_base_positions.shape[0]
@@ -197,14 +193,16 @@ def update_nearest_neighbors(
     topology: 'SarcTopology',
     z_line,
     lattice_spacing,
+    constants,
 ):
-    """Recompute every crossbridge's nearest binding site and its distances.
+    """Recompute every crossbridge's offered binding site and its distances.
 
     Called once per timestep, before the transition kernels, because the
     filaments moved during the previous equilibrium solve and the rates depend
     on where everything now is.
 
-    xb_nearest_bs is the NEAREST site for every head, attached or not.
+    xb_nearest_bs is the lowest-energy candidate for every head, attached or
+    not (find_binding_sites_fixed_width).
     xb_distances is measured to the BOUND monomer for an attached head (its
     current strain) and to the nearest site for a detached one (the opportunity
     it is being offered).
@@ -217,6 +215,7 @@ def update_nearest_neighbors(
         topology: SarcTopology with the precomputed candidate lists
         z_line: current Z-line position (nm), anchors the thin frame
         lattice_spacing: current lattice spacing (nm)
+        constants: DynamicParams (the weak spring rows choose the site)
 
     Returns:
         new_state: State with xb_nearest_bs and xb_distances updated
@@ -230,28 +229,22 @@ def update_nearest_neighbors(
     # Flatten thick base positions (each crown has n_xb_per_crown XBs)
     xb_base_positions = jnp.repeat(thick_pos, n_xb_per_crown, axis=1).reshape(-1)
 
-    # The SEARCH is done from the reaching head position (StaticParams.xb_head_reach
-    # past its crown; the overlap-zone metrics use the same value). The distance
-    # recorded below is measured from the crown base instead — see the module
-    # docstring.
-    xb_head_positions = xb_base_positions + topology.static.xb_head_reach
-
     # Pre-gather n_mono_per_face for each XB
     n_mono_per_face_flat = topology.n_mono_per_face[
         topology.xb_to_thin_id, topology.xb_to_thin_face
     ]
 
-    # Find nearest candidate monomers using fixed-width gather
-    nearest_thin, nearest_site = find_nearest_binding_sites_fixed_width(
-        xb_head_positions,
+    nearest_thin, nearest_site = find_binding_sites_fixed_width(
+        xb_base_positions,
         thin_pos,
         topology.xb_to_thin_id,
         topology.xb_to_mono_indices,
         n_mono_per_face_flat,
+        lattice_spacing,
+        constants,
     )
 
-    # Calculate distances using BASE position (WITHOUT +13 offset), to the bound
-    # monomer where there is one.
+    # Distances to the bound monomer where there is one.
     bound = state.thick.xb_bound_to.reshape(-1)
     distances = calculate_xb_to_bs_distances(
         xb_base_positions,
@@ -294,7 +287,7 @@ if __name__ == "__main__":
     print("="*60)
 
     # Create test state using SarcTopology
-    static_params, dynamic_params, *_ = get_params('skeletal')
+    static_params, dynamic_params, _z0, d0 = get_params('skeletal')
     np.random.seed(42)
     geometry = SarcTopology.create(2, 2, static_params)
 
@@ -317,12 +310,14 @@ if __name__ == "__main__":
         geometry.xb_to_thin_id, geometry.xb_to_thin_face
     ]
 
-    nearest_thin, nearest_site = find_nearest_binding_sites_fixed_width(
+    nearest_thin, nearest_site = find_binding_sites_fixed_width(
         xb_positions,
         bs_positions,
         geometry.xb_to_thin_id,
         geometry.xb_to_mono_indices,
         n_mono_per_face_flat,
+        d0,
+        dynamic_params,
     )
 
     print(f"Nearest thin shape: {nearest_thin.shape}")
@@ -339,12 +334,14 @@ if __name__ == "__main__":
     batched_bs_positions = jnp.tile(bs_positions, (batch_size, 1, 1))
 
     def find_nearest_kernel(xb_pos, bs_pos):
-        return find_nearest_binding_sites_fixed_width(
+        return find_binding_sites_fixed_width(
             xb_pos,
             bs_pos,
             geometry.xb_to_thin_id,
             geometry.xb_to_mono_indices,
             n_mono_per_face_flat,
+            d0,
+            dynamic_params,
         )
 
     batched_results = jax.vmap(find_nearest_kernel)(batched_xb_positions, batched_bs_positions)

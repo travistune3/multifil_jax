@@ -130,6 +130,7 @@ def compute_overlap_tm_fractions(
     state: 'State',
     topology: 'SarcTopology',
     z_line,
+    constants: 'DynamicParams',
 ) -> Dict[str, jnp.ndarray]:
     """Tropomyosin activation restricted to sites a crossbridge could reach.
 
@@ -157,8 +158,9 @@ def compute_overlap_tm_fractions(
       - at or before `crown_offsets.max() + reach` (the tip end, same reach)
       - strictly past the M-line, absolute position > 0
 
-    `reach` is StaticParams.xb_head_reach, the same value the binding search in
-    kernels/geometry.py uses, so the denominator holds only sites a head can reach.
+    `reach` is the axial projection of the weak head's rest geometry,
+    xb_g_rest_weak * cos(xb_c_rest_weak), so the denominator holds only sites a
+    head can reach.
 
     Note the bounds are computed from `crown_offsets`, which is per-filament, so
     they automatically follow a myosin superlattice that shifts different
@@ -181,7 +183,7 @@ def compute_overlap_tm_fractions(
         monomer_axial(state.thin.displacement, topology, z_line),
         topology.tm_rep_mono, axis=1)
 
-    reach = topology.static.xb_head_reach
+    reach = constants.xb_g_rest_weak * jnp.cos(constants.xb_c_rest_weak)
     near_bound = topology.crown_offsets.min() - reach
     far_bound = topology.crown_offsets.max() + reach
 
@@ -294,7 +296,7 @@ def compute_all_metrics(
     # ========================================================================
     # state = 2 * position + has_calcium (0/1 blocked, 2/3 closed, 4/5 open)
     n_tm = [jnp.sum(new_tm == k).astype(jnp.float32) for k in range(N_TM_STATES)]
-    overlap_tm_fractions = compute_overlap_tm_fractions(new_state, topology, z_line)
+    overlap_tm_fractions = compute_overlap_tm_fractions(new_state, topology, z_line, constants)
 
     # ========================================================================
     # TRANSITION EVENT COUNTS

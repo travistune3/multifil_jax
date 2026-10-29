@@ -216,8 +216,9 @@ of slots are invalid.
 ### Geometry — `kernels/geometry.py`
 
 `update_nearest_neighbors` finds each head's nearest binding candidate with a
-fixed-width gather over `xb_to_mono_indices`. The search uses the head position
-(crown + `static.xb_head_reach`); the stored distance is from the crown. Sites
+fixed-width gather over `xb_to_mono_indices`: the offered candidate is the argmin
+of the weak-state elastic energy at the current lattice spacing. The stored
+distance is from the crown. Sites
 past the hiding line, where the thin filament tip crosses the M-line, are masked
 invalid rather than clamped.
 
@@ -353,7 +354,7 @@ realised count of heads observed to leave Tight_2, and it undercounts heads that
 cycle more than once in a step.
 
 **Overlap-zone fractions** average only over sites a head could reach: within
-`static.xb_head_reach` of the crowns and past the hiding line. Their denominator
+the weak head's rest axial projection (`xb_g_rest_weak·cos(xb_c_rest_weak)`) of the crowns and past the hiding line. Their denominator
 moves with the geometry, which is why they are exported and the all-site
 fractions are not.
 
